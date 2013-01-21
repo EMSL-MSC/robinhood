@@ -45,7 +45,7 @@ int SetDefaultLmgrConfig( void *module_config, char *msg_out )
     conf->db_config.password[0] = '\0';
     conf->db_config.port = 0;
     conf->db_config.socket[0] = '\0';
-    conf->db_config.innodb = FALSE;
+    conf->db_config.innodb = TRUE;
 #elif defined (_SQLITE)
     strcpy( conf->db_config.filepath, "/var/robinhood/robinhood_sqlite_db" );
     conf->db_config.retry_delay_microsec = 1000;        /* 1ms */
@@ -75,7 +75,7 @@ int WriteLmgrConfigDefault( FILE * output )
     print_line( output, 2, "password|password_file : [MANDATORY]" );
     print_line( output, 2, "port    :   (MySQL default)" );
     print_line( output, 2, "socket  :   NONE" );
-    print_line( output, 2, "innodb  :   disabled" );
+    print_line( output, 2, "innodb  :   enabled" );
     print_end_block( output, 1 );
 #elif defined (_SQLITE)
     print_begin_block( output, 1, SQLITE_CONFIG_BLOCK, NULL );
@@ -276,7 +276,7 @@ int ReadLmgrConfig( config_file_t config, void *module_config, char *msg_out, in
         if ( !passfile )
         {
             rc = errno;
-            sprintf( msg_out, "Error openning password file %s : %s", tmpstr, strerror(errno) );
+            sprintf( msg_out, "Error opening password file %s : %s", tmpstr, strerror(errno) );
             return rc;
         }
         fscanf( passfile, "%1024s", tmpstr );
@@ -445,7 +445,7 @@ int WriteLmgrConfigTemplate( FILE * output )
     print_line( output, 1, "connect_retry_interval_min = 1 ;" );
     print_line( output, 1, "connect_retry_interval_max = 30 ;" );
 
-    print_line( output, 1, "# disable the following options if your are not interested in" );
+    print_line( output, 1, "# disable the following options if you are not interested in" );
     print_line( output, 1, "# user or group stats (to speed up scan)" );
     print_line( output, 1, "user_acct  = enabled ;" );
     print_line( output, 1, "group_acct = enabled ;" );
@@ -456,8 +456,8 @@ int WriteLmgrConfigTemplate( FILE * output )
     print_line( output, 2, "db     = \"robinhood_db\" ;" );
     print_line( output, 2, "user   = \"robinhood\" ;" );
     print_line( output, 2, "password_file = \"/etc/robinhood.d/.dbpassword\" ;" );
-    print_line( output, 2, "port   = 3306 ;" );
-    print_line( output, 2, "socket = \"/tmp/mysql.sock\" ;" );
+    print_line( output, 2, "# port   = 3306 ;" );
+    print_line( output, 2, "# socket = \"/tmp/mysql.sock\" ;" );
     print_line( output, 2, "innodb = enabled ;" );
     print_end_block( output, 1 );
 #elif defined (_SQLITE)

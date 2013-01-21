@@ -351,6 +351,23 @@ static int listmgr_mass_remove( lmgr_t * p_mgr, const lmgr_filter_t * p_filter, 
                  "CREATE TEMPORARY TABLE %s AS SELECT id FROM "
                  STRIPE_INFO_TABLE " WHERE %s", tmp_table_name, filter_str_stripe_info );
     }
+    else if (filter_main && filter_annex && ! (filter_stripe_items || filter_stripe_info))
+    {
+        sprintf( tmp_table_name, "TMP_TABLE_%u_%u",
+                 ( unsigned int ) getpid(  ), ( unsigned int ) pthread_self(  ) );
+#ifdef HAVE_RM_POLICY
+        if (soft_rm)
+            sprintf( query,
+             "CREATE TEMPORARY TABLE %s AS SELECT "MAIN_TABLE".id, "SOFTRM_SAVED_FIELDS" FROM " MAIN_TABLE
+             " LEFT JOIN "ANNEX_TABLE " ON " MAIN_TABLE ".id = " ANNEX_TABLE ".id"
+             " WHERE %s AND %s", tmp_table_name, filter_str_main, filter_str_annex );
+        else
+#endif
+            sprintf( query,
+             "CREATE TEMPORARY TABLE %s AS SELECT "MAIN_TABLE".id FROM " MAIN_TABLE
+             " LEFT JOIN "ANNEX_TABLE " ON " MAIN_TABLE ".id = " ANNEX_TABLE ".id"
+             " WHERE %s AND %s", tmp_table_name, filter_str_main, filter_str_annex );
+    }
     else
     {
         DisplayLog( LVL_CRIT, LISTMGR_TAG,
@@ -371,7 +388,7 @@ static int listmgr_mass_remove( lmgr_t * p_mgr, const lmgr_filter_t * p_filter, 
     /* delete what can be directly deleted */
     if ( annex_table )
     {
-        if ( filter_annex )
+        if ( filter_annex && !filter_main )
         {
             DisplayLog( LVL_DEBUG, LISTMGR_TAG, "Direct deletion in " ANNEX_TABLE " table" );
 
@@ -387,7 +404,7 @@ static int listmgr_mass_remove( lmgr_t * p_mgr, const lmgr_filter_t * p_filter, 
         }
     }
 
-    if ( filter_main )
+    if ( filter_main  && !filter_annex )
     {
         DisplayLog( LVL_DEBUG, LISTMGR_TAG, "Direct deletion in " MAIN_TABLE " table" );
 

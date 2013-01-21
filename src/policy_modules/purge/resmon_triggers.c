@@ -101,30 +101,28 @@ static void update_trigger_status( unsigned int i, trigger_status_t state )
  */
 static int CheckFSDevice(  )
 {
-    struct stat    fsstat;
+    struct stat    root_md;
 
     /* retrieve device of filesystem, to compare it to initial device id */
 
-    if ( stat( global_config.fs_path, &fsstat ) == -1 )
+    if (stat( global_config.fs_path, &root_md ) == -1)
     {
         DisplayLog( LVL_CRIT, RESMON_TAG, "Stat on '%s' failed! Error %d: %s",
                     global_config.fs_path, errno, strerror( errno ) );
         return FALSE;
     }
-
-    if ( global_config.stay_in_fs && ( fsdev != fsstat.st_dev ) )
+    if (root_md.st_dev != fsdev)
     {
-        char buff[1024];
-        DisplayLog( LVL_CRIT, RESMON_TAG,
-                    "ERROR: Device number of '%s' has changed !!! (%" PRI_DT " <> %"
-                    PRI_DT "). Exiting", global_config.fs_path, fsdev, fsstat.st_dev );
-
-        sprintf(buff, "Filesystem changed (%s)", global_config.fs_path );
-        RaiseAlert( buff,
-                    "Device number of '%s' has changed !!! (%"PRI_DT" <> %"PRI_DT"). Exiting",
-                    global_config.fs_path, fsdev, fsstat.st_dev );
-
-        return FALSE;
+        /* manage dev id change after umount/mount */
+        DisplayLog( LVL_MAJOR, RESMON_TAG, "WARNING: Filesystem device id changed (old=%"PRI_DT", new=%"PRI_DT"): "
+                    "checking if it has been remounted", fsdev, root_md.st_dev );
+        if (ResetFS())
+        {
+            DisplayLog( LVL_CRIT, RESMON_TAG, "Filesystem was unmounted!!! EXITING!" );
+            Exit( 1 );
+        }
+        /* update current fsdev */
+        fsdev = get_fsdev();
     }
 
     return TRUE;
@@ -1243,8 +1241,8 @@ static int check_usergroup_trigger( unsigned trigger_index )
                                     FILTER_FLAG_OR | FILTER_FLAG_END );
         }
     }
-    
-    it = ListMgr_Report( &lmgr, info, 2, &filter, NULL );
+
+    it = ListMgr_Report( &lmgr, info, 2, NULL, &filter, NULL );
 
     lmgr_simple_filter_free( &filter );
 
@@ -1257,7 +1255,7 @@ static int check_usergroup_trigger( unsigned trigger_index )
     }
 
     result_count = 2;
-    while ( (( rc = ListMgr_GetNextReportItem( it, result, &result_count ) ) == DB_SUCCESS) && !terminate )
+    while ( (( rc = ListMgr_GetNextReportItem( it, result, &result_count, NULL ) ) == DB_SUCCESS) && !terminate )
     {
         unsigned long long blocks_purged, nb_purged;
         char           desc[128];
@@ -2149,11 +2147,7 @@ int Start_ResourceMonitor( resource_monitor_config_t * p_config, resmon_opt_t op
     unsigned int   i;
     int            rc;
 
-    /* Check mount point and FS type.  */
-    rc = CheckFSInfo( global_config.fs_path, global_config.fs_type, &fsdev,
-                      global_config.check_mounted, TRUE );
-    if ( rc != 0 )
-        return rc;
+    fsdev = get_fsdev();
 
     /* store configuration */
     resmon_config = *p_config;

@@ -41,6 +41,7 @@
 
 fs_scan_config_t fs_scan_config;
 int              fsscan_flags = 0;
+const char      *partial_scan_root = NULL;
 
 #define fsscan_once ( fsscan_flags & FLAG_ONCE )
 
@@ -230,7 +231,7 @@ static int ignore_entry( char *fullpath, char *name, unsigned int depth, struct 
     /* Set entry id */
 #ifndef _HAVE_FID
     tmpid.inode = p_stat->st_ino;
-    tmpid.device = p_stat->st_dev;
+    tmpid.fs_key = get_fskey();
     tmpid.validator = p_stat->st_ctime;
 #endif
 
@@ -282,6 +283,7 @@ static int TerminateScan( int scan_complete, time_t date_fin )
     int     st, i;
     time_t  last_action = 0;
     char    timestamp[128];
+    char    tmp[1024];
     unsigned int count = 0;
 
     /* store the last scan end date */
@@ -312,8 +314,14 @@ static int TerminateScan( int scan_complete, time_t date_fin )
     /* invoke FSScan_StoreStats, so stats are updated at least once during the scan */
     FSScan_StoreStats( &lmgr ) ;
     /* and update the scan status */
-    ListMgr_SetVar( &lmgr, LAST_SCAN_STATUS, scan_complete ?  SCAN_STATUS_DONE :
-                                             SCAN_STATUS_PARTIAL );
+    if (partial_scan_root)
+    {
+        snprintf(tmp, 1024, "%s (%s)", SCAN_STATUS_PARTIAL, partial_scan_root);
+        ListMgr_SetVar( &lmgr, LAST_SCAN_STATUS, tmp );
+    }
+    else
+        ListMgr_SetVar( &lmgr, LAST_SCAN_STATUS,
+                        scan_complete?SCAN_STATUS_DONE:SCAN_STATUS_INCOMPLETE );
 
     /* if scan is errorneous and no entries was listed, don't rm old entries */
     if ((count > 0) || scan_complete)
@@ -334,6 +342,13 @@ static int TerminateScan( int scan_complete, time_t date_fin )
         /* set update time  */
         ATTR_MASK_SET( &op.entry_attr, md_update );
         ATTR( &op.entry_attr, md_update ) = scan_start_time;
+
+        /* set root (if partial scan) */
+        if (partial_scan_root)
+        {
+            ATTR_MASK_SET( &op.entry_attr, fullpath );
+            strcpy(ATTR(&op.entry_attr, fullpath), partial_scan_root);
+        }
 
         op.entry_attr_is_set = TRUE;
 
@@ -369,11 +384,25 @@ static int TerminateScan( int scan_complete, time_t date_fin )
     /* release the lock */
     V( lock_scan );
 
-    DisplayLog( LVL_EVENT, FSSCAN_TAG, "File list of %s has been updated", global_config.fs_path );
+    if (partial_scan_root)
+        DisplayLog( LVL_EVENT, FSSCAN_TAG, "File list of %s has been updated", partial_scan_root);
+    else
+        DisplayLog( LVL_EVENT, FSSCAN_TAG, "File list of %s has been updated", global_config.fs_path );
 
     /* sending batched alerts */
     DisplayLog( LVL_VERB, FSSCAN_TAG, "Sending batched alerts, if any" );
     Alert_EndBatching();
+
+    if (scan_complete && !EMPTY_STRING(fs_scan_config.completion_command))
+    {
+        /* replace special args in completion command */
+        char * cmd = replace_cmd_parameters(fs_scan_config.completion_command);
+        if (cmd)
+        {
+            execute_shell_command(cmd, 0);
+            free(cmd);
+        }
+    }
 
     if ( fsscan_once )
         signal_scan_finished(  );
@@ -463,7 +492,8 @@ static int RecursiveTaskTermination( thread_scan_info_t * p_info,
 
                 DisplayLog( LVL_MAJOR, FSSCAN_TAG,
                             "Full scan of %s completed, %u entries found (%u errors). Duration = %ld.%02lds",
-                            global_config.fs_path, count, err_count, duree_precise.tv_sec,
+                            partial_scan_root?partial_scan_root:global_config.fs_path,
+                            count, err_count, duree_precise.tv_sec,
                             duree_precise.tv_usec/10000 );
 
                 DisplayLog( LVL_EVENT, FSSCAN_TAG, "Flushing pipeline..." );
@@ -560,28 +590,61 @@ static int HandleFSEntry( thread_scan_info_t * p_info, robinhood_task_t * p_task
     /* Check that the entry is on the same device as the filesystem we manage.
      * (prevent from mountpoint traversal).
      */
-    if ( global_config.stay_in_fs )
+    if ( inode.st_dev != fsdev )
     {
-        if ( inode.st_dev != fsdev )
+        struct stat root_md;
+        /* is the FS root changed: file system may have been remounted.
+         * else: the entry is not in the same filesystem
+         */
+        /* 1) check fs root dev_id */
+        if (stat( global_config.fs_path, &root_md ) == -1)
         {
+            int rc = -errno;
             DisplayLog( LVL_CRIT, FSSCAN_TAG,
-                        "%s (0x%.8"PRI_DT") is in a filesystem different from root (0x%.8"
-                        PRI_DT "), entry ignored", entry_path, inode.st_dev, fsdev );
-            return -1;
+                        "stat failed on %s: %s", global_config.fs_path, strerror(-rc) );
+            DisplayLog( LVL_CRIT, FSSCAN_TAG, "ERROR accessing FileSystem: EXITING." );
+            Exit( rc );
+        }
+        if (root_md.st_dev != fsdev)
+        {
+            /* manage dev id change after umount/mount */
+            DisplayLog( LVL_MAJOR, FSSCAN_TAG, "WARNING: Filesystem device id changed (old=%"PRI_DT", new=%"PRI_DT"): "
+                        "checking if it has been remounted", fsdev, root_md.st_dev );
+            if (ResetFS())
+            {
+                DisplayLog( LVL_CRIT, FSSCAN_TAG, "Filesystem was unmounted!!! EXITING!" );
+                Exit( 1 );
+            }
+            /* update current fsdev */
+            fsdev = get_fsdev();
+        }
+        /* else: root is still the same */
+
+        /* inode.st_dev == fsdev => OK: the entry is in the root filesystem */
+        if (inode.st_dev != fsdev)
+        {
+           if (global_config.stay_in_fs)
+           {
+               DisplayLog( LVL_CRIT, FSSCAN_TAG,
+                           "%s (0x%.8"PRI_DT") is in a filesystem different from root (0x%.8"
+                           PRI_DT "), entry ignored", entry_path, inode.st_dev, fsdev );
+               return -1;
+           }
+           else
+           {
+               /* TODO: what fs_key for this entry??? */
+               DisplayLog( LVL_DEBUG, FSSCAN_TAG,
+                           "%s (0x%.8"PRI_DT") is in a filesystem different from root (0x%.8"
+                           PRI_DT "), but 'stay_in_fs' parameter is disabled: processing entry anyhow",
+                           entry_path, inode.st_dev, fsdev );
+           }
         }
     }
 
-    /* General purpose: Push all entries except dirs to the pipeline.
-     * Lustre-HSM: Only push files.
+    /* Push all entries except dirs to the pipeline.
+     * Note: directories are pushed in Thr_scan(), after the closedir() call.
      */
-    /* Note: for non-Lustre-HSM purposes, directories are pushed in Thr_scan(),
-     * after the closedir() call.
-     */
-#ifdef _LUSTRE_HSM
-    if ( S_ISREG( inode.st_mode ) )
-#else
     if ( !S_ISDIR( inode.st_mode ) )
-#endif
     {
         entry_proc_op_t op;
 
@@ -595,6 +658,9 @@ static int HandleFSEntry( thread_scan_info_t * p_info, robinhood_task_t * p_task
         op.pipeline_stage = STAGE_GET_INFO_DB;
 #endif
         ATTR_MASK_INIT( &op.entry_attr );
+
+        ATTR_MASK_SET( &op.entry_attr, parent_id );
+        ATTR( &op.entry_attr, parent_id) = p_task->dir_id;
 
         ATTR_MASK_SET( &op.entry_attr, name );
         strcpy( ATTR( &op.entry_attr, name ), entry_name );
@@ -628,7 +694,7 @@ static int HandleFSEntry( thread_scan_info_t * p_info, robinhood_task_t * p_task
         /* Set entry id */
 #ifndef _HAVE_FID
         op.entry_id.inode = inode.st_ino;
-        op.entry_id.device = inode.st_dev;
+        op.entry_id.fs_key = get_fskey();
         op.entry_id.validator = inode.st_ctime;
         op.entry_id_is_set = TRUE;
 #else
@@ -648,8 +714,7 @@ static int HandleFSEntry( thread_scan_info_t * p_info, robinhood_task_t * p_task
         }
 
     }
-
-    if ( S_ISDIR( inode.st_mode ) )
+    else if ( S_ISDIR( inode.st_mode ) )
     {
 
         robinhood_task_t *p_scan_task;
@@ -665,7 +730,17 @@ static int HandleFSEntry( thread_scan_info_t * p_info, robinhood_task_t * p_task
 
         p_scan_task->parent_task = p_task;
         strncpy( p_scan_task->path, entry_path, RBH_PATH_MAX );
-        p_scan_task->directory_md = inode;
+        /* set parent id */
+#ifdef _HAVE_FID
+        st = Lustre_GetFidFromPath( entry_path, &p_scan_task->dir_id );
+        if (st)
+            return st;
+#else
+        p_scan_task->dir_id.inode = inode.st_ino;
+        p_scan_task->dir_id.fs_key = get_fskey();
+        p_scan_task->dir_id.validator = inode.st_ctime;
+#endif
+        p_scan_task->dir_md = inode;
         p_scan_task->depth = p_task->depth + 1;
         p_scan_task->task_finished = FALSE;
 
@@ -673,7 +748,7 @@ static int HandleFSEntry( thread_scan_info_t * p_info, robinhood_task_t * p_task
         st = AddChildTask( p_task, p_scan_task );
 
         if ( st )
-            return ( st );
+            return st;
 
         /* insert task to the stack */
         st = InsertTask_to_Stack( &tasks_stack, p_scan_task );
@@ -683,7 +758,6 @@ static int HandleFSEntry( thread_scan_info_t * p_info, robinhood_task_t * p_task
             DisplayLog( LVL_CRIT, FSSCAN_TAG, "CRITICAL ERROR: InsertCandidate returned %d", st );
             return st;
         }
-
     }
 
     return 0;
@@ -756,27 +830,63 @@ static void   *Thr_scan( void *arg_thread )
         gettimeofday( &start_dir, NULL );
 
         /* if this is the root task, check that the filesystem is still mounted */
-        if ( p_task->depth == 0 )
+        if ( p_task->parent_task == NULL )
         {
             /* retrieve filesystem device id */
             if ( stat( p_task->path, &inode_entree ) == -1 )
             {
                 DisplayLog( LVL_CRIT, FSSCAN_TAG,
-                            "lstat failed on %s. Error %d", p_task->path, errno );
+                            "stat failed on %s. Error %d", p_task->path, errno );
                 DisplayLog( LVL_CRIT, FSSCAN_TAG, "Error accessing filesystem: exiting" );
                 Exit( 1 );
             }
 
             if ( fsdev != inode_entree.st_dev )
             {
-                DisplayLog( LVL_CRIT, FSSCAN_TAG,
-                            "Somebody cut the grass under my feet!!! I suicide me..." );
-                Exit( 1 );
+                /* manage dev id change after umount/mount */
+                DisplayLog( LVL_MAJOR, FSSCAN_TAG, "WARNING: Filesystem device id changed (old=%"PRI_DT", new=%"PRI_DT"): "
+                            "checking if it has been remounted", fsdev, inode_entree.st_dev );
+                if (ResetFS())
+                {
+                    DisplayLog( LVL_CRIT, FSSCAN_TAG, "Filesystem was unmounted!!! EXITING!" );
+                    Exit( 1 );
+                }
+                /* update current fsdev */
+                fsdev = get_fsdev();
             }
+
+            /* set dir_md and dir_id */
+            p_task->dir_md = inode_entree;
+
+#ifdef _HAVE_FID
+            st = Lustre_GetFidFromPath( p_task->path, &p_task->dir_id );
+            if (st) {
+                DisplayLog( LVL_CRIT, FSSCAN_TAG,
+                            "Skipping scan of %s because its FID couldn't be resolved",
+                            p_task->path );
+                p_info->entries_errors ++;
+
+                /* cancel the task */
+                st = RecursiveTaskTermination( p_info, p_task, FALSE );
+
+                if ( st )
+                {
+                    DisplayLog( LVL_CRIT, FSSCAN_TAG,
+                                "CRITICAL ERROR: RecursiveTaskTermination returned %d", st );
+                    Exit( 1 );
+                }
+
+                /* back to "normal" life :-) */
+                continue;
+            }
+#else
+            p_task->dir_id.inode = inode_entree.st_ino;
+            p_task->dir_id.fs_key = get_fskey();
+            p_task->dir_id.validator = inode_entree.st_ctime;
+#endif
 
             /* test lock before starting scan */
             TestLockFile( &p_info->last_action );
-
         }
 
 
@@ -855,8 +965,6 @@ static void   *Thr_scan( void *arg_thread )
         if ( rc != EBADF )
             closedir( dirp );
 
-/* No directory management for Lustre HSM */
-#ifndef _LUSTRE_HSM
         if ( p_task->depth > 0 )
         {
             /* Fill dir info and push it to the pileline for checking alerts on it,
@@ -867,15 +975,20 @@ static void   *Thr_scan( void *arg_thread )
 
             /* init the structure */
             InitEntryProc_op( &op );
-
-#ifdef _HAVE_FID
-            /* retrieve fids from posix path */
-            op.pipeline_stage = STAGE_GET_FID;
-#else
-            /* attributes already retrieved */
-            op.pipeline_stage = STAGE_GET_INFO_DB;
-#endif
             ATTR_MASK_INIT( &op.entry_attr );
+
+            /* set entry ID */
+            op.entry_id = p_task->dir_id;
+            op.entry_id_is_set = TRUE;
+
+            /* Id already known */
+            op.pipeline_stage = STAGE_GET_INFO_DB;
+
+            if (p_task->parent_task)
+            {
+                ATTR_MASK_SET( &op.entry_attr, parent_id );
+                ATTR( &op.entry_attr, parent_id ) = p_task->parent_task->dir_id;
+            }
 
             ATTR_MASK_SET( &op.entry_attr, name );
             strcpy( ATTR( &op.entry_attr, name ), basename( p_task->path ) );
@@ -883,8 +996,10 @@ static void   *Thr_scan( void *arg_thread )
             ATTR_MASK_SET( &op.entry_attr, fullpath );
             strcpy( ATTR( &op.entry_attr, fullpath ), p_task->path );
 
+#ifdef ATTR_INDEX_invalid
             ATTR_MASK_SET( &op.entry_attr, invalid );
             ATTR( &op.entry_attr, invalid ) = FALSE;
+#endif
 
             ATTR_MASK_SET( &op.entry_attr, depth );
             ATTR( &op.entry_attr, depth ) = p_task->depth - 1;  /* depth(/tmp/toto) = 0 */
@@ -893,9 +1008,9 @@ static void   *Thr_scan( void *arg_thread )
             ATTR( &op.entry_attr, dircount ) = nb_entries;
 
 #if defined( _LUSTRE ) && defined( _MDS_STAT_SUPPORT )
-            PosixStat2EntryAttr( &p_task->directory_md, &op.entry_attr, !(is_lustre_fs && global_config.direct_mds_stat) );
+            PosixStat2EntryAttr( &p_task->dir_md, &op.entry_attr, !(is_lustre_fs && global_config.direct_mds_stat) );
 #else
-            PosixStat2EntryAttr( &p_task->directory_md, &op.entry_attr, TRUE );
+            PosixStat2EntryAttr( &p_task->dir_md, &op.entry_attr, TRUE );
 #endif
             op.entry_attr_is_set = TRUE;
 
@@ -905,16 +1020,6 @@ static void   *Thr_scan( void *arg_thread )
 #ifdef _HAVE_FID
             ATTR_MASK_SET( &op.entry_attr, path_update );
             ATTR( &op.entry_attr, path_update ) = time( NULL );
-#endif
-
-            /* Set entry id */
-#ifndef _HAVE_FID
-            op.entry_id.inode = p_task->directory_md.st_ino;
-            op.entry_id.device = p_task->directory_md.st_dev;
-            op.entry_id.validator = p_task->directory_md.st_ctime;
-            op.entry_id_is_set = TRUE;
-#else
-            op.entry_id_is_set = FALSE;
 #endif
 
             op.extra_info_is_set = FALSE;
@@ -929,7 +1034,6 @@ static void   *Thr_scan( void *arg_thread )
                 return NULL;
             }
         }
-#endif
 
         gettimeofday( &end_dir, NULL );
         timersub( &end_dir, &start_dir, &diff );
@@ -956,7 +1060,6 @@ static void   *Thr_scan( void *arg_thread )
                         "CRITICAL ERROR: RecursiveTaskTermination returned %d", st );
             Exit( 1 );
         }
-
     }
 
 end_task:
@@ -967,7 +1070,6 @@ end_task:
         signal_scan_finished();
 
     return NULL;
-
 }
 
 
@@ -981,7 +1083,7 @@ end_task:
  * that have been previously parsed.
  * 
  * It returns a status code:
- *   0 : initialization sucessful
+ *   0 : initialization successful
  *   -1 : unexpected error at initialization.
  *   EINVAL : a parameter from the config file is invalid.
  */
@@ -1009,10 +1111,7 @@ int Robinhood_InitScanModule(  )
 
     pthread_mutex_init( &lock_scan, NULL );
 
-    /* check device, filesystem type, ... */
-    if ( ( rc = CheckFSInfo( global_config.fs_path, global_config.fs_type, &fsdev,
-                             global_config.check_mounted, TRUE ) ) != 0 )
-        return ( rc );
+    fsdev = get_fsdev();
 
     if ( !strcmp( global_config.fs_type, "lustre" ) )
         is_lustre_fs = TRUE;
@@ -1109,12 +1208,46 @@ int Robinhood_StopScanModule(  )
 }
 
 
+static unsigned int path_depth(const char * path)
+{
+    const char     *curr;
+    unsigned int   nb1;
+    unsigned int   nb2;
+    /* depth = number of '/' - 1 - depth of root fs.
+     * E.g.: root="/mnt/lustre", path="/mnt/lustre/dir/foo", depth=4-2-1=1
+     */
+
+    nb1 = 0;
+    curr = global_config.fs_path;
+    while ( ( curr = strchr( curr, '/' ) ) )
+    {
+        curr++;
+        nb1++;
+    }
+
+    nb2 = 0;
+    curr = path;
+    while ( ( curr = strchr( curr, '/' ) ) )
+    {
+        curr++;
+        nb2++;
+    }
+    /* decrease '/' count if the path ended with '/' */
+    unsigned int len = strlen(path);
+    if ((len > 1) && (path[len-1] == '/'))
+        nb2 --;
+
+    return nb2 - nb1 - 1;
+}
+
+
 
 /* Start a scan of the filesystem. 
  * This creates a root task and push it to the stack of tasks.
- * Return EBUSY if a scan is already running.
+ * @param partial_root NULL for full scan; subdir path for partial scan
+ * @retval EBUSY if a scan is already running.
  */
-static int StartScan(  )
+static int StartScan()
 {
     robinhood_task_t *p_parent_task;
     char              timestamp[128];
@@ -1128,7 +1261,8 @@ static int StartScan(  )
     {
         V( lock_scan );
         DisplayLog( LVL_MAJOR, FSSCAN_TAG,
-                    "An scan is already running on %s", global_config.fs_path );
+                    "An scan is already running on %s",
+                    partial_scan_root?partial_scan_root:global_config.fs_path );
         return EBUSY;
     }
 
@@ -1141,12 +1275,30 @@ static int StartScan(  )
     {
         V( lock_scan );
         DisplayLog( LVL_CRIT, FSSCAN_TAG,
-                    "ERROR creating scan task for %s", global_config.fs_path );
+                    "ERROR creating scan task for %s",
+                    partial_scan_root?partial_scan_root:global_config.fs_path );
         return -1;
     }
 
-    strcpy( p_parent_task->path, global_config.fs_path );
-    p_parent_task->depth = 0;
+    if (partial_scan_root)
+    {
+        /* check that partial_root is under FS root */
+        if (strncmp(global_config.fs_path, partial_scan_root, strlen(global_config.fs_path)))
+        {
+            DisplayLog( LVL_CRIT, FSSCAN_TAG, "ERROR scan root %s is not under fs root %s",
+                        partial_scan_root, global_config.fs_path );
+            return -1;
+        }
+        strcpy( p_parent_task->path, partial_scan_root );
+    }
+    else
+        strcpy( p_parent_task->path, global_config.fs_path );
+
+    if (partial_scan_root)
+        p_parent_task->depth = path_depth(partial_scan_root);
+    else
+        p_parent_task->depth = 0;
+
     p_parent_task->task_finished = FALSE;
 
     /* set the mother task, and remember start time */
@@ -1356,9 +1508,9 @@ int Robinhood_CheckScanDeadlines(  )
 
         DisplayLog( LVL_MAJOR, FSSCAN_TAG,
                     "Starting scan of %s (current scan interval is %s)",
-                    global_config.fs_path, tmp_buff );
+                    partial_scan_root?partial_scan_root:global_config.fs_path, tmp_buff );
 
-        st = StartScan(  );
+        st = StartScan();
 
         if ( st == EBUSY )
         {
@@ -1377,9 +1529,10 @@ int Robinhood_CheckScanDeadlines(  )
     {
         /* retry a scan, if the last was incomplete */
 
-        DisplayLog( LVL_MAJOR, FSSCAN_TAG, "Starting scan of %s", global_config.fs_path );
+        DisplayLog( LVL_MAJOR, FSSCAN_TAG, "Starting scan of %s",
+                    partial_scan_root?partial_scan_root:global_config.fs_path );
 
-        st = StartScan(  );
+        st = StartScan();
 
         if ( st == EBUSY )
         {

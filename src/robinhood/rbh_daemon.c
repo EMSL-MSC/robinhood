@@ -74,6 +74,7 @@ static time_t  boot_time;
 #define DRY_RUN           280
 #define NO_LIMIT          281
 #define TEST_SYNTAX       282
+#define PARTIAL_SCAN      283
 
 #define ACTION_MASK_SCAN                0x00000001
 #define ACTION_MASK_PURGE               0x00000002
@@ -140,6 +141,7 @@ static struct option option_tab[] = {
 
     /* Actions selectors */
     {"scan", no_argument, NULL, 'S'},
+    {"partial-scan", required_argument, NULL, PARTIAL_SCAN},
 #ifdef HAVE_PURGE_POLICY
     {"purge", no_argument, NULL, 'P'},
     {"release", no_argument, NULL, 'P'},
@@ -260,6 +262,8 @@ typedef struct rbh_options {
     double         usage_target;
     int            purge_class;
     char           purge_target_class[128];
+    int            partial_scan; 
+    char           partial_scan_path[RBH_PATH_MAX];
 
 #ifdef HAVE_MIGR_POLICY
 #ifdef _LUSTRE
@@ -297,7 +301,6 @@ static inline void zero_options(struct rbh_options * opts)
 
 /* program options from command line  */
 static struct rbh_options options;
-
 
 /* special character sequences for displaying help */
 
@@ -339,6 +342,8 @@ static const char *help_string =
     "    " _B "-R" B_ ", " _B "--hsm-remove" B_ "\n"
     "        Perform deferred removal in HSM.\n"
 #endif
+    "    " _B "--partial-scan=" B_ _U "dir" U_ "\n"
+    "        Scan a subset of the filesystem namespace.\n"
     "\n"
     "    Default is: "DEFAULT_ACTION_HELP"\n"
     "\n"
@@ -826,7 +831,7 @@ static inline int do_write_template( const char *file )
         if ( stream == NULL )
         {
             rc = errno;
-            fprintf( stderr, "Error openning file '%s' for writting: %s.\n", file, strerror( rc ) );
+            fprintf( stderr, "Error opening file '%s' for writting: %s.\n", file, strerror( rc ) );
             return rc;
         }
     }
@@ -972,6 +977,16 @@ int main( int argc, char **argv )
             break;
         case 'i':
             options.flags |= FLAG_IGNORE_POL;
+            break;
+
+        case PARTIAL_SCAN:
+            options.flags |= FLAG_ONCE;
+            SET_ACTION_FLAG( ACTION_MASK_SCAN );
+            options.partial_scan = TRUE;
+            strncpy(options.partial_scan_path, optarg, RBH_PATH_MAX);
+            /* clean final slash */
+            if (FINAL_SLASH(options.partial_scan_path))
+                REMOVE_FINAL_SLASH(options.partial_scan_path);
             break;
 
 #ifdef _LUSTRE
@@ -1198,7 +1213,7 @@ int main( int argc, char **argv )
     /* get default config file, if not specified */
     if ( SearchConfig( options.config_file, options.config_file, &chgd ) != 0 )
     {
-        fprintf(stderr, "No config file found in '/etc/robinhood.d/"PURPOSE_EXT"', ...\n" );
+        fprintf(stderr, "No config file found\n" );
         exit(2);
     }
     else if (chgd)
@@ -1213,6 +1228,7 @@ int main( int argc, char **argv )
                  options.config_file, err_msg );
         exit( 1 );
     }
+    process_config_file = options.config_file;
 
     if ( options.test_syntax )
     {
@@ -1295,6 +1311,11 @@ int main( int argc, char **argv )
     if ( options.pid_file )
         create_pid_file( options.pid_filepath );
 
+    /* Initialize filesystem access */
+    rc = InitFS();
+    if (rc)
+        exit(rc);
+
 #ifdef _HSM_LITE
     rc = Backend_Start( &rh_config.backend_config, options.flags );
     if ( rc )
@@ -1356,7 +1377,12 @@ int main( int argc, char **argv )
     {
 
         /* Start FS scan */
-        rc = FSScan_Start( &rh_config.fs_scan_config, options.flags );
+        if (options.partial_scan)
+            rc = FSScan_Start( &rh_config.fs_scan_config, options.flags,
+                               options.partial_scan_path );
+        else
+            rc = FSScan_Start( &rh_config.fs_scan_config, options.flags, NULL );
+
         if ( rc )
         {
             DisplayLog( LVL_CRIT, MAIN_TAG, "Error %d initializing FS Scan module", rc );

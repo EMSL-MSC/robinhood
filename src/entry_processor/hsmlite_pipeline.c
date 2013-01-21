@@ -26,6 +26,9 @@
 #include "backend_ext.h"
 #include <errno.h>
 #include <time.h>
+#ifdef HAVE_SHOOK
+#include <shook_svr.h>
+#endif
 
 #define ERR_MISSING(_err) (((_err)==ENOENT)||((_err)==ESTALE))
 
@@ -79,17 +82,73 @@ pipeline_stage_t entry_proc_pipeline[] = {
 
 #ifdef HAVE_SHOOK
 #include <fnmatch.h>
-int shook_special_file( struct entry_proc_op_t * p_op )
+int shook_special_obj( struct entry_proc_op_t * p_op )
 {
-    if ( p_op->entry_attr_is_set || ATTR_MASK_TEST( &p_op->entry_attr, fullpath ) )
+    if (p_op->entry_attr_is_set && ATTR_MASK_TEST( &p_op->entry_attr, fullpath )
+        && ATTR_MASK_TEST( &p_op->entry_attr, type))
     {
-        if ( fnmatch( "*/.shook_locks/lock.*", ATTR(&p_op->entry_attr, fullpath ), 0 ) == 0 )
+        if ( !strcmp(STR_TYPE_FILE, ATTR(&p_op->entry_attr, type)) )
+        {
+            /* is it a lock file? */
+            if (!fnmatch("*/"LOCK_DIR"/"SHOOK_LOCK_PREFIX"*", ATTR(&p_op->entry_attr, fullpath ), 0))
+            {
+                /* skip the entry */
+                DisplayLog(LVL_DEBUG, ENTRYPROC_TAG, "%s is a shook lock",
+                           ATTR(&p_op->entry_attr, fullpath));
+                /** @TODO raise special event for the file: LOCK/UNLOCK */
+                return TRUE;
+            }
+#if 0 /* keep events on those entries */
+            /* is it a restripe src or tgt */
+            else if (!fnmatch("*/"RESTRIPE_DIR"/"RESTRIPE_SRC_PREFIX"*", ATTR(&p_op->entry_attr, fullpath ), 0))
+            {
+                /* skip the entry */
+                DisplayLog(LVL_DEBUG, ENTRYPROC_TAG, "%s is a shook restripe source",
+                           ATTR(&p_op->entry_attr, fullpath));
+                return TRUE;
+            }
+            else if (!fnmatch("*/"RESTRIPE_DIR"/"RESTRIPE_TGT_PREFIX"*", ATTR(&p_op->entry_attr, fullpath ), 0))
+            {
+                /* skip the entry */
+                DisplayLog(LVL_DEBUG, ENTRYPROC_TAG, "%s is a shook restripe target",
+                           ATTR(&p_op->entry_attr, fullpath));
+                return TRUE;
+            }
+#endif
+        }
+        else if (!strcmp(STR_TYPE_DIR, ATTR(&p_op->entry_attr, type)))
+        {
+            if (!fnmatch("*/"LOCK_DIR, ATTR(&p_op->entry_attr, fullpath ), 0))
+            {
+                /* skip the entry */
+                DisplayLog(LVL_DEBUG, ENTRYPROC_TAG, "%s is a shook lock dir",
+                           ATTR(&p_op->entry_attr, fullpath));
+                return TRUE;
+            }
+            else if (!fnmatch("*/"RESTRIPE_DIR, ATTR(&p_op->entry_attr, fullpath ), 0))
+            {
+                /* skip the entry */
+                DisplayLog(LVL_DEBUG, ENTRYPROC_TAG, "%s is a shook restripe dir",
+                           ATTR(&p_op->entry_attr, fullpath));
+                return TRUE;
+            }
+        }
+    }
+
+    /* also match '.shook' directory */
+    if (p_op->entry_attr_is_set && ATTR_MASK_TEST( &p_op->entry_attr, name)
+        && ATTR_MASK_TEST( &p_op->entry_attr, type))
+    {
+        if ( !strcmp(STR_TYPE_DIR, ATTR(&p_op->entry_attr, type)) &&
+             !strcmp(SHOOK_DIR, ATTR(&p_op->entry_attr, name)) )
         {
             /* skip the entry */
-            /** @TODO raise special event for the file: LOCK/UNLOCK */
+            DisplayLog(LVL_DEBUG, ENTRYPROC_TAG, "\"%s\" is a shook dir",
+                       ATTR(&p_op->entry_attr, name));
             return TRUE;
         }
     }
+
     return FALSE;
 }
 #endif
@@ -149,6 +208,43 @@ int EntryProc_get_fid( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
 #endif
 }
 
+static inline int soft_remove_filter(struct entry_proc_op_t *p_op)
+{
+    if (ATTR_MASK_TEST( &p_op->entry_attr, type )
+        && !strcmp( ATTR( &p_op->entry_attr, type ), STR_TYPE_DIR ))
+    {
+        DisplayLog( LVL_FULL, ENTRYPROC_TAG, "Removing directory entry (no rm in backend)");
+        return FALSE;
+    }
+    else if (ATTR_MASK_TEST(&p_op->entry_attr, status)
+        && (ATTR(&p_op->entry_attr, status) == STATUS_NEW))
+    {
+        DisplayLog( LVL_DEBUG, ENTRYPROC_TAG, "Removing 'new' entry ("DFID"): no remove in backend",
+                    PFID(&p_op->entry_id) );
+        return FALSE;
+    }
+#ifdef HAVE_SHOOK
+    /* if the removed entry is a restripe source,
+     * we MUST NOT remove the backend entry
+     * as it will be linked to the restripe target
+     */
+    else if ( (ATTR_MASK_TEST(&p_op->entry_attr, fullpath)
+               && !fnmatch("*/"RESTRIPE_DIR"/"RESTRIPE_SRC_PREFIX"*",
+                     ATTR(&p_op->entry_attr, fullpath), 0))
+        ||
+        (ATTR_MASK_TEST(&p_op->entry_attr, name)
+         && !strncmp(RESTRIPE_SRC_PREFIX, ATTR(&p_op->entry_attr, name ),
+                     strlen(RESTRIPE_SRC_PREFIX))))
+    {
+        DisplayLog( LVL_DEBUG, ENTRYPROC_TAG, "Removing shook stripe source %s: no removal in backend!",
+                    ATTR_MASK_TEST(&p_op->entry_attr, fullpath)?
+                    ATTR(&p_op->entry_attr, fullpath) :
+                    ATTR(&p_op->entry_attr, name) );
+        return FALSE;
+    }
+#endif
+    return TRUE;
+}
 
 #ifdef HAVE_CHANGELOGS
 /**
@@ -159,7 +255,7 @@ static int EntryProc_FillFromLogRec( struct entry_proc_op_t *p_op,
                                      int allow_md_updt, int allow_path_updt )
 {
     /* alias to the log record */
-    struct changelog_rec * logrec = p_op->extra_info.log_record.p_log_rec;
+    CL_REC_TYPE *logrec = p_op->extra_info.log_record.p_log_rec;
 
     /* if this is a CREATE record, we know that its status is NEW. */
     if ( logrec->cr_type == CL_CREATE )
@@ -226,6 +322,7 @@ static int EntryProc_FillFromLogRec( struct entry_proc_op_t *p_op,
         /* entry is a directory */
         ATTR_MASK_SET( &p_op->entry_attr, type );
         strcpy( ATTR( &p_op->entry_attr, type ), STR_TYPE_DIR );
+        p_op->extra_info.getstripe_needed = FALSE;
     }
     else if (logrec->cr_type == CL_UNLINK )
     {
@@ -261,20 +358,20 @@ static int EntryProc_FillFromLogRec( struct entry_proc_op_t *p_op,
             p_op->extra_info.getstatus_needed = TRUE;
         }
     }
-    else if (CL_CHG_TIME(logrec->cr_type))
+    else if (CL_CHG_TIME(logrec->cr_type) || (logrec->cr_type == CL_SETATTR))
     {
         /* need to update attrs */
         p_op->extra_info_is_set = TRUE;
         p_op->extra_info.getattr_needed = TRUE;
 #ifdef HAVE_SHOOK
-        /* in Lustre v2.O, changing trusted xattr generates CTIME event */
+        /* in Lustre v2.O, changing trusted xattr generates CTIME/SATTR event */
         p_op->extra_info.getstatus_needed = TRUE;
 
         DisplayLog( LVL_DEBUG, ENTRYPROC_TAG,
-                    "getstatus and getattr needed because this is a CTIME event" );
+                    "getstatus and getattr needed because this is a CTIME or SATTR event" );
 #else
         DisplayLog( LVL_DEBUG, ENTRYPROC_TAG,
-                    "getattr needed because this is a CTIME event" );
+                    "getattr needed because this is a CTIME or SATTR event" );
 #endif
     }
 
@@ -294,6 +391,18 @@ static int EntryProc_FillFromLogRec( struct entry_proc_op_t *p_op,
                     DisplayLog( LVL_DEBUG, ENTRYPROC_TAG,
                              "Getpath needed because name changed: '%s'->'%s'",
                              ATTR( &p_op->entry_attr, name ), logrec->cr_name );
+
+#ifdef HAVE_SHOOK
+                    /* if the old name is a restripe file, also update the status */
+                    if (!strncmp(RESTRIPE_TGT_PREFIX, ATTR( &p_op->entry_attr, name ), strlen(RESTRIPE_TGT_PREFIX)))
+                    {
+                        p_op->extra_info.getstatus_needed = TRUE;
+                        DisplayLog( LVL_DEBUG, ENTRYPROC_TAG,
+                                    "Getstatus needed because rename source is a restripe target");
+                    }
+#endif
+
+
                 }
             }
             else if ( ATTR_MASK_TEST( &p_op->entry_attr, fullpath ) )
@@ -357,13 +466,20 @@ static int EntryProc_FillFromLogRec( struct entry_proc_op_t *p_op,
 static int EntryProc_ProcessLogRec( struct entry_proc_op_t *p_op )
 {
     /* short alias */
-    struct changelog_rec * logrec = p_op->extra_info.log_record.p_log_rec;
+    CL_REC_TYPE * logrec = p_op->extra_info.log_record.p_log_rec;
 
     /* allow event-driven update */
     int md_allow_event_updt = TRUE;
     int path_allow_event_updt = TRUE;
 
     /* TODO RMDIR */
+
+    /* is there parent_id in log rec ? */
+    if ( logrec->cr_namelen > 0 )
+    {
+        ATTR_MASK_SET( &p_op->entry_attr, parent_id );
+        ATTR( &p_op->entry_attr, parent_id ) = logrec->cr_pfid;
+    }
 
     if ( logrec->cr_type == CL_UNLINK )
     {
@@ -391,6 +507,7 @@ static int EntryProc_ProcessLogRec( struct entry_proc_op_t *p_op )
                     return STAGE_DB_APPLY;
                 }
                 else
+                    /* ignore the record */
                     return STAGE_CHGLOG_CLR;
             }
             else /* hsm removal enabled: must check if there is some cleaning
@@ -398,7 +515,11 @@ static int EntryProc_ProcessLogRec( struct entry_proc_op_t *p_op )
             {
                 /* If the entry exists in DB, this moves it from main table
                  * to a remove queue, else, just insert it to remove queue. */
-                p_op->db_op_type = OP_TYPE_SOFT_REMOVE;
+
+                if (soft_remove_filter(p_op))
+                    p_op->db_op_type = OP_TYPE_SOFT_REMOVE;
+                else
+                    p_op->db_op_type = OP_TYPE_REMOVE;
                 return STAGE_DB_APPLY;
             }
         }
@@ -488,16 +609,21 @@ int EntryProc_get_info_db( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
     /* is this a changelog record? */
     if ( p_op->extra_info.is_changelog_record )
     {
-        struct changelog_rec * logrec = p_op->extra_info.log_record.p_log_rec;
+        CL_REC_TYPE *logrec = p_op->extra_info.log_record.p_log_rec;
 
         /* what do we know about this entry? */
         ATTR_MASK_INIT( &p_op->entry_attr );
         ATTR_MASK_SET( &p_op->entry_attr, fullpath );
         ATTR_MASK_SET( &p_op->entry_attr, name );
+        ATTR_MASK_SET( &p_op->entry_attr, type );
         ATTR_MASK_SET( &p_op->entry_attr, stripe_info );
         ATTR_MASK_SET( &p_op->entry_attr, md_update );
         ATTR_MASK_SET( &p_op->entry_attr, path_update );
         ATTR_MASK_SET( &p_op->entry_attr, status );
+#ifdef ATTR_INDEX_creation_time
+        if (entry_proc_conf.detect_fake_mtime)
+            ATTR_MASK_SET( &p_op->entry_attr, creation_time);
+#endif
 
         if ( entry_proc_conf.match_classes )
         {
@@ -514,15 +640,16 @@ int EntryProc_get_info_db( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
 
         /* what info is needed to check backend status? */
         rc = rbhext_status_needs( TYPE_NONE,
-                                &attr_allow_cached,
-                                &attr_need_fresh );
+                                  &attr_allow_cached,
+                                  &attr_need_fresh );
         if ( rc != 0 )
         {
             if ( rc == -ENOTSUP )
             {
                 /* this type can't be backup'ed: skip the record */
-                next_stage = STAGE_CHGLOG_CLR;
-                goto next_step;
+                ATTR_MASK_UNSET(&p_op->entry_attr, status);
+                p_op->extra_info.getstatus_needed = FALSE;
+                p_op->extra_info.not_supp = TRUE;
             }
             else
                 DisplayLog( LVL_MAJOR, ENTRYPROC_TAG,
@@ -604,6 +731,13 @@ int EntryProc_get_info_db( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
                         rc_status_need );
             attr_allow_cached = attr_need_fresh = 0;
         }
+        if (rc_status_need == -ENOTSUP)
+             p_op->extra_info.not_supp = TRUE;
+
+#ifdef ATTR_INDEX_creation_time
+        if (entry_proc_conf.detect_fake_mtime)
+            attr_allow_cached |= ATTR_MASK_creation_time;
+#endif
 
         /* full path and posix attrs are already set for scans */
         attr_need_fresh &= ~( ATTR_MASK_fullpath | POSIX_ATTR_MASK );
@@ -629,7 +763,8 @@ int EntryProc_get_info_db( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
                                        & ~p_op->entry_attr.attr_mask);
 
                 /* no class for directories */
-                if ( strcmp( ATTR(&p_op->entry_attr, type), STR_TYPE_DIR ) != 0 )
+                if ( ATTR_MASK_TEST(&p_op->entry_attr, type) &&
+                     strcmp( ATTR(&p_op->entry_attr, type), STR_TYPE_DIR ) != 0 )
                 {
                     if ( entry_proc_conf.match_classes )
                     {
@@ -684,8 +819,12 @@ int EntryProc_get_info_db( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
         {
             /* new entry */
             p_op->db_op_type = OP_TYPE_INSERT;
-            ATTR_MASK_SET( &p_op->entry_attr, creation_time );
-            ATTR( &p_op->entry_attr, creation_time ) = time( NULL );
+
+            if (!ATTR_MASK_TEST(&p_op->entry_attr, creation_time))
+            {
+                ATTR_MASK_SET( &p_op->entry_attr, creation_time );
+                ATTR( &p_op->entry_attr, creation_time ) = time( NULL );
+            }
 
             p_op->extra_info_is_set = TRUE;
             p_op->extra_info.getstatus_needed = TRUE;
@@ -727,9 +866,9 @@ int EntryProc_get_info_db( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
 
         if ( rc_status_need == -ENOTSUP )
         {
-            /* entry type is not managed for this backend => skipped */
-            next_stage = -1;
-            goto next_step;
+            /* entry type is not managed for this backend */
+            p_op->extra_info.getstatus_needed = FALSE;
+            p_op->extra_info.not_supp = TRUE;
         }
         else if ( attr_need_fresh )
         {
@@ -829,7 +968,37 @@ int EntryProc_get_info_fs( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
 
             ATTR_MASK_SET( &p_op->entry_attr, md_update );
             ATTR( &p_op->entry_attr, md_update ) = time( NULL );
+
         } /* getattr needed */
+
+
+#ifdef ATTR_INDEX_creation_time
+        if (entry_proc_conf.detect_fake_mtime)
+        {
+            if (ATTR_MASK_TEST(&p_op->entry_attr, creation_time)
+                && ATTR_MASK_TEST(&p_op->entry_attr, last_mod)
+                && ATTR(&p_op->entry_attr, last_mod) < ATTR(&p_op->entry_attr, creation_time))
+            {
+                time_t val;
+                char mt[128];
+                char ct[128];
+                struct tm      t;
+                val = ATTR(&p_op->entry_attr, last_mod);
+                strftime(mt, 128, "%Y/%m/%d %T", localtime_r(&val, &t));
+                val = ATTR(&p_op->entry_attr, creation_time);
+                strftime(ct, 128, "%Y/%m/%d %T", localtime_r(&val, &t));
+
+                if (ATTR_MASK_TEST(&p_op->entry_attr, fullpath))
+                    DisplayLog(LVL_VERB, ENTRYPROC_TAG,
+                               "Fake mtime detected for %s: mtime=%s, creation=%s",
+                               ATTR(&p_op->entry_attr, fullpath), mt, ct);
+                else
+                    DisplayLog(LVL_VERB, ENTRYPROC_TAG,
+                               "Fake mtime detected for "DFID": mtime=%s, creation=%s",
+                               PFID(&p_op->entry_id), mt, ct);
+            }
+        }
+#endif
 
         if ( p_op->extra_info.getpath_needed )
         {
@@ -931,15 +1100,16 @@ int EntryProc_get_info_fs( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
             else if ( rc == -ENOTSUP )
             {
                 /* this type of entry is not managed: ignored */
-                /* TODO: backup md in database anyhow */
-                goto skip_record;
+                p_op->extra_info.not_supp = TRUE;
+                /* no status */
+                ATTR_MASK_UNSET(&p_op->entry_attr, status);
             }
 
         } /* get_status needed */
     }
 
     /* match fileclasses if specified in config */
-    if ( entry_proc_conf.match_classes )
+    if ( entry_proc_conf.match_classes && !p_op->extra_info.not_supp )
         check_policies( &p_op->entry_id, &p_op->entry_attr, TRUE );
 
     /* set other info */
@@ -976,28 +1146,18 @@ rm_record:
     /* soft remove the entry, except if it was 'new' (not in backend)
      * or not in DB.
      */
-    if (ATTR_MASK_TEST(&p_op->entry_attr, status)
-        && (ATTR(&p_op->entry_attr, status) == STATUS_NEW))
-    {
-        DisplayLog( LVL_DEBUG, ENTRYPROC_TAG, "Removing 'new' entry ("DFID"): no remove in backend",
-                    PFID(&p_op->entry_id) );
+
+    if (!soft_remove_filter(p_op))
         p_op->db_op_type = OP_TYPE_REMOVE;
-        rc = EntryProcessor_Acknowledge( p_op, STAGE_DB_APPLY, FALSE );
-        if ( rc )
-            DisplayLog( LVL_CRIT, ENTRYPROC_TAG, "Error %d acknowledging stage.", rc );
-    }
     else if ( p_op->db_exists )
-    {
         p_op->db_op_type = OP_TYPE_SOFT_REMOVE;
-        rc = EntryProcessor_Acknowledge( p_op, STAGE_DB_APPLY, FALSE );
-        if ( rc )
-            DisplayLog( LVL_CRIT, ENTRYPROC_TAG, "Error %d acknowledging stage.", rc );
-    }
     else
-    {
         /* drop the record */
         goto skip_record;
-    }
+
+    rc = EntryProcessor_Acknowledge( p_op, STAGE_DB_APPLY, FALSE );
+    if ( rc )
+        DisplayLog( LVL_CRIT, ENTRYPROC_TAG, "Error %d acknowledging stage.", rc );
     return rc;
 }
 
@@ -1052,7 +1212,7 @@ int EntryProc_reporting( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
         }
     }
 
-    /* acknoledge now if the stage is asynchronous */
+    /* acknowledge now if the stage is asynchronous */
     if ( stage_info->stage_flags & STAGE_FLAG_ASYNC )
     {
         rc = EntryProcessor_Acknowledge( p_op, STAGE_DB_APPLY, FALSE );
@@ -1064,7 +1224,7 @@ int EntryProc_reporting( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
     if ( is_alert )
         RaiseEntryAlert(title, stralert, strid, strvalues );
 
-    /* acknoledge now if the stage was synchronous */
+    /* acknowledge now if the stage was synchronous */
     if ( !( stage_info->stage_flags & STAGE_FLAG_ASYNC ) )
     {
         rc = EntryProcessor_Acknowledge( p_op, STAGE_DB_APPLY, FALSE );
@@ -1092,15 +1252,21 @@ int EntryProc_db_apply( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
     }
 
 #ifdef HAVE_SHOOK
-    if (shook_special_file( p_op )) {
-                DisplayLog( LVL_FULL, ENTRYPROC_TAG,
-                    "Shook lock file '%s', skipped",
+    if (shook_special_obj( p_op )) {
+                DisplayLog( LVL_DEBUG, ENTRYPROC_TAG,
+                    "Shook special file or dir '%s', skipped",
                     (ATTR_MASK_TEST( &p_op->entry_attr, fullpath )?
                      ATTR(&p_op->entry_attr, fullpath):
                      ATTR(&p_op->entry_attr, name)) );
         /* skip special shook entry */
         goto skip_record;
     }
+#endif
+
+#ifdef ATTR_INDEX_creation_time
+    /* never change creation time */
+    if (p_op->db_op_type != OP_TYPE_INSERT)
+        ATTR_MASK_UNSET( &p_op->entry_attr, creation_time );
 #endif
 
     /* insert to DB */
@@ -1121,9 +1287,10 @@ int EntryProc_db_apply( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
         rc = ListMgr_Remove( lmgr, &p_op->entry_id );
         break;
     case OP_TYPE_SOFT_REMOVE:
-        DisplayLog( LVL_FULL, ENTRYPROC_TAG, "SoftRemove("DFID", path=%x, bkpath=%x)",
-                    PFID(&p_op->entry_id), ATTR_MASK_TEST( &p_op->entry_attr, fullpath ),
-                    ATTR_MASK_TEST( &p_op->entry_attr, backendpath ) );
+        DisplayLog( LVL_DEBUG, ENTRYPROC_TAG, "SoftRemove("DFID", path=%s, bkpath=%s)",
+                    PFID(&p_op->entry_id),
+                    ATTR_MASK_TEST( &p_op->entry_attr, fullpath )?ATTR(&p_op->entry_attr, fullpath):"",
+                    ATTR_MASK_TEST( &p_op->entry_attr, backendpath )?ATTR(&p_op->entry_attr, backendpath):"" );
         rc = ListMgr_SoftRemove( lmgr, &p_op->entry_id,
                 ATTR_MASK_TEST( &p_op->entry_attr, fullpath )?ATTR(&p_op->entry_attr, fullpath ):NULL,
                 ATTR_MASK_TEST( &p_op->entry_attr, backendpath )?ATTR(&p_op->entry_attr, backendpath ):NULL,
@@ -1137,14 +1304,14 @@ int EntryProc_db_apply( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
     if ( rc )
         DisplayLog( LVL_CRIT, ENTRYPROC_TAG, "Error %d performing database operation.", rc );
 
-    /* Acknoledge the operation if there is a callback */
+    /* Acknowledge the operation if there is a callback */
     if ( p_op->callback_func )
         rc = EntryProcessor_Acknowledge( p_op, STAGE_CHGLOG_CLR, FALSE );
     else
         rc = EntryProcessor_Acknowledge( p_op, -1, TRUE );
 
     if ( rc )
-        DisplayLog( LVL_CRIT, ENTRYPROC_TAG, "Error %d acknoledging stage %s.", rc,
+        DisplayLog( LVL_CRIT, ENTRYPROC_TAG, "Error %d acknowledging stage %s.", rc,
                     stage_info->stage_name );
 
     return rc;
@@ -1170,7 +1337,7 @@ int            EntryProc_chglog_clr( struct entry_proc_op_t * p_op, lmgr_t * lmg
 {
     int            rc;
     const pipeline_stage_t *stage_info = &entry_proc_pipeline[p_op->pipeline_stage];
-    struct changelog_rec * logrec = p_op->extra_info.log_record.p_log_rec;
+    CL_REC_TYPE * logrec = p_op->extra_info.log_record.p_log_rec;
 
     if (p_op->extra_info.is_changelog_record)
         DisplayLog( LVL_FULL, ENTRYPROC_TAG, "stage %s - record #%llu - id="DFID"\n", stage_info->stage_name,
@@ -1186,10 +1353,10 @@ int            EntryProc_chglog_clr( struct entry_proc_op_t * p_op, lmgr_t * lmg
                         stage_info->stage_name );
     }
 
-    /* Acknoledge the operation and remove it from pipeline */
+    /* Acknowledge the operation and remove it from pipeline */
     rc = EntryProcessor_Acknowledge( p_op, -1, TRUE );
     if ( rc )
-        DisplayLog( LVL_CRIT, ENTRYPROC_TAG, "Error %d acknoledging stage %s.", rc,
+        DisplayLog( LVL_CRIT, ENTRYPROC_TAG, "Error %d acknowledging stage %s.", rc,
                     stage_info->stage_name );
 
     return rc;
@@ -1199,7 +1366,6 @@ int EntryProc_rm_old_entries( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
 {
     int            rc;
     const pipeline_stage_t *stage_info = &entry_proc_pipeline[p_op->pipeline_stage];
-    char           timestamp[128];
     lmgr_filter_t  filter;
     filter_value_t val;
 
@@ -1208,11 +1374,22 @@ int EntryProc_rm_old_entries( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
     val.val_uint = ATTR( &p_op->entry_attr, md_update );
     lmgr_simple_filter_add( &filter, ATTR_INDEX_md_update, LESSTHAN_STRICT, val, 0 );
 
+    /* partial scan: remove non-updated entries from a subset of the namespace */
+    if (ATTR_MASK_TEST( &p_op->entry_attr, fullpath ))
+    {
+        char tmp[RBH_PATH_MAX];
+        strcpy(tmp, ATTR(&p_op->entry_attr, fullpath));
+        strcat(tmp, "/*");
+        val.val_str = tmp;
+        lmgr_simple_filter_add( &filter, ATTR_INDEX_fullpath, LIKE, val, 0 );
+    }
+
     /* force commit after this operation */
     ListMgr_ForceCommitFlag( lmgr, TRUE );
 
     /* remove entries listed in previous scans */
     if (policies.unlink_policy.hsm_remove)
+        /* @TODO fix for dirs */
         rc = ListMgr_MassSoftRemove( lmgr, &filter, time(NULL) + policies.unlink_policy.deferred_remove_delay );
     else
         rc = ListMgr_MassRemove( lmgr, &filter );
@@ -1238,7 +1415,7 @@ int EntryProc_rm_old_entries( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
     rc = EntryProcessor_Acknowledge( p_op, -1, TRUE );
 
     if ( rc )
-        DisplayLog( LVL_CRIT, ENTRYPROC_TAG, "Error %d acknoledging stage %s.", rc,
+        DisplayLog( LVL_CRIT, ENTRYPROC_TAG, "Error %d acknowledging stage %s.", rc,
                     stage_info->stage_name );
 
     return rc;

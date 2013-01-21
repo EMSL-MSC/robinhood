@@ -42,12 +42,12 @@ typedef lustre_fid entry_id_t;
 #define INUM_PK
 typedef struct __entry_id__
 {
-  dev_t device;
+  uint64_t fs_key;
   ino_t inode;
   int validator;
 } entry_id_t;
 
-#define entry_id_equal( _p_id_1, _p_id_2 ) ( ((_p_id_1)->device == (_p_id_2)->device) && ((_p_id_1)->inode == (_p_id_2)->inode)  )
+#define entry_id_equal( _p_id_1, _p_id_2 ) ( ((_p_id_1)->fs_key == (_p_id_2)->fs_key) && ((_p_id_1)->inode == (_p_id_2)->inode)  )
 
 #endif
 
@@ -113,7 +113,9 @@ typedef enum
   STATUS_SYNCHRO,               /* file has been synchronized in HSM, file can be purged */
   STATUS_RELEASED,              /* file is released (nothing to do). XXX should not be in DB? */
   STATUS_RELEASE_PENDING,    	/* file is being released */
-  STATUS_REMOVED                /* file has been removed from lustre and still exists in the backend */
+  STATUS_REMOVED,               /* file has been removed from lustre and still exists in the backend */
+
+  STATUS_COUNT                  /* number of possible file status */
 } file_status_t;
 
 
@@ -121,6 +123,10 @@ typedef enum
 
 # /!\ Entry attribute type must fit with DB type
 # name,	C type,	db type, size (C and db), flags (INIT_ONLY, FREQ_ACCESS or ANNEX_INFO)
+
+parent_id,      entry_id_t,    DB_ID,          0, FREQ_ACCESS | INDEXED
+dircount, 	    unsigned int,  DB_UINT,        0, DIR_ATTR, type, NULL
+avgsize, 	    uint64_t,      DB_BIGUINT,     0, DIR_ATTR, type, NULL
 
 # important attributes for building LRUs
 #file status compared to external backend
@@ -163,9 +169,6 @@ archive_class,      char,           DB_TEXT,    128,   FREQ_ACCESS
 arch_cl_update,     unsigned int,   DB_UINT,      0,   FREQ_ACCESS
 release_class,      char,           DB_TEXT,    128,   FREQ_ACCESS
 rel_cl_update,      unsigned int,   DB_UINT,      0,   FREQ_ACCESS
-
-# directories only
-dircount, 	unsigned int, DB_UINT, 0, ANNEX_INFO
 
 # info that is set once for each file
 creation_time,  unsigned int,   DB_UINT,    0,       INIT_ONLY

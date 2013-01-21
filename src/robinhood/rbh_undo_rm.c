@@ -381,7 +381,7 @@ static inline void undo_rm_helper( entry_id_t * id, const char *last_known_path,
     }
 
     /* copy file to Lustre */
-    st = rbhext_recover( id, &attrs, &new_id, &new_attrs );
+    st = rbhext_recover( id, &attrs, &new_id, &new_attrs, NULL );
     if ( (st == RS_OK) || (st == RS_DELTA) )
     {
         printf("Success\n");
@@ -570,6 +570,7 @@ int main( int argc, char **argv )
         fprintf( stderr, "Error reading configuration file '%s': %s\n", config_file, err_msg );
         exit( 1 );
     }
+    process_config_file = config_file;
 
     /* set global configuration */
     global_config = config.global_config;
@@ -594,22 +595,10 @@ int main( int argc, char **argv )
         exit( rc );
     }
 
-    /* Initialize mount point info */
-#ifdef _LUSTRE
-    if ( ( rc = Lustre_Init(  ) ) )
-    {
-        fprintf( stderr, "Error %d initializing liblustreapi\n", rc );
-        exit( 1 );
-    }
-
-    rc = CheckFSInfo( global_config.fs_path, global_config.fs_type, NULL,
-                      global_config.check_mounted, TRUE );
+    /* Initialize Filesystem access */
+    rc = InitFS();
     if (rc)
-    {
-        DisplayLog( LVL_CRIT, LOGTAG, "Error %d checking Filesystem", rc );
-        exit( rc );
-    }
-#endif
+        exit(rc);
 
     /* Initialize list manager */
     rc = ListMgr_Init( &config.lmgr_config, FALSE );

@@ -123,7 +123,7 @@ static int EntryProc_FillFromLogRec( struct entry_proc_op_t *p_op,
                                      int allow_md_updt, int allow_path_updt )
 {
     /* alias to the log record */
-    struct changelog_rec * logrec = p_op->extra_info.log_record.p_log_rec;
+    CL_REC_TYPE *logrec = p_op->extra_info.log_record.p_log_rec;
 
     /* if this is a CREATE record, we know that its status is NEW. */
     if ( logrec->cr_type == CL_CREATE )
@@ -176,6 +176,15 @@ static int EntryProc_FillFromLogRec( struct entry_proc_op_t *p_op,
             ATTR( &p_op->entry_attr, last_restore ) = 0;
             ATTR_MASK_SET( &p_op->entry_attr, last_restore );
         }
+    }
+    else if ((logrec->cr_type == CL_MKDIR )
+            || (logrec->cr_type == CL_RMDIR ))
+    {
+        /* entry is a directory */
+        ATTR_MASK_SET( &p_op->entry_attr, type );
+        strcpy( ATTR( &p_op->entry_attr, type ), STR_TYPE_DIR );
+        p_op->extra_info.getstripe_needed = FALSE;
+        p_op->extra_info.getstatus_needed = FALSE;
     }
     else if ( logrec->cr_type == CL_HSM )
     {
@@ -364,13 +373,18 @@ static int EntryProc_FillFromLogRec( struct entry_proc_op_t *p_op,
 static int EntryProc_ProcessLogRec( struct entry_proc_op_t *p_op )
 {
     /* short alias */
-    struct changelog_rec * logrec = p_op->extra_info.log_record.p_log_rec;
+    CL_REC_TYPE *logrec = p_op->extra_info.log_record.p_log_rec;
 
     /* allow event-driven update */
     int md_allow_event_updt = TRUE;
     int path_allow_event_updt = TRUE;
 
-    /* TODO : mkdir/rmdir => directory */
+    /* is there parent_id in log rec ? */
+    if ( logrec->cr_namelen > 0 )
+    {
+        ATTR_MASK_SET( &p_op->entry_attr, parent_id );
+        ATTR( &p_op->entry_attr, parent_id ) = logrec->cr_pfid;
+    }
 
     if ( logrec->cr_type == CL_UNLINK )
     {
@@ -494,7 +508,7 @@ int EntryProc_get_info_db( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
     /* is this a changelog record? */
     if ( p_op->extra_info.is_changelog_record )
     {
-        struct changelog_rec * logrec = p_op->extra_info.log_record.p_log_rec;
+        CL_REC_TYPE *logrec = p_op->extra_info.log_record.p_log_rec;
 
         /* what do we know about this entry? */
         ATTR_MASK_INIT( &p_op->entry_attr );
@@ -504,6 +518,10 @@ int EntryProc_get_info_db( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
         ATTR_MASK_SET( &p_op->entry_attr, md_update );
         ATTR_MASK_SET( &p_op->entry_attr, path_update );
         ATTR_MASK_SET( &p_op->entry_attr, status );
+#ifdef ATTR_INDEX_creation_time
+        if (entry_proc_conf.detect_fake_mtime)
+            ATTR_MASK_SET( &p_op->entry_attr, creation_time);
+#endif
 
         if ( entry_proc_conf.match_classes )
         {
@@ -567,48 +585,49 @@ int EntryProc_get_info_db( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
             goto next_step;
         }
 
-        /* skip directories */
-        if ( ATTR_MASK_TEST( &p_op->entry_attr, type )
-             && !strcmp( ATTR(&p_op->entry_attr, type), STR_TYPE_DIR ) )
-        {
-            DisplayLog( LVL_DEBUG, ENTRYPROC_TAG,
-                        "Skipping entry (directory): %s",
-                        ATTR( &p_op->entry_attr, fullpath ) );
-            /* skip the entry */
-            next_stage = -1;
-            goto next_step;
-        }
-
         /* check if the entry exists in DB */
         p_op->db_exists = ListMgr_Exists( lmgr, &p_op->entry_id );
 
         if ( p_op->db_exists )
         {
+            int needed = entry_proc_conf.alert_attr_mask;
+
+#ifdef ATTR_INDEX_creation_time
+            if (entry_proc_conf.detect_fake_mtime)
+                needed |= ATTR_MASK_creation_time;
+#endif
+
             /* retrieve missing attrs, if needed */
             if ( entry_proc_conf.match_classes ||
-                (entry_proc_conf.alert_attr_mask & ~p_op->entry_attr.attr_mask) )
+                (needed & ~p_op->entry_attr.attr_mask) )
             {
                 attr_set_t tmp_attr;
 
                 ATTR_MASK_INIT( &tmp_attr );
 
-                tmp_attr.attr_mask |= (entry_proc_conf.alert_attr_mask
-                                       & ~p_op->entry_attr.attr_mask);
+                tmp_attr.attr_mask |= (needed & ~p_op->entry_attr.attr_mask);
 
-                if ( entry_proc_conf.match_classes )
+                /* no class for directories */
+                if ( ATTR_MASK_TEST(&p_op->entry_attr, type) &&
+                     strcmp( ATTR(&p_op->entry_attr, type), STR_TYPE_DIR ) != 0 )
                 {
-                    /* get fileclass update info to know if we must check it */
-                    ATTR_MASK_SET( &tmp_attr, rel_cl_update );
-                    ATTR_MASK_SET( &tmp_attr, release_class );
+                    if ( entry_proc_conf.match_classes )
+                    {
+                        /* get fileclass update info to know if we must check it */
+                        ATTR_MASK_SET( &tmp_attr, rel_cl_update );
+                        ATTR_MASK_SET( &tmp_attr, release_class );
 
-                    tmp_attr.attr_mask |= (policies.purge_policies.global_attr_mask
-                                           & ~p_op->entry_attr.attr_mask);
+                        tmp_attr.attr_mask |= (policies.purge_policies.global_attr_mask
+                                               & ~p_op->entry_attr.attr_mask);
 
-                    ATTR_MASK_SET( &tmp_attr, arch_cl_update );
-                    ATTR_MASK_SET( &tmp_attr, archive_class );
+                        ATTR_MASK_SET( &tmp_attr, arch_cl_update );
+                        ATTR_MASK_SET( &tmp_attr, archive_class );
 
-                    tmp_attr.attr_mask |= (policies.migr_policies.global_attr_mask
-                                           & ~p_op->entry_attr.attr_mask);
+                        tmp_attr.attr_mask |= (policies.migr_policies.global_attr_mask
+                                               & ~p_op->entry_attr.attr_mask);
+                    }
+                    /* no dircount for files */
+                    tmp_attr.attr_mask &= ~ATTR_MASK_dircount;
                 }
 
                 if( tmp_attr.attr_mask )
@@ -642,14 +661,28 @@ int EntryProc_get_info_db( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
         {
             /* new entry */
             p_op->db_op_type = OP_TYPE_INSERT;
-            ATTR_MASK_SET( &p_op->entry_attr, creation_time );
-            ATTR( &p_op->entry_attr, creation_time ) = time( NULL );
 
+            if (!ATTR_MASK_TEST(&p_op->entry_attr, creation_time))
+            {
+                ATTR_MASK_SET( &p_op->entry_attr, creation_time );
+                ATTR( &p_op->entry_attr, creation_time ) = time( NULL );
+            }
+
+            /* defaults */
             p_op->extra_info_is_set = TRUE;
             p_op->extra_info.getstatus_needed = TRUE;
             p_op->extra_info.getstripe_needed = TRUE;
             p_op->extra_info.getattr_needed = FALSE;
             p_op->extra_info.getpath_needed = FALSE;
+
+            if ( p_op->entry_attr_is_set
+                 && ATTR_MASK_TEST( &p_op->entry_attr, type )
+                 && strcmp( ATTR( &p_op->entry_attr, type ), STR_TYPE_FILE ) != 0 )
+            {
+                /* not a file, for sure */
+                p_op->extra_info.getstatus_needed = FALSE;
+                p_op->extra_info.getstripe_needed = FALSE;
+            }
 
             next_stage = STAGE_GET_INFO_FS;
         }
@@ -659,20 +692,28 @@ int EntryProc_get_info_db( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
 
             /* FS scan is used for resynchronizing DB, so we always get status */
             p_op->extra_info_is_set = TRUE;
-            p_op->extra_info.getstatus_needed = TRUE;
+            p_op->extra_info.getstatus_needed = FALSE;
             p_op->extra_info.getattr_needed = FALSE;
             p_op->extra_info.getpath_needed = FALSE;
 
-            /* Does file has stripe info ? */
-            if ( ListMgr_CheckStripe( lmgr, &p_op->entry_id ) != DB_SUCCESS )
+            if ( p_op->entry_attr_is_set
+                 && ATTR_MASK_TEST( &p_op->entry_attr, type )
+                 && !strcmp( ATTR( &p_op->entry_attr, type ), STR_TYPE_FILE ) )
             {
-                DisplayLog( LVL_DEBUG, ENTRYPROC_TAG, "Stripe information is missing" );
-                p_op->extra_info.getstripe_needed = TRUE;
+                /* only get status for files */
+                p_op->extra_info.getstatus_needed = TRUE;
+
+                /* Does file has stripe info ? */
+                if ( ListMgr_CheckStripe( lmgr, &p_op->entry_id ) != DB_SUCCESS )
+                {
+                    DisplayLog( LVL_DEBUG, ENTRYPROC_TAG, "Stripe information is missing" );
+                    p_op->extra_info.getstripe_needed = TRUE;
+                }
             }
 
             next_stage = STAGE_GET_INFO_FS;
         }
-    }
+    } /* end if scan */
 
 next_step:
     if ( next_stage == -1 )
@@ -738,13 +779,6 @@ int EntryProc_get_info_fs( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
                 goto skip_record;
             }
 
-            /* only files are considered (however, ack the record)*/
-            if ( !S_ISREG( entry_md.st_mode ) )
-            {
-                rc = EntryProcessor_Acknowledge( p_op, STAGE_CHGLOG_CLR, FALSE );
-                return rc;
-            }
-
             /* convert them to internal structure */
 #if defined( _MDS_STAT_SUPPORT )
             PosixStat2EntryAttr( &entry_md, &p_op->entry_attr, !global_config.direct_mds_stat );
@@ -757,6 +791,34 @@ int EntryProc_get_info_fs( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
             ATTR( &p_op->entry_attr, md_update ) = time( NULL );
 
         } /* getattr needed */
+
+#ifdef ATTR_INDEX_creation_time
+        if (entry_proc_conf.detect_fake_mtime)
+        {
+            if (ATTR_MASK_TEST(&p_op->entry_attr, creation_time)
+                && ATTR_MASK_TEST(&p_op->entry_attr, last_mod)
+                && ATTR(&p_op->entry_attr, last_mod) < ATTR(&p_op->entry_attr, creation_time))
+            {
+                time_t val;
+                char mt[128];
+                char ct[128];
+                struct tm      t;
+                val = ATTR(&p_op->entry_attr, last_mod);
+                strftime(mt, 128, "%Y/%m/%d %T", localtime_r(&val, &t));
+                val = ATTR(&p_op->entry_attr, creation_time);
+                strftime(ct, 128, "%Y/%m/%d %T", localtime_r(&val, &t));
+
+                if (ATTR_MASK_TEST(&p_op->entry_attr, fullpath))
+                    DisplayLog(LVL_VERB, ENTRYPROC_TAG,
+                               "Fake mtime detected for %s: mtime=%s, creation=%s",
+                               ATTR(&p_op->entry_attr, fullpath), mt, ct);
+                else
+                    DisplayLog(LVL_VERB, ENTRYPROC_TAG,
+                               "Fake mtime detected for "DFID": mtime=%s, creation=%s",
+                               PFID(&p_op->entry_id), mt, ct);
+            }
+        }
+#endif
 
         if ( p_op->extra_info.getpath_needed )
         {
@@ -788,6 +850,13 @@ int EntryProc_get_info_fs( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
             }
         } /* getpath needed */
 
+        /* getstripe only for files */
+        if ( p_op->extra_info.getstripe_needed
+             && p_op->entry_attr_is_set
+             && ATTR_MASK_TEST( &p_op->entry_attr, type )
+             && strcmp( ATTR( &p_op->entry_attr, type ), STR_TYPE_FILE ) != 0 )
+            p_op->extra_info.getstripe_needed = FALSE;
+
         if ( p_op->extra_info.getstripe_needed )
         {
             /* get entry stripe */
@@ -809,6 +878,13 @@ int EntryProc_get_info_fs( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
                 p_op->entry_attr_is_set = TRUE;
             }
         } /* get_stripe needed */
+
+        /* get status only for files */
+        if ( p_op->extra_info.getstatus_needed
+             && p_op->entry_attr_is_set
+             && ATTR_MASK_TEST( &p_op->entry_attr, type )
+             && strcmp( ATTR( &p_op->entry_attr, type ), STR_TYPE_FILE ) != 0 )
+            p_op->extra_info.getstatus_needed = FALSE;
 
         if ( p_op->extra_info.getstatus_needed )
         {
@@ -939,7 +1015,7 @@ int EntryProc_reporting( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
         }
     }
 
-    /* acknoledge now if the stage is asynchronous */
+    /* acknowledge now if the stage is asynchronous */
     if ( stage_info->stage_flags & STAGE_FLAG_ASYNC )
     {
         rc = EntryProcessor_Acknowledge( p_op, STAGE_DB_APPLY, FALSE );
@@ -951,7 +1027,7 @@ int EntryProc_reporting( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
     if ( is_alert )
         RaiseEntryAlert(title, stralert, strid, strvalues );
 
-    /* acknoledge now if the stage was synchronous */
+    /* acknowledge now if the stage was synchronous */
     if ( !( stage_info->stage_flags & STAGE_FLAG_ASYNC ) )
     {
         rc = EntryProcessor_Acknowledge( p_op, STAGE_DB_APPLY, FALSE );
@@ -973,7 +1049,16 @@ int EntryProc_db_apply( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
 
     /* if stripe has not been retrieved, don't update it in the database */
     if ( !p_op->extra_info.getstripe_needed )
+    {
         ATTR_MASK_UNSET( &p_op->entry_attr, stripe_info );
+        ATTR_MASK_UNSET( &p_op->entry_attr, stripe_items );
+    }
+
+#ifdef ATTR_INDEX_creation_time
+    /* never change creation time */
+    if (p_op->db_op_type != OP_TYPE_INSERT)
+        ATTR_MASK_UNSET( &p_op->entry_attr, creation_time );
+#endif
 
     /* insert to DB */
     switch ( p_op->db_op_type )
@@ -1006,14 +1091,14 @@ int EntryProc_db_apply( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
     if ( rc )
         DisplayLog( LVL_CRIT, ENTRYPROC_TAG, "Error %d performing database operation.", rc );
 
-    /* Acknoledge the operation if there is a callback */
+    /* Acknowledge the operation if there is a callback */
     if ( p_op->callback_func )
         rc = EntryProcessor_Acknowledge( p_op, STAGE_CHGLOG_CLR, FALSE );
     else
         rc = EntryProcessor_Acknowledge( p_op, -1, TRUE );
 
     if ( rc )
-        DisplayLog( LVL_CRIT, ENTRYPROC_TAG, "Error %d acknoledging stage %s.", rc,
+        DisplayLog( LVL_CRIT, ENTRYPROC_TAG, "Error %d acknowledging stage %s.", rc,
                     stage_info->stage_name );
 
     return rc;
@@ -1023,7 +1108,7 @@ int            EntryProc_chglog_clr( struct entry_proc_op_t * p_op, lmgr_t * lmg
 {
     int            rc;
     const pipeline_stage_t *stage_info = &entry_proc_pipeline[p_op->pipeline_stage];
-    struct changelog_rec * logrec = p_op->extra_info.log_record.p_log_rec;
+    CL_REC_TYPE *logrec = p_op->extra_info.log_record.p_log_rec;
 
     if (p_op->extra_info.is_changelog_record)
         DisplayLog( LVL_FULL, ENTRYPROC_TAG, "stage %s - record #%llu - id="DFID"\n", stage_info->stage_name,
@@ -1039,10 +1124,10 @@ int            EntryProc_chglog_clr( struct entry_proc_op_t * p_op, lmgr_t * lmg
                         stage_info->stage_name );
     }
 
-    /* Acknoledge the operation and remove it from pipeline */
+    /* Acknowledge the operation and remove it from pipeline */
     rc = EntryProcessor_Acknowledge( p_op, -1, TRUE );
     if ( rc )
-        DisplayLog( LVL_CRIT, ENTRYPROC_TAG, "Error %d acknoledging stage %s.", rc,
+        DisplayLog( LVL_CRIT, ENTRYPROC_TAG, "Error %d acknowledging stage %s.", rc,
                     stage_info->stage_name );
 
     return rc;
@@ -1060,6 +1145,16 @@ int EntryProc_rm_old_entries( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
 
     val.val_uint = ATTR( &p_op->entry_attr, md_update );
     lmgr_simple_filter_add( &filter, ATTR_INDEX_md_update, LESSTHAN_STRICT, val, 0 );
+
+    /* partial scan: remove non-updated entries from a subset of the namespace */
+    if (ATTR_MASK_TEST( &p_op->entry_attr, fullpath ))
+    {
+        char tmp[RBH_PATH_MAX];
+        strcpy(tmp, ATTR(&p_op->entry_attr, fullpath));
+        strcat(tmp, "/*");
+        val.val_str = tmp;
+        lmgr_simple_filter_add( &filter, ATTR_INDEX_fullpath, LIKE, val, 0 );
+    }
 
     /* force commit after this operation */
     ListMgr_ForceCommitFlag( lmgr, TRUE );
@@ -1089,7 +1184,7 @@ int EntryProc_rm_old_entries( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
     rc = EntryProcessor_Acknowledge( p_op, -1, TRUE );
 
     if ( rc )
-        DisplayLog( LVL_CRIT, ENTRYPROC_TAG, "Error %d acknoledging stage %s.", rc,
+        DisplayLog( LVL_CRIT, ENTRYPROC_TAG, "Error %d acknowledging stage %s.", rc,
                     stage_info->stage_name );
 
     return rc;

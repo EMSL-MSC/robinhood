@@ -142,12 +142,44 @@ static int Recursive_Rmdir_ByPath( lmgr_t * lmgr, const char * dir_path,
             continue;
        }
 
-       if ( global_config.stay_in_fs && ( fsdev != stat_buf.st_dev ) )
+       if ( fsdev != stat_buf.st_dev )
        {
-            DisplayLog( LVL_CRIT, RMDIR_TAG, "%s is not in the same filesystem as %s, skipping it",
-                        tmp_path, global_config.fs_path );
-            err = EXDEV;
-            continue;
+            /* check if filesystem was remounted */
+            struct stat root_md;
+            /* is the FS root changed: file system may have been remounted.
+             * else: the entry is not in the same filesystem
+             */
+            /* 1) check fs root dev_id */
+            if (stat( global_config.fs_path, &root_md ) == -1)
+            {
+                int rc = -errno;
+                DisplayLog( LVL_CRIT, RMDIR_TAG,
+                            "stat failed on %s: %s", global_config.fs_path, strerror(-rc) );
+                DisplayLog( LVL_CRIT, RMDIR_TAG, "ERROR accessing FileSystem: EXITING." );
+                Exit( rc );
+            }
+            if (root_md.st_dev != fsdev)
+            {
+                /* manage dev id change after umount/mount */
+                DisplayLog( LVL_MAJOR, RMDIR_TAG, "WARNING: Filesystem device id changed (old=%"PRI_DT", new=%"PRI_DT"): "
+                            "checking if it has been remounted", fsdev, root_md.st_dev );
+                if (ResetFS())
+                {
+                    DisplayLog( LVL_CRIT, RMDIR_TAG, "Filesystem was unmounted!!! EXITING!" );
+                    Exit( 1 );
+                }
+                /* update current fsdev */
+                fsdev = get_fsdev();
+            }
+            /* else: root is still the same */
+
+            if ( global_config.stay_in_fs && (fsdev != stat_buf.st_dev))
+            {
+                DisplayLog( LVL_CRIT, RMDIR_TAG, "%s is not in the same filesystem as %s, skipping it",
+                            tmp_path, global_config.fs_path );
+                err = EXDEV;
+                continue;
+            }
        }
 
 #ifdef _HAVE_FID
@@ -160,7 +192,7 @@ static int Recursive_Rmdir_ByPath( lmgr_t * lmgr, const char * dir_path,
             continue;
        }
 #else
-       id.device = stat_buf.st_dev;
+       id.fs_key = get_fskey();
        id.inode  = stat_buf.st_ino;
        id.validator = stat_buf.st_ctime;
 #endif
@@ -419,7 +451,7 @@ static int perform_rmdir( unsigned int *p_nb_removed )
       }
     /* do not retrieve 'invalid' entries */
     fval.val_bool = FALSE;
-    rc = lmgr_simple_filter_add( &filter, ATTR_INDEX_invalid, EQUAL, fval, 0 );
+    rc = lmgr_simple_filter_add( &filter, ATTR_INDEX_invalid, EQUAL, fval, FILTER_FLAG_ALLOW_NULL );
     if ( rc )
       {
           ListMgr_CloseAccess( &lmgr );
@@ -799,6 +831,11 @@ inline static int update_dir( lmgr_t * lmgr, entry_id_t * p_entry_id, attr_set_t
 
     p_attr_set->attr_mask &= ~readonly_attr_set;
 
+#ifdef ATTR_INDEX_creation_time
+    /* never update creation time */
+    ATTR_MASK_UNSET( p_attr_set, creation_time );
+#endif
+
     rc = ListMgr_Update( lmgr, p_entry_id, p_attr_set );
     if ( rc )
         DisplayLog( LVL_CRIT, RMDIR_TAG, "Error %d updating directory in database.", rc );
@@ -857,12 +894,20 @@ static void   *Thr_Rmdir( void *arg )
         rc = Lustre_GetFullPath( &p_item->entry_id, ATTR(&p_item->entry_attr, fullpath), RBH_PATH_MAX );
         if ( rc )
         {
-           DisplayLog( LVL_MAJOR, RMDIR_TAG, "Can not get path for fid "DFID", tagging it invalid: (%d) %s",
-                       PFID( &p_item->entry_id), rc, strerror(-rc) );
-           invalidate_dir( &lmgr, &p_item->entry_id );
+            if (rc == -ENOENT || rc == -ESTALE)
+            {
+                DisplayLog( LVL_EVENT, RMDIR_TAG, "Directory with fid "DFID" disapeared, tagging it invalid: (%d) %s",
+                            PFID( &p_item->entry_id), rc, strerror(-rc) );
+            }
+            else
+            {
+                DisplayLog( LVL_MAJOR, RMDIR_TAG, "Can not get path for fid "DFID", tagging it invalid: (%d) %s",
+                            PFID( &p_item->entry_id), rc, strerror(-rc) );
+            }
+            invalidate_dir( &lmgr, &p_item->entry_id );
 
-           /* Notify that this entry has been processed and is errorneous */
-           Queue_Acknowledge( &rmdir_queue, RMDIR_ERROR, NULL, 0 );
+            /* Notify that this entry has been processed and is errorneous */
+            Queue_Acknowledge( &rmdir_queue, RMDIR_ERROR, NULL, 0 );
 
            /* free entry resources */
            FreeRmdirItem( p_item );
@@ -875,8 +920,13 @@ static void   *Thr_Rmdir( void *arg )
         ATTR( &p_item->entry_attr, path_update ) = time( NULL );
 #endif
 
+#ifdef _HAVE_FID
+        DisplayLog( LVL_FULL, RMDIR_TAG, "Considering entry %s (fid="DFID")",
+                    ATTR( &p_item->entry_attr, fullpath ), PFID( &p_item->entry_id) );
+#else
         DisplayLog( LVL_FULL, RMDIR_TAG, "Considering entry %s",
                     ATTR( &p_item->entry_attr, fullpath ) );
+#endif
 
         /* 2) Perform lstat on entry */
 
@@ -899,8 +949,9 @@ static void   *Thr_Rmdir( void *arg )
 
           /* 3) check entry id */
 #ifndef _HAVE_FID
+          /* TODO: check against current fs_key */
           if ( ( entry_md.st_ino != p_item->entry_id.inode )
-               || ( entry_md.st_dev != p_item->entry_id.device ) )
+               || ( get_fskey() != p_item->entry_id.fs_key ) )
             {
                 /* If it has changed, invalidate the entry
                  * (fullpath does not match entry_id, it will be updated
@@ -911,9 +962,9 @@ static void   *Thr_Rmdir( void *arg )
                             "Tagging it invalid.",
                             ATTR( &p_item->entry_attr, fullpath ),
                             ( unsigned long long ) p_item->entry_id.inode,
-                            ( unsigned long long ) p_item->entry_id.device,
+                            ( unsigned long long ) p_item->entry_id.fs_key,
                             ( unsigned long long ) entry_md.st_ino,
-                            ( unsigned long long ) entry_md.st_dev );
+                            ( unsigned long long ) get_fskey() );
 
                 invalidate_dir( &lmgr, &p_item->entry_id );
 
@@ -1029,7 +1080,7 @@ static void   *Thr_Rmdir( void *arg )
 
               if ( rc < 0 )
                 {
-                    /* probably an error openning in directory... */
+                    /* probably an error opening in directory... */
                     /* update its info anyway */
                     update_dir( &lmgr, &p_item->entry_id, &new_attr_set );
 
@@ -1083,7 +1134,7 @@ static void   *Thr_Rmdir( void *arg )
                 {
                     char           strmod[256];
 
-                    /* dir has been sucessfully deleted */
+                    /* dir has been successfully deleted */
 
                     /* report messages */
 
@@ -1165,7 +1216,7 @@ static void   *Thr_Rmdir( void *arg )
                         char volstr[256];
 
                          /* report messages */
-                         DisplayLog( LVL_DEBUG, RMDIR_TAG,
+                         DisplayLog( LVL_EVENT, RMDIR_TAG,
                                      "Recursively removed directory %s (content: %u entries, volume: %s)",
                                      ATTR( &p_item->entry_attr, fullpath ), nb_entries,
                                      FormatFileSize( volstr, 256, DEV_BSIZE*blocks ) );
@@ -1180,7 +1231,7 @@ static void   *Thr_Rmdir( void *arg )
                          Queue_Acknowledge( &rmdir_queue, RMDIR_OK, rmdir_stats, RMDIR_FDBK_COUNT );
                          /* free entry resources */
                          FreeRmdirItem( p_item );
-                     } /* sucess */
+                     } /* success */
                 }  /* entry matches */
                 else
                 {
@@ -1309,11 +1360,7 @@ int Start_Rmdir( rmdir_config_t * p_config, int flags )
     rmdir_config = *p_config;
     rmdir_flags = flags;
 
-    /* Check mount point and FS type.  */
-    rc = CheckFSInfo( global_config.fs_path, global_config.fs_type, &fsdev,
-                      global_config.check_mounted, TRUE );
-    if ( rc != 0 )
-        return rc;
+    fsdev = get_fsdev();
 
     /* does not start rmdir module if nothing is defined in configuration */
     if ( (policies.rmdir_policy.age_rm_empty_dirs == 0)

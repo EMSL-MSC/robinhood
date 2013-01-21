@@ -165,11 +165,18 @@ int EntryProc_get_fid( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
 static int EntryProc_ProcessLogRec( struct entry_proc_op_t *p_op )
 {
     /* short alias */
-    struct changelog_rec * logrec = p_op->extra_info.log_record.p_log_rec;
+    CL_REC_TYPE *logrec = p_op->extra_info.log_record.p_log_rec;
 
     /* allow event-driven update */
     int allow_md_updt = TRUE;
     int allow_path_updt = TRUE;
+
+    /* is there parent_id in log rec ? */
+    if ( logrec->cr_namelen > 0 )
+    {
+        ATTR_MASK_SET( &p_op->entry_attr, parent_id );
+        ATTR( &p_op->entry_attr, parent_id ) = logrec->cr_pfid;
+    }
 
     if ( logrec->cr_type == CL_UNLINK )
     {
@@ -359,7 +366,7 @@ int EntryProc_get_info_db( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
 
     /* 1) get the name from changelog to pre-filter entry */
 #ifdef HAVE_CHANGELOGS
-    struct changelog_rec * logrec = p_op->extra_info.log_record.p_log_rec;
+    CL_REC_TYPE *logrec = p_op->extra_info.log_record.p_log_rec;
 
     /** if this is a changelog record, copy its name into the attr structure */
     if ( p_op->extra_info.is_changelog_record
@@ -386,7 +393,7 @@ int EntryProc_get_info_db( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
 #ifdef HAVE_CHANGELOGS
     if ( p_op->extra_info.is_changelog_record )
     {
-        struct changelog_rec * logrec = p_op->extra_info.log_record.p_log_rec;
+        CL_REC_TYPE * logrec = p_op->extra_info.log_record.p_log_rec;
 
         /* what do we know about this entry? */
         ATTR_MASK_INIT( &p_op->entry_attr );
@@ -475,7 +482,8 @@ int EntryProc_get_info_db( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
                 tmp_attr.attr_mask = (entry_proc_conf.alert_attr_mask
                                       & ~p_op->entry_attr.attr_mask);
 
-                if ( strcmp( ATTR(&p_op->entry_attr, type), STR_TYPE_DIR ) != 0 )
+                if ( ATTR_MASK_TEST(&p_op->entry_attr, type) &&
+                     strcmp( ATTR(&p_op->entry_attr, type), STR_TYPE_DIR ) != 0 )
                 {
                     if ( entry_proc_conf.match_classes )
                     {
@@ -662,21 +670,6 @@ int EntryProc_get_info_fs( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
         } /* getpath needed */
 #endif
 
-        if ( p_op->extra_info.getstripe_needed )
-        {
-            /* Get stripe info for this file */
-    #ifdef _LUSTRE
-            if ( File_GetStripeByPath( path,
-                                       &ATTR( &p_op->entry_attr, stripe_info ),
-                                       &ATTR( &p_op->entry_attr, stripe_items ) ) == 0 )
-            {
-                p_op->entry_attr_is_set = TRUE;
-                ATTR_MASK_SET( &p_op->entry_attr, stripe_info );
-                ATTR_MASK_SET( &p_op->entry_attr, stripe_items );
-            }
-    #endif
-        }
-
 #ifdef HAVE_CHANGELOGS /* for scan, always get it */
         if ( p_op->extra_info.getattr_needed )
         {
@@ -703,8 +696,28 @@ int EntryProc_get_info_fs( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
         }
 #endif
 
-    }
+        /* getstripe only for files */
+        if ( p_op->entry_attr_is_set
+             && ATTR_MASK_TEST( &p_op->entry_attr, type )
+             && strcmp( ATTR( &p_op->entry_attr, type ), STR_TYPE_FILE ) != 0 )
+            p_op->extra_info.getstripe_needed = FALSE;
 
+        if ( p_op->extra_info.getstripe_needed )
+        {
+            /* Get stripe info for this file */
+    #ifdef _LUSTRE
+            if ( File_GetStripeByPath( path,
+                                       &ATTR( &p_op->entry_attr, stripe_info ),
+                                       &ATTR( &p_op->entry_attr, stripe_items ) ) == 0 )
+            {
+                p_op->entry_attr_is_set = TRUE;
+                ATTR_MASK_SET( &p_op->entry_attr, stripe_info );
+                ATTR_MASK_SET( &p_op->entry_attr, stripe_items );
+            }
+    #endif
+        }
+
+    }
 
     /* acknowledge the stage and go to the next */
     rc = EntryProcessor_Acknowledge( p_op, STAGE_REPORTING, FALSE );
@@ -731,7 +744,7 @@ rm_record:
 
 
 /**
- *  Raise alert if the entry exceeds an admministrator defined limit.
+ *  Raise alert if the entry exceeds an administrator defined limit.
  *  This operation can be made asynchronously.
  */
 int EntryProc_reporting( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
@@ -790,7 +803,7 @@ int EntryProc_reporting( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
         }
     }
 
-    /* acknoledge now if the stage is asynchronous */
+    /* acknowledge now if the stage is asynchronous */
     if ( stage_info->stage_flags & STAGE_FLAG_ASYNC )
     {
         rc = EntryProcessor_Acknowledge( p_op, STAGE_DB_APPLY, FALSE );
@@ -802,7 +815,7 @@ int EntryProc_reporting( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
     if ( is_alert )
         RaiseEntryAlert(title, stralert, strid, strvalues );
 
-    /* acknoledge now if the stage was synchronous */
+    /* acknowledge now if the stage was synchronous */
     if ( !( stage_info->stage_flags & STAGE_FLAG_ASYNC ) )
     {
         rc = EntryProcessor_Acknowledge( p_op, STAGE_DB_APPLY, FALSE );
@@ -835,7 +848,10 @@ int EntryProc_db_apply( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
 #endif
     /* if stripe has not been retrieved, don't update it in the database */
     if ( !p_op->extra_info.getstripe_needed )
+    {
         ATTR_MASK_UNSET( &p_op->entry_attr, stripe_info );
+        ATTR_MASK_UNSET( &p_op->entry_attr, stripe_items );
+    }
 
     /* insert to DB */
     switch ( p_op->db_op_type )
@@ -876,7 +892,7 @@ int EntryProc_db_apply( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
         rc = EntryProcessor_Acknowledge( p_op, -1, TRUE );
 
     if ( rc )
-        DisplayLog( LVL_CRIT, ENTRYPROC_TAG, "Error %d acknoledging stage %s.", rc,
+        DisplayLog( LVL_CRIT, ENTRYPROC_TAG, "Error %d acknowledging stage %s.", rc,
                     stage_info->stage_name );
 
     return rc;
@@ -887,7 +903,7 @@ int            EntryProc_chglog_clr( struct entry_proc_op_t * p_op, lmgr_t * lmg
 {
     int            rc;
     const pipeline_stage_t *stage_info = &entry_proc_pipeline[p_op->pipeline_stage];
-    struct changelog_rec * logrec = p_op->extra_info.log_record.p_log_rec;
+    CL_REC_TYPE * logrec = p_op->extra_info.log_record.p_log_rec;
 
     if ( p_op->extra_info.is_changelog_record )
         DisplayLog( LVL_FULL, ENTRYPROC_TAG, "stage %s - record #%llu - id="DFID"\n",
@@ -903,10 +919,10 @@ int            EntryProc_chglog_clr( struct entry_proc_op_t * p_op, lmgr_t * lmg
                         stage_info->stage_name );
     }
 
-    /* Acknoledge the operation and remove it from pipeline */
+    /* Acknowledge the operation and remove it from pipeline */
     rc = EntryProcessor_Acknowledge( p_op, -1, TRUE );
     if ( rc )
-        DisplayLog( LVL_CRIT, ENTRYPROC_TAG, "Error %d acknoledging stage %s.", rc,
+        DisplayLog( LVL_CRIT, ENTRYPROC_TAG, "Error %d acknowledging stage %s.", rc,
                     stage_info->stage_name );
 
     return rc;
@@ -929,6 +945,16 @@ int EntryProc_rm_old_entries( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
 
     val.val_uint = ATTR( &p_op->entry_attr, md_update );
     lmgr_simple_filter_add( &filter, ATTR_INDEX_md_update, LESSTHAN_STRICT, val, 0 );
+
+    /* partial scan: remove non-updated entries from a subset of the namespace */
+    if (ATTR_MASK_TEST( &p_op->entry_attr, fullpath ))
+    {
+        char tmp[RBH_PATH_MAX];
+        strcpy(tmp, ATTR(&p_op->entry_attr, fullpath));
+        strcat(tmp, "/*");
+        val.val_str = tmp;
+        lmgr_simple_filter_add( &filter, ATTR_INDEX_fullpath, LIKE, val, 0 );
+    }
 
     /* force commit after this operation */
     ListMgr_ForceCommitFlag( lmgr, TRUE );
@@ -956,7 +982,7 @@ int EntryProc_rm_old_entries( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
     rc = EntryProcessor_Acknowledge( p_op, -1, TRUE );
 
     if ( rc )
-        DisplayLog( LVL_CRIT, ENTRYPROC_TAG, "Error %d acknoledging stage %s.", rc,
+        DisplayLog( LVL_CRIT, ENTRYPROC_TAG, "Error %d acknowledging stage %s.", rc,
                     stage_info->stage_name );
 
     return rc;

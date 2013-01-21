@@ -1,3 +1,4 @@
+# a lot of unused variables in this module... (remove -Werror)
 AM_CFLAGS= -Wall $(DB_CFLAGS) $(PURPOSE_CFLAGS)
 
 noinst_LTLIBRARIES=libresmonitor.la

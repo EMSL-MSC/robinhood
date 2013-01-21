@@ -29,6 +29,7 @@
 #include <pthread.h>
 #include <libgen.h>             /* for dirname */
 #include <stdarg.h>
+#include <fnmatch.h>
 
 #ifndef HAVE_GETMNTENT_R
 #include "mntent_compat.h"
@@ -72,6 +73,134 @@ void Exit( int error_code )
     FlushLogs(  );
     exit( error_code );
 }
+
+/* global info about the filesystem to be managed */
+static char    mount_point[RBH_PATH_MAX] = "";
+static char    fsname[RBH_PATH_MAX] = "";
+static dev_t   dev_id = 0;
+static uint64_t fs_key = 0;
+
+/* to optimize string concatenation */
+static unsigned int mount_len = 0;
+
+
+/* used at initialization time, to avoid several modules
+ * that start in parallel to check it several times.
+ */
+static pthread_mutex_t mount_point_lock = PTHREAD_MUTEX_INITIALIZER;
+
+#define LAST_32PRIME    0xFFFFFFFB
+#define LAST_64PRIME    0xFFFFFFFFFFFFFFC5
+static uint64_t hash_name(const char * str)
+{
+    unsigned int i;
+    uint64_t val = 1;
+
+    for ( i = 0; i < strlen(str); i++ )
+        val = ( val << 5 ) - val + (unsigned int) ( str[i] );
+
+    return val % LAST_32PRIME;
+}
+
+static uint64_t fsidto64(fsid_t fsid)
+{
+    uint64_t out;
+    if (sizeof(fsid_t) <= sizeof(uint64_t))
+    {
+        memset(&out, 0, sizeof(out));
+        memcpy((&out)+(sizeof(out)-sizeof(fsid_t)), &fsid, sizeof(fsid));
+        DisplayLog(LVL_DEBUG, __func__, "sizeof(fsid)=%lu <= 64bits, fsid as 64=%"PRIX64, sizeof(fsid_t), out);
+        return out;
+    }
+    else
+    {
+        unsigned int i;
+        out = 1;
+        char * str = (char *)(&fsid);
+
+        for ( i = 0; i < sizeof(fsid_t); i++ )
+            out = ( out << 5 ) - out + (unsigned int) ( str[i] );
+
+        out = out % LAST_64PRIME;
+        DisplayLog(LVL_DEBUG, __func__, "sizeof(fsid)=%lu > 64bits, hash64(fsid)=%"PRIX64, sizeof(fsid_t), out);
+        return out;
+    }
+}
+
+/* this set of functions is for retrieving/checking mount point
+ * and fs name (once for all threads):
+ */
+static void _set_mount_point( char *mntpnt )
+{
+    /* cannot change during a run */
+    if (mount_len == 0)
+    {
+        strcpy( mount_point, mntpnt );
+        mount_len = strlen( mntpnt );
+
+        /* remove final slash, if any */
+        if ( (mount_len > 1) && (mount_point[mount_len-1] == '/') )
+        {
+            mount_point[mount_len-1] = '\0';
+            mount_len --;
+        }
+    }
+}
+
+void set_fs_info( char *name, char * mountp, dev_t dev, fsid_t fsid)
+{
+    P( mount_point_lock );
+    _set_mount_point(mountp);
+    strcpy( fsname, name );
+    dev_id = dev;
+
+    switch (global_config.fs_key)
+    {
+        case FSKEY_FSNAME:
+            fs_key = hash_name(name);
+            DisplayLog(LVL_DEBUG, "FSInfo", "fs_key: hash(fsname)=%"PRIX64, fs_key);
+            break;
+        case FSKEY_FSID:
+            fs_key = fsidto64(fsid);
+            DisplayLog(LVL_DEBUG, "FSInfo", "fs_key: fsid as 64=%"PRIX64, fs_key);
+            break;
+        case FSKEY_DEVID:
+            fs_key = dev_id;
+            DisplayLog(LVL_DEBUG, "FSInfo", "fs_key: devid=%"PRIX64, fs_key);
+            break;
+        default:
+            DisplayLog(LVL_MAJOR, "FSInfo", "Invalid fs_key type %#x", global_config.fs_key);
+            fs_key = 0;
+    }
+    V( mount_point_lock );
+}
+
+/* retrieve the mount point from any module
+ * without final slash.
+ */
+const char          *get_mount_point( unsigned int * plen )
+{
+    if (plen) (*plen) = mount_len;
+    return mount_point;
+}
+
+/* retrieve fsname from any module */
+const char          *get_fsname(  )
+{
+    return fsname;
+}
+
+/* return Filesystem device id  */
+dev_t          get_fsdev()
+{
+    return dev_id;
+}
+
+uint64_t       get_fskey()
+{
+    return fs_key;
+}
+
 
 
 /**
@@ -133,6 +262,9 @@ int SearchConfig( const char * cfg_in, char * cfg_out, int * changed )
             {
                 /* ignore .xxx files */
                 if (ent->d_name[0] == '.')
+                    continue;
+                if (fnmatch("*.conf", ent->d_name, 0) && fnmatch("*.cfg", ent->d_name, 0))
+                    /* not a config file */
                     continue;
 
                 sprintf( cfg_out, "%s/%s", current_path, ent->d_name );
@@ -275,6 +407,20 @@ void PosixStat2EntryAttr( struct stat *p_inode, attr_set_t * p_attr_set, int siz
     ATTR( p_attr_set, last_mod ) = MAX2( p_inode->st_mtime, p_inode->st_ctime );
 #endif
 
+#ifdef ATTR_INDEX_creation_time
+    if (ATTR_MASK_TEST(p_attr_set, creation_time))
+    {
+        /* creation time is always <= ctime */
+        if (p_inode->st_ctime < ATTR(p_attr_set, creation_time))
+            ATTR(p_attr_set, creation_time) = p_inode->st_ctime;
+    }
+    else
+    {
+        ATTR_MASK_SET(p_attr_set, creation_time);
+        ATTR(p_attr_set, creation_time) = p_inode->st_ctime;
+    }
+#endif
+
 #ifdef ATTR_INDEX_type
     if ( S_ISREG( p_inode->st_mode ) )
     {
@@ -385,8 +531,9 @@ static struct mntent *getmntent_r(FILE *fp, struct mntent *mntbuf,
  * Also return the associated device number.
  * (for STAY_IN_FS security option).
  */
-int CheckFSInfo( char *path, char *expected_type, dev_t * p_fs_dev, int check_mounted,
-                 int save_fs )
+int CheckFSInfo( char *path, char *expected_type,
+                 dev_t * p_fs_dev, char * fsname_out,
+                 int check_mounted, int save_fs )
 {
     FILE          *fp;
     struct mntent *p_mnt;
@@ -398,9 +545,6 @@ int CheckFSInfo( char *path, char *expected_type, dev_t * p_fs_dev, int check_mo
     char           tmp_buff[RBH_PATH_MAX];
     char          *parentmntdir;
     char           fs_spec[RBH_PATH_MAX];
-#ifdef _HAVE_FID
-    char          *ptr;
-#endif
 
     char           type[256];
 
@@ -408,6 +552,8 @@ int CheckFSInfo( char *path, char *expected_type, dev_t * p_fs_dev, int check_mo
     struct stat    parentmntstat;
 
     size_t         pathlen, outlen;
+    char * name = NULL;
+
 
     if ( ( expected_type == NULL ) || ( expected_type[0] == '\0' ) )
     {
@@ -416,13 +562,24 @@ int CheckFSInfo( char *path, char *expected_type, dev_t * p_fs_dev, int check_mo
     }
 
     /* convert to canonic path */
-    if ( !realpath( path, rpath ) )
+    /* let realpath determine the output length (NULL argument) */
+    char * tmp_path = realpath( path, NULL );
+    if ( tmp_path == NULL )
     {
         DisplayLog( LVL_CRIT, "CheckFS", "Error %d in realpath(%s): %s",
                     errno, ( path ? path : "<null>" ), strerror( errno ) );
         return errno;
     }
-
+    if (strlen(tmp_path) >= RBH_PATH_MAX)
+    {
+        free(tmp_path);
+        DisplayLog( LVL_CRIT, "CheckFS", "Path length is too long!" );
+        return ENAMETOOLONG;
+    }
+    /* safe because of previous check */
+    strcpy(rpath, tmp_path);
+    /* now can release tmp path */
+    free(tmp_path);
 
     /* open mount tab and look for the given path */
     outlen = 0;
@@ -544,28 +701,187 @@ int CheckFSInfo( char *path, char *expected_type, dev_t * p_fs_dev, int check_mo
         return ENOENT;
     }
 
-#ifdef _HAVE_FID
-    if ( save_fs )
+#ifdef _LUSTRE
+    if (!strcmp(type, "lustre"))
     {
-        set_mount_point( mntdir );
-
+        char *ptr;
         ptr = strstr( fs_spec, ":/" );
         if ( ptr != NULL )
         {
-            set_fsname( ptr + 2 );
+            name = ptr + 2;
         }
+        else
+            name = fs_spec;
     }
+    else
 #endif
+        name = fs_spec;
 
     /* all checks are OK */
+
+    if ( save_fs )
+    {
+        /* getting filesystem fsid (needed for fskey) */
+        if (global_config.fs_key == FSKEY_FSID)
+        {
+            struct statfs stf;
+            if (statfs(mntdir, &stf))
+            {
+                int rc = -errno;
+                DisplayLog( LVL_CRIT, "CheckFS", "ERROR calling statfs(%s): %s",
+                    mntdir, strerror(-rc) );
+                    return rc;
+            }
+            /* if fsid == 0, it may mean that fsid is not significant on the current system
+             * => DISPLAY A WARNING */
+            if (fsidto64(stf.f_fsid) == 0)
+            {
+                DisplayLog(LVL_MAJOR, "CheckFS", "WARNING: fsid(0) doesn't look significant on this system. I should not be used as fs_key!");
+            }
+            set_fs_info(name, mntdir, pathstat.st_dev, stf.f_fsid);
+        }
+        else
+        {
+            fsid_t dummy_fsid;
+            memset(&dummy_fsid, 0, sizeof(fsid_t));
+            set_fs_info(name, mntdir, pathstat.st_dev, dummy_fsid);
+        }
+    }
 
     if ( p_fs_dev != NULL )
         *p_fs_dev = pathstat.st_dev;
 
+    if ( fsname_out != NULL )
+        strcpy(fsname_out, name);
+
     endmntent( fp );
     return 0;
-
 }                               /* CheckFSInfo */
+
+/**
+ * Initialize filesystem access and retrieve current devid/fs_key
+ * - global_config must be set
+ * - initialize mount_point, fsname and dev_id
+ */
+int InitFS()
+{
+    int rc;
+
+    /* Initialize mount point info */
+#ifdef _LUSTRE
+    if (!strcmp( global_config.fs_type, "lustre" ))
+    {
+        if ( ( rc = Lustre_Init() ) )
+        {
+            DisplayLog( LVL_CRIT, "InitFS", "Error %d initializing liblustreapi", rc );
+            return rc;
+        }
+    }
+#endif
+
+    rc = CheckFSInfo( global_config.fs_path, global_config.fs_type, NULL, NULL,
+                      global_config.check_mounted, TRUE );
+    if (rc)
+    {
+        DisplayLog( LVL_CRIT, "InitFS", "Error %d checking Filesystem", rc );
+        return rc;
+    }
+
+    /* OK */
+    return 0;
+}
+
+/**
+ * This is to be called after a dev_id change was detected
+ * return 0 if fskey is unchanged and update mount_point, fsname and dev_id
+ * else, return -1
+ */
+int ResetFS()
+{
+    char   name[RBH_PATH_MAX];
+    dev_t  dev;
+    struct statfs stf;
+    int rc;
+    /* check depending on FS key type:
+     * - fsname: check mount tab
+     * - fsid: check statfs
+     * - devid: check dev_id
+     */
+    switch (global_config.fs_key)
+    {
+        case FSKEY_FSNAME:
+            /* get and compare FS name */
+            rc = CheckFSInfo( global_config.fs_path, global_config.fs_type, NULL, name,
+                              global_config.check_mounted, FALSE );
+            if (rc)
+                return rc;
+            /* did the name changed ? */
+            if (strcmp(name, fsname))
+            {
+                DisplayLog(LVL_CRIT, "FSInfo", "fsname change detected: %s->%s",
+                           fsname, name);
+                RaiseAlert( "Filesystem changed",
+                             "fsname of '%s' has changed !!! %s->%s => EXITING",
+                            global_config.fs_path, fsname, name );
+                return -1;
+            }
+            /* update fsid and devid */
+            rc = CheckFSInfo( global_config.fs_path, global_config.fs_type, NULL, NULL,
+                              global_config.check_mounted, TRUE );
+            return rc;
+
+        case FSKEY_FSID:
+            /* get and compare FS ID */
+            if (statfs(global_config.fs_path, &stf))
+            {
+                rc = -errno;
+                DisplayLog( LVL_CRIT, "FSInfo", "ERROR calling statfs(%s): %s",
+                    global_config.fs_path, strerror(-rc) );
+                    return rc;
+            }
+            if (fsidto64(stf.f_fsid) != fs_key)
+            {
+                DisplayLog(LVL_CRIT, "FSInfo", "fsid change detected: %"PRIX64"->%"PRIX64,
+                           fs_key, fsidto64(stf.f_fsid));
+                RaiseAlert( "Filesystem changed",
+                             "fsid of '%s' has changed !!! %"PRIX64"->%"PRIX64" => EXITING",
+                            global_config.fs_path, fs_key, fsidto64(stf.f_fsid) );
+                return -1;
+            }
+            /* update fsname and devid */
+            rc = CheckFSInfo( global_config.fs_path, global_config.fs_type, NULL, NULL,
+                              global_config.check_mounted, TRUE );
+            return rc;
+
+        case FSKEY_DEVID:
+            /* get and compare dev id */
+            rc = CheckFSInfo( global_config.fs_path, global_config.fs_type, &dev, NULL,
+                              global_config.check_mounted, FALSE );
+            if (rc)
+                return rc;
+            /* did the device change? */
+            if (dev != dev_id)
+            {
+                DisplayLog(LVL_CRIT, "FSInfo", "devid change detected: %"PRI_DT"->%"PRI_DT,
+                           dev_id, dev);
+
+                RaiseAlert( "Filesystem changed",
+                             "devid of '%s' has changed !!! %"PRI_DT"->%"PRI_DT" => EXITING",
+                            global_config.fs_path, dev_id, dev );
+                return -1;
+            }
+            /* update fsname and fsid */
+            rc = CheckFSInfo( global_config.fs_path, global_config.fs_type, NULL, NULL,
+                              global_config.check_mounted, TRUE );
+            return rc;
+
+        default:
+            DisplayLog(LVL_MAJOR, "FSInfo", "Invalid fs_key type %#x", global_config.fs_key);
+            return -1;
+    }
+
+}
+
 
 /**
  *  Check that FS path is the same as the last time.
@@ -885,17 +1201,17 @@ uint64_t str2size( char *str )
 
     if ( !strcasecmp( suffix, "B" ) )
         return size;
-    if ( !strcasecmp( suffix, "kB" ) )
+    if ( !strcasecmp( suffix, "kB" ) || !strcasecmp( suffix, "K" ) )
         return ( KILO_BYTE * size );
-    if ( !strcasecmp( suffix, "MB" ) )
+    if ( !strcasecmp( suffix, "MB" ) ||  !strcasecmp( suffix, "M" ) )
         return ( MEGA_BYTE * size );
-    if ( !strcasecmp( suffix, "GB" ) )
+    if ( !strcasecmp( suffix, "GB" ) ||  !strcasecmp( suffix, "G" ) )
         return ( GIGA_BYTE * size );
-    if ( !strcasecmp( suffix, "TB" ) )
+    if ( !strcasecmp( suffix, "TB" ) || !strcasecmp( suffix, "T" ))
         return ( TERA_BYTE * size );
-    if ( !strcasecmp( suffix, "PB" ) )
+    if ( !strcasecmp( suffix, "PB" ) || !strcasecmp( suffix, "P" ) )
         return ( PETA_BYTE * size );
-    if ( !strcasecmp( suffix, "EB" ) )
+    if ( !strcasecmp( suffix, "EB" ) || !strcasecmp( suffix, "E" ) )
         return ( EXA_BYTE * size );
 
     return (uint64_t) -1LL;
@@ -1298,6 +1614,79 @@ int execute_shell_command( const char * cmd, int argc, ... )
     }
 
     return rc;
+}
+
+
+/**
+ * Replace special parameters {cfgfile}, {fspath}, ...
+ * in the given cmd line.
+ * Result string is allocated using malloc()
+ * and must be released using free().
+ */
+char * replace_cmd_parameters(const char * cmd_in)
+{
+#define CMDPARAMS "CmdParams"
+    int error = FALSE;
+    char * pass_begin;
+    char * begin_var;
+    char * end_var;
+    const char * value;
+
+    /* allocate tmp copy of cmd in */
+    pass_begin = (char *)malloc(strlen(cmd_in)+1);
+    strcpy(pass_begin, cmd_in);
+
+    do
+    {
+        char * new_str = NULL;
+
+        /* look for a variable */
+        begin_var = strchr( pass_begin, '{' );
+
+        /* no more variables */
+        if ( !begin_var )
+            break;
+
+        *begin_var = '\0';
+        begin_var++;
+
+        /* get matching '}' */
+        end_var = strchr( begin_var, '}' );
+        if (!end_var)
+        {
+           DisplayLog(LVL_CRIT,CMDPARAMS, "ERROR: unmatched '{' in command parameters '%s'", cmd_in);
+           error = TRUE;
+           break;
+        }
+
+        *end_var = '\0';
+        end_var++;
+
+        value = NULL;
+
+        /* compute final length, depending on variable name */
+        if (!strcasecmp( begin_var, "cfg" ))
+           value = process_config_file;
+        else if (!strcasecmp( begin_var, "fspath" ))
+           value = global_config.fs_path;
+        else
+        {
+            DisplayLog(LVL_CRIT,CMDPARAMS, "ERROR: unknown parameter '%s' in command parameters '%s'", begin_var, cmd_in);
+            error = TRUE;
+            break;
+        }
+
+        /* allocate a new string if var length < value length */
+        new_str = malloc( strlen(pass_begin)+strlen(value)+strlen(end_var)+1 );
+
+        sprintf(new_str, "%s%s%s", pass_begin, value, end_var );
+
+        free(pass_begin);
+        pass_begin = new_str;
+
+    } while(1);
+
+    return pass_begin;
 }
 
 

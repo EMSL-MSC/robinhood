@@ -53,11 +53,13 @@ typedef struct fs_scan_config_t
     whitelist_item_t *ignore_list;
     unsigned int   ignore_count;
 
+	char           completion_command[RBH_PATH_MAX];
+
 } fs_scan_config_t;
 
 
 /** start scanning module */
-int            FSScan_Start( fs_scan_config_t * module_config, int flags );
+int            FSScan_Start( fs_scan_config_t * module_config, int flags, const char * partial_root );
 
 /** terminate scanning module */
 int            FSScan_Terminate(  );

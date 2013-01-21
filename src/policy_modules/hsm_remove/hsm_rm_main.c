@@ -39,10 +39,11 @@
 static entry_queue_t hsm_rm_queue;
 
 /* request status */
-#define HSMRM_OK            0
-#define HSMRM_ERROR         1
+#define HSMRM_OK            0 /* file removed */
+#define HSMRM_NOCOPY        1 /* no copy in backend */
+#define HSMRM_ERROR         2 /* rm error */
 
-#define HSMRM_STATUS_COUNT  2
+#define HSMRM_STATUS_COUNT  3
 
 /* ----- Module configuration ----- */
 
@@ -144,7 +145,7 @@ static inline unsigned int ack_count( unsigned int *status_tab )
 
 static inline int check_rm_limit( unsigned int count )
 {
-    if ( count >= hsm_rm_config.max_rm )
+    if ( (hsm_rm_config.max_rm > 0) && (count >= hsm_rm_config.max_rm) )
     {
         DisplayLog( LVL_EVENT, HSMRM_TAG,
                     "max hsm_rm count %u is reached.", hsm_rm_config.max_rm );
@@ -157,7 +158,7 @@ static inline int check_rm_limit( unsigned int count )
  * This function retrieve files to be removed from HSM
  * and submit them to workers.
  */
-static int perform_hsm_rm( unsigned int *p_nb_removed )
+static int perform_hsm_rm( unsigned int *p_nb_removed, unsigned int * p_noop, unsigned int * p_errors)
 {
     int            rc = 0;
     lmgr_t         lmgr;
@@ -176,6 +177,10 @@ static int perform_hsm_rm( unsigned int *p_nb_removed )
 
     if ( p_nb_removed )
         *p_nb_removed = 0;
+    if ( p_noop )
+        *p_noop = 0;
+    if ( p_errors )
+        *p_errors = 0;
 
     /* we assume that purging is a rare event
      * and we don't want to use a DB connection all the time
@@ -269,6 +274,10 @@ static int perform_hsm_rm( unsigned int *p_nb_removed )
 
     if ( p_nb_removed )
         *p_nb_removed = status_tab2[HSMRM_OK] - status_tab1[HSMRM_OK];
+    if ( p_noop )
+        *p_noop = status_tab2[HSMRM_NOCOPY] - status_tab1[HSMRM_NOCOPY];
+    if ( p_errors )
+        *p_errors = status_tab2[HSMRM_ERROR] - status_tab1[HSMRM_ERROR];
 
     if ( end_of_list )
         return 0;
@@ -309,7 +318,33 @@ static void   *Thr_Rm( void *arg )
           rc = HSM_rm( &p_item->entry_id );
 #endif
 
-          if ( rc != 0 )
+          if (rc == -ENOENT)
+          {
+               DisplayLog( LVL_DEBUG, HSMRM_TAG, "%s not in backend",
+                           p_item->backendpath );
+                /* remove it from database */
+                rc = ListMgr_SoftRemove_Discard( &lmgr, &p_item->entry_id );
+                if ( rc )
+                    DisplayLog( LVL_CRIT, HSMRM_TAG, "Error %d removing entry from database.",
+                                rc );
+
+               Queue_Acknowledge( &hsm_rm_queue, HSMRM_NOCOPY, NULL, 0 );
+               FreeRmItem( p_item );
+          }
+          else if (rc == -EINVAL)
+          {
+               DisplayLog( LVL_DEBUG, HSMRM_TAG, "Unknown backend path for "DFID,
+                           PFID( &p_item->entry_id) );
+                /* remove it from database */
+                rc = ListMgr_SoftRemove_Discard( &lmgr, &p_item->entry_id );
+                if ( rc )
+                    DisplayLog( LVL_CRIT, HSMRM_TAG, "Error %d removing entry from database.",
+                                rc );
+
+               Queue_Acknowledge( &hsm_rm_queue, HSMRM_NOCOPY, NULL, 0 );
+               FreeRmItem( p_item );
+          }
+          else if ( rc != 0 )
             {
                 DisplayLog( LVL_DEBUG, HSMRM_TAG, "Error removing entry "DFID": %s",
                             PFID( &p_item->entry_id), strerror( abs(rc) ) );
@@ -318,14 +353,12 @@ static void   *Thr_Rm( void *arg )
 
                 /* free entry resources */
                 FreeRmItem( p_item );
-
-                continue;
             }
           else
             {
                 /*char           strmod[256];*/
 
-                /* request sucessfully sent */
+                /* request successfully sent */
 
                 /* report messages */
 
@@ -348,7 +381,6 @@ static void   *Thr_Rm( void *arg )
 
                 /* free entry resources */
                 FreeRmItem( p_item );
-
             }
     }                         /* end of infinite loop en Queue_Get */
 
@@ -387,13 +419,13 @@ int start_hsm_rm_threads( unsigned int nb_threads )
 static void   *remove_thr( void *thr_arg )
 {
     int            rc;
-    unsigned int   nb_removed;
+    unsigned int   nb_removed, nb_noop, nb_err;
 
     do
       {
           if ( policies.unlink_policy.hsm_remove )
             {
-                rc = perform_hsm_rm( &nb_removed );
+                rc = perform_hsm_rm( &nb_removed, &nb_noop, &nb_err );
 
                 if ( rc )
                     DisplayLog( LVL_CRIT, HSMRM_TAG,
@@ -401,7 +433,8 @@ static void   *remove_thr( void *thr_arg )
                                 rc, nb_removed );
                 else
                     DisplayLog( LVL_MAJOR, HSMRM_TAG,
-                                "HSM file removal summary: %u requests sent.", nb_removed );
+                               "HSM file removal summary: %u files removed, %u void op, %u errors.",
+                                nb_removed, nb_noop, nb_err );
             }
           else
             {
@@ -434,17 +467,10 @@ static void   *remove_thr( void *thr_arg )
 int Start_HSMRm( hsm_rm_config_t * p_config, int flags )
 {
     int            rc;
-    dev_t       fsdev;
 
     /* store configuration */
     hsm_rm_config = *p_config;
     hsm_rm_flags = flags;
-
-    /* Check mount point and FS type.  */
-    rc = CheckFSInfo( global_config.fs_path, global_config.fs_type, &fsdev,
-                      global_config.check_mounted, TRUE );
-    if ( rc != 0 )
-        return rc;
 
     if ( !policies.unlink_policy.hsm_remove )
     {
@@ -520,8 +546,9 @@ void Dump_HSMRm_Stats(  )
 
     DisplayLog( LVL_MAJOR, "STATS", "idle rm threads       = %u", nb_waiting );
     DisplayLog( LVL_MAJOR, "STATS", "rm requests pending   = %u", nb_items );
-    DisplayLog( LVL_MAJOR, "STATS", "requests sent         = %u", status_tab[HSMRM_OK] );
-    DisplayLog( LVL_MAJOR, "STATS", "errorneous requests   = %u", status_tab[HSMRM_ERROR] );
+    DisplayLog( LVL_MAJOR, "STATS", "effective rm          = %u", status_tab[HSMRM_OK] );
+    DisplayLog( LVL_MAJOR, "STATS", "void rm               = %u", status_tab[HSMRM_NOCOPY] );
+    DisplayLog( LVL_MAJOR, "STATS", "rm errors             = %u", status_tab[HSMRM_ERROR] );
 
     if ( last_submitted )
         DisplayLog( LVL_MAJOR, "STATS", "last entry submitted %2d s ago",

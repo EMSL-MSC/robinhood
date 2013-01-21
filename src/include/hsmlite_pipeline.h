@@ -22,7 +22,11 @@
 
 typedef struct changelog_record
 {
+#ifdef HAVE_CHANGELOG_EXTEND_REC
+    struct changelog_ext_rec * p_log_rec;
+#else
     struct changelog_rec * p_log_rec;
+#endif
     char          *mdt;
 } changelog_record_t;
 
@@ -40,6 +44,7 @@ typedef struct op_extra_info_t
     int            getattr_needed:1;
     int            getpath_needed:1;
     int            getstatus_needed:1;
+    int            not_supp:1; /* unsupported type for migration */
 } op_extra_info_t;
 
 static void inline extra_info_init( op_extra_info_t * p_extra_info )
@@ -50,6 +55,7 @@ static void inline extra_info_init( op_extra_info_t * p_extra_info )
    p_extra_info->getattr_needed = FALSE;
    p_extra_info->getpath_needed = FALSE;
    p_extra_info->getstatus_needed = FALSE;
+   p_extra_info->not_supp = FALSE;
 }
 
 #define POSIX_ATTR_MASK (ATTR_MASK_size | ATTR_MASK_blocks | ATTR_MASK_owner \

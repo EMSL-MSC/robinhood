@@ -83,10 +83,13 @@ typedef struct stripe_items_t
 #define ANNEX_INFO   0x00000002 /* annex information, rarely accessed: stored in an annex table */
 #define FREQ_ACCESS  0x00000004 /* frequently updated, or used as select filter: stored in the main table */
 #define GENERATED    0x10000000 /* field not stored in database: generated in SELECT requests (read-only) */
+#define INDEXED      0x20000000 /* this field must be indexed */
+#define DIR_ATTR     0x40000000 /* need to aggregate directory info (specific DB request) */
 
 /** type of fields in database */
 typedef enum
 {
+    DB_ID,           /**< entry id */
     DB_STRIPE_INFO,  /**< stripe info */
     DB_STRIPE_ITEMS,  /**< stripe items */
     DB_TEXT,    /**< string/text        */
@@ -97,22 +100,6 @@ typedef enum
     DB_BOOL     /**< boolean            */
 } db_type_t;
 
-typedef union
-{
-    const char    *val_str;
-    int            val_int;
-    unsigned int   val_uint;
-    long long      val_bigint;
-    unsigned long long val_biguint;
-    int            val_bool;
-} db_type_u;
-
-/** value from DB with the associated type */
-typedef struct db_value_t
-{
-    db_type_t      type;
-    db_type_u      value_u;
-} db_value_t;
 
 #define DB_IS_NULL( _p_v ) ( ((_p_v)->type == DB_TEXT) && ((_p_v)->value_u.val_str == NULL) )
 
@@ -162,6 +149,24 @@ typedef struct field_info_t
 #else
 #error "No application was specified"
 #endif
+
+typedef union
+{
+    const char    *val_str;
+    int            val_int;
+    unsigned int   val_uint;
+    long long      val_bigint;
+    unsigned long long val_biguint;
+    int            val_bool;
+    entry_id_t     val_id;
+} db_type_u;
+
+/** value from DB with the associated type */
+typedef struct db_value_t
+{
+    db_type_t      type;
+    db_type_u      value_u;
+} db_value_t;
 
 /** table switch */
 typedef enum
@@ -214,6 +219,7 @@ int            WriteLmgrConfigDefault( FILE * output );
 /* opaque types */
 struct lmgr_iterator_t;
 struct lmgr_report_t;
+struct lmgr_profile_t;
 struct lmgr_rm_list_t;
 
 /** Options for iterators */
@@ -221,6 +227,7 @@ typedef struct lmgr_iter_opt_t
 {
     unsigned int   list_count_max;               /* max entries to be returned by iterator or report */
     unsigned int   force_no_acct:1;              /* don't use acct table for reports */
+    unsigned int   allow_no_attr:1;              /* allow returning entries if no attr is available */
 } lmgr_iter_opt_t;
 
 /** Set of attributes for a FS entry */
@@ -328,7 +335,7 @@ void           ListMgr_ForceCommitFlag( lmgr_t * p_mgr, int force_commit );
 int            ListMgr_GetCommitStatus( lmgr_t * p_mgr );
 
 
-/** 
+/**
  * Tests if this entry exists in the database.
  * @param p_mgr pointer to a DB connection
  * @param p_id pointer to an entry identifier
@@ -464,7 +471,7 @@ int     ListMgr_GetRmEntry(lmgr_t * p_mgr,
 
 #define RECOV_ATTR_MASK ( ATTR_MASK_fullpath | ATTR_MASK_size | ATTR_MASK_owner | \
                           ATTR_MASK_gr_name | ATTR_MASK_last_mod | ATTR_MASK_backendpath | \
-                          ATTR_MASK_status | ATTR_MASK_stripe_info )
+                          ATTR_MASK_status | ATTR_MASK_stripe_info | ATTR_MASK_type )
 
 #define SOFTRM_MASK ( ATTR_MASK_fullpath | ATTR_MASK_backendpath )
 
@@ -572,6 +579,32 @@ void           ListMgr_CloseIterator( struct lmgr_iterator_t *p_iter );
 /** @} */
 
 /**
+ * Function for handling namespace and child entries
+ *
+ * \addtogroup NAMESPACE_FUNCTIONS
+ * @{
+ */
+/**
+ * Get the list of children of a given parent (or list of parents).
+ * \param parent_list       [in]  list of parents to get the child of
+ * \param parent_count      [in]  number of ids in parent list
+ * \param child_id_list     [out] array of child ids
+ * \param child_attr_list   [out] array of child attrs
+ * \param child_count       [out] number of returned children
+ *
+ * ListMgr_FreeAttrs() must be called on each child attribute
+ * and child_id_list and child_attr_list must be freed with MemFree()
+ */
+int ListMgr_GetChild( lmgr_t * p_mgr, const lmgr_filter_t * p_filter,
+                      const entry_id_t * parent_list, unsigned int parent_count,
+                      int attr_mask,
+                      entry_id_t ** child_id_list, attr_set_t ** child_attr_list,
+                      unsigned int * child_count );
+
+
+/** @} */
+
+/**
  * Types and functions for building reports about FS content.
  *
  * \addtogroup REPORT_FUNCTIONS
@@ -581,6 +614,7 @@ void           ListMgr_CloseIterator( struct lmgr_iterator_t *p_iter );
 /** type of report that can be done on each attr */
 typedef enum
 {
+    /* 0 = no specific operation */
     REPORT_MIN = 1,
     REPORT_MAX,
     REPORT_AVG,
@@ -594,7 +628,7 @@ typedef enum
 typedef struct report_field_descr_t
 {
     unsigned int   attr_index;
-    report_type_t  report_type;
+    report_type_t  report_type; 
     sort_order_t   sort_flag;
 
     int            filter;      /**< is there a filter on this value ? */
@@ -603,12 +637,64 @@ typedef struct report_field_descr_t
 
 } report_field_descr_t;
 
+/* profile is based on LOG2(size)
+ * -> FLOOR(LOG2(size)/5)
+ */
+#define SZ_PROFIL_COUNT 10
+#define SZ_MIN_BY_INDEX(_i) ((_i==0)?0:(1LL<<((_i-1)*5)))
+/** size profile descriptor */
+typedef struct size_range__
+{
+    uint64_t min_size; /* max_size[i] is min_size[i+1] */
+    char *title;
+} size_range_t;
+
+static const  __attribute__ ((__unused__))
+size_range_t size_range[SZ_PROFIL_COUNT] =
+{
+    {SZ_MIN_BY_INDEX(0), "0"},
+    {SZ_MIN_BY_INDEX(1), "1~31"},
+    {SZ_MIN_BY_INDEX(2), "32~1K-"},
+    {SZ_MIN_BY_INDEX(3), "1K~31K"},
+    {SZ_MIN_BY_INDEX(4), "32K~1M-"},
+    {SZ_MIN_BY_INDEX(5), "1M~31M"},
+    {SZ_MIN_BY_INDEX(6), "32M~1G-"},
+    {SZ_MIN_BY_INDEX(7), "1G~31G"},
+    {SZ_MIN_BY_INDEX(8), "32G~1T-"},
+    {SZ_MIN_BY_INDEX(9), "+1T"}
+};
+
+/** size profile values */
+typedef struct size_profile__
+{
+    uint64_t file_count[SZ_PROFIL_COUNT];
+} size_profile_t;
+
+typedef union
+{
+    size_profile_t size;
+    /* TODO mtime, ... */
+} profile_u;
+
+/** describe a profile field */
+typedef struct profile_field_descr_t
+{
+    unsigned int   attr_index;
+
+    /* sort range ratio */
+    unsigned int   range_ratio_start; /* index of selected range ratio */
+    unsigned int   range_ratio_len;   /* nbr of ranges in the selected range (0=none) */
+    sort_order_t   range_ratio_sort;  /* sort order for this range */
+
+} profile_field_descr_t;
 
 /**
  * Builds a report from database.
  */
-struct lmgr_report_t *ListMgr_Report( lmgr_t * p_mgr, report_field_descr_t * report_desc_array,
+struct lmgr_report_t *ListMgr_Report( lmgr_t * p_mgr,
+                                      const report_field_descr_t * report_desc_array,
                                       unsigned int report_descr_count,
+                                      const profile_field_descr_t * profile_desc, /* optional */
                                       const lmgr_filter_t * p_filter,
                                       const lmgr_iter_opt_t * p_opt );
 
@@ -617,12 +703,45 @@ struct lmgr_report_t *ListMgr_Report( lmgr_t * p_mgr, report_field_descr_t * rep
  * @param p_value_count is IN/OUT parameter. IN: size of output array. OUT: nbr of fields set in array.
  */
 int            ListMgr_GetNextReportItem( struct lmgr_report_t *p_iter, db_value_t * p_value,
-                                          unsigned int *p_value_count );
+                                          unsigned int *p_value_count,  profile_u *p_profile );
 
 /**
  * Releases report resources.
  */
 void           ListMgr_CloseReport( struct lmgr_report_t *p_iter );
+
+
+/**
+ * Retrieve profile (on size, atime, mtime, ...)
+ * (by status, by user, by group, ...)
+ * @param profile_descr information about the attribute to be profiled
+ * @param report_descr  information about other fields of the report
+                        (field to group on and field to sort on)
+ * @param report_descr_count number of items in report_descr
+ */
+struct lmgr_profile_t *ListMgr_Profile( lmgr_t * p_mgr,
+                                        const profile_field_descr_t  *profile_descr,
+                                        const report_field_descr_t  *report_descr,
+                                        unsigned int report_descr_count,
+                                        const lmgr_filter_t   *p_filter,
+                                        const lmgr_iter_opt_t * p_opt );
+/**
+ * Get next profile entry.
+ * @param p_profile the profile structure
+ * @param p_value array of values of report_descr
+ * @param p_value_count is IN/OUT parameter. IN: size of output array. OUT: nbr of fields set in array.
+ */
+int            ListMgr_GetNextProfile( struct lmgr_profile_t *p_iter,
+                                       profile_u  * p_profile,
+                                       db_value_t * p_value,
+                                       unsigned int *p_value_count );
+
+/**
+ * Releases profile resources.
+ */
+void           ListMgr_CloseProfile( struct lmgr_profile_t *p_iter );
+
+
 
 /** @} */
 
@@ -663,10 +782,11 @@ void           ListMgr_CloseReport( struct lmgr_report_t *p_iter );
 #define PREV_SCAN_START_TIME  "PrevScanStartTime"
 #define PREV_SCAN_END_TIME    "PrevScanEndTime"
 
-#define SCAN_STATUS_DONE      "done"
-#define SCAN_STATUS_RUNNING   "running"
-#define SCAN_STATUS_ABORTED   "aborted"
-#define SCAN_STATUS_PARTIAL   "partial"
+#define SCAN_STATUS_DONE       "done"
+#define SCAN_STATUS_RUNNING    "running"
+#define SCAN_STATUS_ABORTED    "aborted"
+#define SCAN_STATUS_INCOMPLETE "incomplete"
+#define SCAN_STATUS_PARTIAL    "partial"
 
 // Changelog statitics
 #define CL_LAST_READ_ID       "ChangelogLastId"

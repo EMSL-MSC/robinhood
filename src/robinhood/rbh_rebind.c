@@ -13,7 +13,7 @@
  */
 
 /**
- * Command for restoring an entry that was accidentaly removed from filesystem.
+ * Command for rebinding a backend entry to a new fid.
  */
 
 #ifdef HAVE_CONFIG_H
@@ -26,6 +26,7 @@
 #include "RobinhoodMisc.h"
 #include "xplatform_print.h"
 #include "backend_ext.h"
+#include "cmd_helpers.h"
 
 #include <unistd.h>
 #include <getopt.h>
@@ -36,14 +37,10 @@
 #include <pthread.h>
 #include <signal.h>
 
-#define LOGTAG "Import"
+#define LOGTAG "Rebind"
 
 static struct option option_tab[] =
 {
-    /* options for cancelling remove operation */
-    {"list", no_argument, NULL, 'L'},
-    {"restore", no_argument, NULL, 'R'},
-
     /* config file options */
     {"config-file", required_argument, NULL, 'f'},
 
@@ -58,12 +55,11 @@ static struct option option_tab[] =
 
 };
 
-#define SHORT_OPT_STRING    "LRf:l:hV"
+#define SHORT_OPT_STRING    "f:l:hV"
 
 /* global variables */
 
 static lmgr_t  lmgr;
-static int force_stop = 0;
 
 /* special character sequences for displaying help */
 
@@ -78,13 +74,9 @@ static int force_stop = 0;
 #define U_ "[0m"
 
 static const char *help_string =
-    _B "Usage:" B_ " %s [options] <backend_path> <import_path>\n"
+    _B "Usage:" B_ " %s [options] <old_backend_path> <new_fs_path> [new_fid]\n"
+    _B "By default, new_fid is taken as the current fid of new_fs_path but it might be different\n"
     "\n"
-// TODO: to be implemented
-//    _B "Import options:" B_ "\n"
-//    "    " _B "-H" B_ ", " _B "--hardlink" B_ "\n"
-//    "        Create hardlinks instead of moving files.\n"
-//    "\n"
     _B "Config file options:" B_ "\n"
     "    " _B "-f" B_ " " _U "file" U_ ", " _B "--config-file=" B_ _U "file" U_ "\n"
     "        Path to configuration file (or short name).\n"
@@ -106,7 +98,7 @@ static inline void display_help( char *bin_name )
 static inline void display_version( char *bin_name )
 {
     printf( "\n" );
-    printf( "Product:         " PACKAGE_NAME " import tool\n" );
+    printf( "Product:         " PACKAGE_NAME " rebind tool\n" );
     printf( "Version:         " PACKAGE_VERSION "-"RELEASE"\n" );
     printf( "Build:           " COMPIL_DATE "\n" );
     printf( "\n" );
@@ -162,189 +154,78 @@ static inline void display_version( char *bin_name )
     printf( "\n" );
 }
 
-static inline int import_helper(const char       *backend_path,
-                                char             *tgt_path, /* in/out */
-                                char             *new_backend_path)
+static inline int rebind_helper(const char       *old_backend_path,
+                                const char       *new_fs_path,
+                                const char       *new_fid_str)
 {
-    entry_id_t old_id, new_id;
-    recov_status_t st;
-    attr_set_t     attrs, new_attrs;
     int rc;
+    char rp[RBH_PATH_MAX];
+    char new_backend_path[RBH_PATH_MAX];
+    entry_id_t new_fid;
+    char * tmp;
 
-    /* to check src path */
-    char * name;
-    char * first;
-    char * second;
-    char dummy[RBH_PATH_MAX] = "";
-    char tmp[RBH_PATH_MAX];
-
-    /* tmp copy of src path */
-    strcpy(tmp, backend_path);
-    name = basename(tmp);
-
-    /* clean import path if it already as fid in it */
-    if ((second = strrchr(name, '_')) && (second != name)
-        && (*(first = second - 1) == '_')
-        && (sscanf(second+1, SFID"%s", RFID(&old_id), dummy) >= 3))
+    /* full path required */
+    tmp = realpath( new_fs_path, NULL );
+    if (tmp == NULL)
     {
-        if (EMPTY_STRING(dummy)) {
-            DisplayLog(LVL_EVENT, LOGTAG, "'%s' ends with a fid: "DFID_NOBRACE,
-                       name, PFID(&old_id));
-            /* clean fid in target path */
-            tgt_path[strlen(tgt_path)-strlen(first)] = '\0';
-        } else {
-            DisplayLog(LVL_MAJOR, LOGTAG, "'%s' has garbage ('%s') after fid ("DFID_NOBRACE")", 
-                       name, dummy, PFID(&old_id));
-            memset(&old_id, 0, sizeof(old_id));
-        }
-    } else
-        memset(&old_id, 0, sizeof(old_id));
-
-    printf("Importing '%s' as '%s'...\n", backend_path, tgt_path);
-
-    ATTR_MASK_INIT( &attrs );
-
-    ATTR_MASK_SET( &attrs, backendpath );
-    strcpy( ATTR( &attrs, backendpath), backend_path );
-
-    ATTR_MASK_SET( &attrs, fullpath );
-    strcpy( ATTR( &attrs, fullpath), tgt_path );
-
-    /* create file in Lustre */
-    st = rbhext_recover( &old_id, &attrs, &new_id, &new_attrs );
-    if ( (st == RS_OK) || (st == RS_DELTA) )
+        rc = -errno;
+        DisplayLog(LVL_CRIT, LOGTAG, "Error in realpath(%s): %s",
+                   new_fs_path, strerror(-rc));
+        return rc;
+    }
+    if (strlen(tmp) >= RBH_PATH_MAX)
     {
-        printf("Success\n");
+        DisplayLog( LVL_CRIT, LOGTAG, "Path length is too long!" );
+        return -ENAMETOOLONG;
+    }
+    /* safe because of previous check */
+    strcpy(rp, tmp);
+    /* now can release tmp path */
+    free(tmp);
 
-        /* insert or update it in the db */
-        rc = ListMgr_Insert( &lmgr, &new_id, &new_attrs, TRUE );
-        if ( rc == 0 )
-            printf("Entry successfully updated in the dabatase\n");
+    if (new_fid_str)
+    {
+        int nb_read;
+
+        /* parse fid */
+        if (new_fid_str[0] == '[')
+            nb_read = sscanf(new_fid_str, "["SFID"]", RFID(&new_fid));
         else
-            fprintf(stderr, "ERROR %d inserting entry in the database\n", rc );
+            nb_read = sscanf(new_fid_str, SFID, RFID(&new_fid));
+
+        if (nb_read != 3)
+        {
+            DisplayLog( LVL_CRIT, LOGTAG, "Unexpected format for fid %s", new_fid_str );
+            return -EINVAL;
+        }
+
+        printf("Binding "DFID" to '%s'...\n", PFID(&new_fid), old_backend_path);
+    }
+    else
+    {
+        /* get fid for the given file */
+        rc = Path2Id(new_fs_path, &new_fid);
+        if (rc)
+            return rc;
+
+        printf("Binding '%s' ("DFID") to '%s'...\n", new_fs_path, PFID(&new_fid),
+               old_backend_path);
+    }
+
+    /* build the new backend path for the entry */
+    rc = rbhext_rebind(rp, old_backend_path, new_backend_path, &new_fid);
+    if (rc) {
+        fprintf(stderr,"rebind failed for '%s': %s\n", rp, strerror(-rc));
         return rc;
     }
     else
     {
-        fprintf(stderr, "ERROR importing '%s' as '%s'\n", backend_path, tgt_path);
-        return -1;
+        printf("'%s' sucessfully rebound to '%s'\n", rp, new_backend_path);
+        return 0;
     }
 }
 
 
-static int perform_import(const char * src_path, const char * tgt_path,
-                          uint64_t * import_count, uint64_t * err_count)
-{
-    int            rc;
-
-    char bk_path[RBH_PATH_MAX] = "";
-    char fs_path[RBH_PATH_MAX] = "";
-    char new_bk_path[RBH_PATH_MAX] = "";
-
-    DIR           *dirp;
-    struct dirent direntry;
-    struct dirent *dircookie;
-    struct stat   md, src_md, tgt_md;
-
-    printf("%s\n", src_path);
-    if (lstat(src_path, &src_md) != 0)
-    {
-        rc = -errno;
-        DisplayLog(LVL_CRIT, LOGTAG, "ERROR: lstat failed on %s: %s",
-                   src_path, strerror(-rc));
-        return rc;
-    }
-
-    /* handle the case when src_path is a file or symlink */
-    if (!S_ISDIR(src_md.st_mode))
-    {
-        /* tmp copy of path to modify it */
-        strcpy(fs_path, tgt_path);
-
-        /* is target an exitsting dir? (or link to a dir) */
-        if ((stat(tgt_path, &tgt_md) == 0)
-            && (S_ISDIR(tgt_md.st_mode)))
-        {
-            /* tmp copy of path to modify it */
-            strcpy(bk_path, src_path);
-            sprintf(fs_path, "%s/%s", tgt_path, basename(bk_path));
-        }
-
-        if ((rc = import_helper(src_path, fs_path, new_bk_path)))
-            (*err_count)++;
-        else
-            (*import_count)++;
-
-        return rc;
-    }
-
-    /* scan bkpath */
-    if ((dirp = opendir(src_path)) == NULL)
-    {
-        rc = -errno;
-        DisplayLog(LVL_CRIT, LOGTAG,
-                   "opendir on %s failed: Error %d: %s",
-                   src_path, -rc, strerror(-rc));
-        (*err_count)++;
-        return rc;
-    }
-
-    while (1)
-    {
-        rc = readdir_r(dirp, &direntry, &dircookie);
-
-        if (rc == 0 && dircookie == NULL)
-            /* end of directory */
-            break;
-        else if ( force_stop )
-        {
-            DisplayLog( LVL_EVENT, LOGTAG, "Stop requested: cancelling import of %s", src_path );
-            return 0;
-        }
-        else if ( rc != 0 )
-        {
-            DisplayLog(LVL_CRIT, LOGTAG, "ERROR %d reading directory '%s': %s",
-                       rc, src_path, strerror(rc));
-            (*err_count)++;
-            break;
-        }
-        /* ignore . and .. */
-        else if (!strcmp(direntry.d_name, ".") || !strcmp(direntry.d_name, ".."))
-            continue;
-
-        sprintf(bk_path, "%s/%s", src_path, direntry.d_name);
-        sprintf(fs_path, "%s/%s", tgt_path, direntry.d_name);
-
-        /* what kind of entry is it? */
-        if (lstat(bk_path, &md) != 0) {
-            DisplayLog(LVL_CRIT, LOGTAG, "ERROR calling lstat(%s): %s",
-                       bk_path, strerror(errno));
-            (*err_count)++;
-            continue;
-        }
-        if (S_ISDIR(md.st_mode))
-        {
-            /* recurse */
-            rc = perform_import(bk_path, fs_path, import_count, err_count);
-            if (rc)
-                continue;
-        }
-        else
-        {
-            if (import_helper(bk_path, fs_path, new_bk_path))
-                (*err_count)++;
-            else
-                (*import_count)++;
-        }
-    }
-    closedir(dirp);
-    return 0;
-}
-
-static void terminate_handler( int sig )
-{
-    force_stop = 1;
-}
 
 #define MAX_OPT_LEN 1024
 
@@ -357,8 +238,6 @@ int main( int argc, char **argv )
     char          *bin = basename( argv[0] );
 
     char           config_file[MAX_OPT_LEN] = "";
-    uint64_t       total = 0;
-    uint64_t       err = 0;
 
     int            force_log_level = FALSE;
     int            log_level = 0;
@@ -367,8 +246,6 @@ int main( int argc, char **argv )
     char           err_msg[4096];
     robinhood_config_t config;
     int chgd = 0;
-
-    struct sigaction act_sigterm;
 
     /* parse command line options */
     while ( ( c = getopt_long( argc, argv, SHORT_OPT_STRING, option_tab,
@@ -407,10 +284,16 @@ int main( int argc, char **argv )
         }
     }
 
-    /* 2 expected argument: src_path, tgt_path */
-    if ( optind != argc - 2 )
+    /* 2 expected argument: old backend path, new path is FS */
+    if ( optind > argc - 2 )
     {
         fprintf( stderr, "Error: missing arguments on command line.\n" );
+        display_help(bin);
+        exit( 1 );
+    }
+    else if  ( optind < argc - 3 )
+    {
+        fprintf( stderr, "Error: too many arguments on command line.\n" );
         display_help(bin);
         exit( 1 );
     }
@@ -432,6 +315,7 @@ int main( int argc, char **argv )
         fprintf( stderr, "Error reading configuration file '%s': %s\n", config_file, err_msg );
         exit( 1 );
     }
+    process_config_file = config_file;
 
     /* set global configuration */
     global_config = config.global_config;
@@ -456,23 +340,10 @@ int main( int argc, char **argv )
         exit( rc );
     }
 
-    /* Initialize mount point info */
-#ifdef _LUSTRE
-    if ( ( rc = Lustre_Init(  ) ) )
-    {
-        fprintf( stderr, "Error %d initializing liblustreapi\n", rc );
-        exit( 1 );
-    }
-
-    rc = CheckFSInfo( global_config.fs_path, global_config.fs_type, NULL,
-                      global_config.check_mounted, TRUE );
+    /* Initialize Filesystem access */
+    rc = InitFS();
     if (rc)
-    {
-        DisplayLog( LVL_CRIT, LOGTAG, "Error %d checking Filesystem", rc );
-        exit( rc );
-    }
-
-#endif
+        exit(rc);
 
     /* Initialize list manager */
     rc = ListMgr_Init( &config.lmgr_config, FALSE );
@@ -504,29 +375,12 @@ int main( int argc, char **argv )
     }
 #endif
 
-    /* create signal handlers */
-    memset( &act_sigterm, 0, sizeof( act_sigterm ) );
-    act_sigterm.sa_flags = 0;
-    act_sigterm.sa_handler = terminate_handler;
-    if ( sigaction( SIGTERM, &act_sigterm, NULL ) == -1
-         || sigaction( SIGINT, &act_sigterm, NULL ) == -1 )
-    {
-        DisplayLog( LVL_CRIT, LOGTAG,
-                    "Error while setting signal handlers for SIGTERM and SIGINT: %s",
-                    strerror( errno ) );
-        exit(1);
-    }
-
-    rc = perform_import(argv[optind], argv[optind+1], &total, &err);
-    if (rc)
-        fprintf(stderr, "Import terminated with error %d\n", rc);
-    else if (force_stop)
-        fprintf(stderr, "Import aborted by user\n");
-
-    printf("Import summary: %"PRIu64" entries imported, %"PRIu64" errors\n", total, err);
+    if (optind == argc - 2)
+        rc = rebind_helper(argv[optind], argv[optind+1], NULL);
+    else if (optind == argc - 3)
+        rc = rebind_helper(argv[optind], argv[optind+1], argv[optind+2]);
 
     ListMgr_CloseAccess( &lmgr );
 
     return rc;
-
 }

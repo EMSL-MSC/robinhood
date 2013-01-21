@@ -20,6 +20,9 @@
 #define ASSIGN_UNION( _u, _type, _address ) do {            \
                     switch( _type )                         \
                     {                                       \
+                      case DB_ID:                           \
+                        _u.val_id = *((entry_id_t*)(_address)); \
+                        break;                              \
                       case DB_TEXT:                         \
                         _u.val_str = (char*)(_address);     \
                         break;                              \
@@ -46,6 +49,9 @@
 #define UNION_GET_VALUE( _u, _type, _address ) do {            \
                     switch( _type )                         \
                     {                                       \
+                      case DB_ID:                           \
+                        *((entry_id_t*)(_address)) = _u.val_id; \
+                        break;                              \
                       case DB_TEXT:                         \
                         strcpy( (char*)(_address), _u.val_str ); \
                         break;                              \
@@ -74,6 +80,7 @@ extern int     main_attr_set;
 extern int     annex_attr_set;
 extern int     gen_attr_set;
 extern int     stripe_attr_set;
+extern int     dir_attr_set;
 extern int     acct_attr_set;
 extern int     acct_pk_attr_set;
 
@@ -86,6 +93,7 @@ void           init_attrset_masks(  );
 #define gen_fields( _attr_mask )       ( (_attr_mask) & gen_attr_set )
 #define stripe_fields( _attr_mask )    ( (_attr_mask) & stripe_attr_set )
 #define readonly_fields( _attr_mask )  ( (_attr_mask) & readonly_attr_set )
+#define dirattr_fields( _attr_mask )   ( (_attr_mask) & dir_attr_set )
 
 /* these 2 functions can only be used after init_attrset_masks() has been called */
 #define is_acct_field( _attr_index ) \
@@ -96,7 +104,7 @@ void           init_attrset_masks(  );
 /* ------------ */
 
 #define is_read_only_field( _attr_index ) \
-                ( field_infos[_attr_index].flags & GENERATED )
+                ( (field_infos[_attr_index].flags & GENERATED) || (field_infos[_attr_index].flags & DIR_ATTR) )
 
 #define is_stripe_field( _attr_index ) \
                 ( ( field_infos[_attr_index].db_type == DB_STRIPE_INFO ) || ( field_infos[_attr_index].db_type == DB_STRIPE_ITEMS ) )
@@ -104,15 +112,22 @@ void           init_attrset_masks(  );
 #define is_main_field( _attr_index ) \
                 ( (!annex_table || ( field_infos[_attr_index].flags & FREQ_ACCESS )) \
                   && !is_stripe_field( _attr_index ) \
-                  && !(field_infos[_attr_index].flags & GENERATED) )
+                  && !(field_infos[_attr_index].flags & GENERATED) \
+                  && !(field_infos[_attr_index].flags & DIR_ATTR) )
 
 #define is_gen_field( _attr_index ) \
                 ( field_infos[_attr_index].flags & GENERATED )
 
+#define is_indexed_field( _attr_index ) \
+                ( field_infos[_attr_index].flags & INDEXED )
+
 #define is_annex_field( _attr_index ) \
                 ( annex_table && ( field_infos[_attr_index].flags & ( ANNEX_INFO | INIT_ONLY ) ) \
                   && !is_stripe_field( _attr_index ) \
-                  && !(field_infos[_attr_index].flags & GENERATED) )
+                  && !(field_infos[_attr_index].flags & GENERATED) \
+                  && !(field_infos[_attr_index].flags & DIR_ATTR) )
+
+#define is_dirattr( _attr_index )  ( field_infos[_attr_index].flags & DIR_ATTR )
 
 #ifdef _HSM_LITE
 #define is_recov_field( _attr_index ) \
@@ -123,7 +138,7 @@ void           init_attrset_masks(  );
                 ( (1 << _attr_index) & SOFTRM_MASK )
 #endif
 
-int            printdbtype( lmgr_t * p_mgr, char *str, db_type_t type, db_type_u * value_ptr );
+int            printdbtype( lmgr_t * p_mgr, char *str, db_type_t type, const db_type_u * value_ptr );
 
 int            parsedbtype( char *instr, db_type_t type, db_type_u * value_out );
 
@@ -145,7 +160,7 @@ typedef enum
 
 typedef enum {
     ADD,
-    SUBTRACT
+    SUBSTRACT
 } operation_type;
 
 void           add_source_fields_for_gen( int * attr_mask );
@@ -173,8 +188,23 @@ char          *compar2str( filter_comparator_t compar );
 int            filter2str( lmgr_t * p_mgr, char *str, const lmgr_filter_t * p_filter,
                            table_enum table, int leading_and, int prefix_table );
 
+unsigned int  append_size_range_fields(char * str, int leading_comma, char *prefix);
+
+typedef enum
+{
+    FILTERDIR_NONE = 0,    /* no dir filter */
+    FILTERDIR_EMPTY,       /* empty dir filter */
+    FILTERDIR_OTHER,       /* other condition on directory attribute */
+} filter_dir_e;
+ 
+filter_dir_e dir_filter(lmgr_t * p_mgr, const lmgr_filter_t * p_filter,
+                        char* filter_str, unsigned int * dir_attr_index);
+ 
+
 int            result2attrset( table_enum table, char **result_tab,
                                unsigned int res_count, attr_set_t * p_set );
+
+const char * dirattr2str( unsigned int attr_index );
 
 int entry_id2pk( lmgr_t * p_mgr, const entry_id_t * p_id, int add_if_not_exists,
                  PK_PARG_T p_pk );

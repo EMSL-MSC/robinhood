@@ -20,7 +20,7 @@
 #define _FSSCAN_H
 
 /* tag for logs */
-#define FSSCAN_TAG "FS Scan"
+#define FSSCAN_TAG "FS_Scan"
 
 #include "fs_scan_types.h"
 #include "fs_scan_main.h"
@@ -28,6 +28,7 @@
 /* defined in fs_scan.c */
 extern fs_scan_config_t fs_scan_config;
 extern int     fsscan_flags;
+extern const char * partial_scan_root;
 
 /* Audit module relative types */
 
@@ -62,7 +63,7 @@ typedef struct robinhood_fsscan_stat__
  * that have been previously parsed.
  * 
  * It returns a status code:
- *   0 : initialization sucessful
+ *   0 : initialization successful
  *   -1 : unexpected error at initialization.
  *   EINVAL : a parameter from the config file is invalid.
  */

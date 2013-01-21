@@ -137,6 +137,9 @@ typedef struct robinhood_config_t
 
 } robinhood_config_t;
 
+/* the config file for the current process */
+extern char *process_config_file;
+
 /* behavior flags for all modules */
 #define FLAG_DRY_RUN    0x00000001
 #define FLAG_IGNORE_POL 0x00000002
@@ -407,6 +410,16 @@ const char    *type2str( obj_type_t type );
 
 /** give the  name for a criteria */
 const char    *criteria2str( compare_criteria_t crit );
+
+
+/** Create a boolean condition */
+int CreateBoolCond(bool_node_t * p_out_node, compare_direction_t compar,
+                   compare_criteria_t  crit, compare_value_t val);
+
+/** Append a boolean condition with bool op = AND */
+int AppendBoolCond(bool_node_t * p_in_out_node, compare_direction_t compar,
+                   compare_criteria_t  crit, compare_value_t val);
+
 
 /**
  * Print a boolean expression to a string.

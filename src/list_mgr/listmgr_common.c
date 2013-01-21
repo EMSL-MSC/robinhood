@@ -24,16 +24,20 @@
 #include "xplatform_print.h"
 #include <stdio.h>
 
-int printdbtype( lmgr_t * p_mgr, char *str, db_type_t type, db_type_u * value_ptr )
+int printdbtype( lmgr_t * p_mgr, char *str, db_type_t type, const db_type_u * value_ptr )
 {
-    char escaped[4096];
+    char tmpstr[4096];
 
     switch ( type )
     {
+    case DB_ID:
+        /* convert id to str */
+        entry_id2pk( p_mgr, &value_ptr->val_id, FALSE, tmpstr );
+        return sprintf( str, "'%s'", tmpstr );
     case DB_TEXT:
         /* escape special characters in value */
-        db_escape_string( &p_mgr->conn, escaped, 4096, value_ptr->val_str );
-        return sprintf( str, "'%s'", escaped );
+        db_escape_string( &p_mgr->conn, tmpstr, 4096, value_ptr->val_str );
+        return sprintf( str, "'%s'", tmpstr );
     case DB_INT:
         return sprintf( str, "%d", value_ptr->val_int );
     case DB_UINT:
@@ -57,8 +61,15 @@ int printdbtype( lmgr_t * p_mgr, char *str, db_type_t type, db_type_u * value_pt
 /* return 1 on success */
 int parsedbtype( char *str_in, db_type_t type, db_type_u * value_out )
 {
+    int rc;
     switch ( type )
     {
+    case DB_ID:
+        /* convert str to id */
+        rc = pk2entry_id( NULL, str_in, &value_out->val_id );
+        if (rc)
+            return 0;
+        return 1;
     case DB_TEXT:
         value_out->val_str = str_in;
         return 1;
@@ -108,6 +119,7 @@ int parsedbtype( char *str_in, db_type_t type, db_type_u * value_out )
 int            main_attr_set = 0;
 int            annex_attr_set = 0;
 int            stripe_attr_set = 0;
+int            dir_attr_set = 0;
 int            readonly_attr_set = 0;
 int            gen_attr_set = 0;
 int            acct_attr_set = 0;
@@ -125,23 +137,23 @@ void init_attrset_masks( const lmgr_config_t *lmgr_config )
     readonly_attr_set = 0;
     acct_pk_attr_set = 0;
     acct_attr_set = 0;
+    dir_attr_set = 0;
 
     if ( lmgr_config->user_acct )
         acct_pk_attr_set |= ATTR_MASK_owner;
     if ( lmgr_config->group_acct )
         acct_pk_attr_set |= ATTR_MASK_gr_name;
-#ifndef _LUSTRE_HSM
     if ( lmgr_config->user_acct || lmgr_config->group_acct )
     {
         acct_pk_attr_set |= ATTR_MASK_type;
     }
-#endif
 #ifdef ATTR_MASK_status
     if ( lmgr_config->user_acct || lmgr_config->group_acct )
     {
         acct_pk_attr_set |= ATTR_MASK_status;
     }
 #endif
+    /* size: also used for size range stats */
     acct_attr_set |= ATTR_MASK_size | ATTR_MASK_blocks ;
 
     for ( i = 0; i < ATTR_COUNT; i++, mask <<= 1 )
@@ -158,6 +170,8 @@ void init_attrset_masks( const lmgr_config_t *lmgr_config )
             annex_attr_set |= mask;
         else if ( is_stripe_field( i ) )
             stripe_attr_set |= mask;
+        else if ( is_dirattr( i ) )
+            dir_attr_set |= mask;
     }
 
 }
@@ -174,7 +188,8 @@ void add_source_fields_for_gen( int * attr_mask )
     /* add attr mask for source info of generated fields */
     for ( i = 0; i < ATTR_COUNT; i++, mask <<= 1 )
     {
-        if ( ((*attr_mask) & mask) && (field_infos[i].flags & GENERATED)
+        if ( ((*attr_mask) & mask)
+             && ((field_infos[i].flags & GENERATED) || (field_infos[i].flags & DIR_ATTR))
              && (field_infos[i].gen_index != -1) )
         {
            (*attr_mask) |= (1 << field_infos[i].gen_index);
@@ -345,7 +360,7 @@ int attrmask2fieldoperation( char *str, int attr_mask, table_enum table, const c
     char *fields_curr = str;
     char operator;
 
-    if ( operation == SUBTRACT )
+    if ( operation == SUBSTRACT )
         operator = '-';
     else
         operator = '+';
@@ -358,11 +373,11 @@ int attrmask2fieldoperation( char *str, int attr_mask, table_enum table, const c
             {
                 if ( nbfields == 0 )
                     fields_curr += 
-                        sprintf( fields_curr, "%s=%s%c%s%s ", field_infos[i].field_name,
+                        sprintf( fields_curr, "%s=CAST(%s as SIGNED)%cCAST(%s%s as SIGNED) ", field_infos[i].field_name,
                                 field_infos[i].field_name, operator, prefix, field_infos[i].field_name );
                 else
                     fields_curr += 
-                        sprintf( fields_curr, ", %s=%s%c%s%s ", field_infos[i].field_name,
+                        sprintf( fields_curr, ", %s=CAST(%s as SIGNED)%cCAST(%s%s as SIGNED) ", field_infos[i].field_name,
                                 field_infos[i].field_name, operator, prefix, field_infos[i].field_name );
                 nbfields++;
             }
@@ -539,50 +554,6 @@ int mk_result_bind_list( const attr_set_t * p_set, table_enum table, db_type_t *
 
 }
 
-int pkfields( char *str, int with_validator )
-{
-#ifdef FID_PK
-    strcpy( str, "fid_seq,fid_oid" );
-#else
-    if ( with_validator )
-        strcpy( str, "inum,dev,validator" );
-    else
-        strcpy( str, "inum,dev" );
-#endif
-    return 0;
-}
-
-
-int pkvalues( char *str, const entry_id_t * p_id, int with_validator )
-{
-#ifdef FID_PK
-    sprintf( str, "%llu,%u", p_id->f_seq, p_id->f_oid );
-#else
-    if ( with_validator )
-        sprintf( str, "%llu,%llu,%u", ( unsigned long long ) p_id->inode,
-                 ( unsigned long long ) p_id->device, p_id->validator );
-    else
-        sprintf( str, "%llu,%llu", ( unsigned long long ) p_id->inode,
-                 ( unsigned long long ) p_id->device );
-#endif
-    return 0;
-}
-
-
-char          *pkfilter( char *str, const entry_id_t * p_id )
-{
-#ifdef FID_PK
-    /* FID Primary key */
-    sprintf( str, "fid_seq=%llu AND fid_oid=%u", p_id->f_seq, p_id->f_oid );
-#else
-    /* inum/dev primary key */
-    sprintf( str, "inum=%llu AND dev=%llu",
-             ( unsigned long long ) p_id->inode, ( unsigned long long ) p_id->device );
-#endif
-    return str;
-}
-
-
 int result2attrset( table_enum table, char **result_tab,
                     unsigned int res_count, attr_set_t * p_set )
 {
@@ -675,6 +646,53 @@ char          *compar2str( filter_comparator_t compar )
     }
 }
 
+/**
+ * return FILTERDIR_NONE if there is no filter on dirattrs
+ * return FILTERDIR_EMPTY if the test is 'dircount == 0'
+ * return FILTERDIR_NONEMPTY if the test is on dircount != 0, >= 0, ...
+ */
+filter_dir_e dir_filter(lmgr_t * p_mgr, const lmgr_filter_t * p_filter, char* filter_str,
+                        unsigned int * dir_attr_index)
+{
+    int i;
+    filter_str[0] = '\0';
+
+#ifdef ATTR_INDEX_dircount
+    if ( p_filter->filter_type == FILTER_SIMPLE )
+    {
+        for ( i = 0; i < p_filter->filter_simple.filter_count; i++ )
+        {
+            unsigned int index = p_filter->filter_simple.filter_index[i];
+            if (!is_dirattr(index))
+                continue;
+
+            /* condition about empty directory ? */
+            if ((index == ATTR_INDEX_dircount)
+                  && (p_filter->filter_simple.filter_value[i].val_uint == 0)
+                  && (p_filter->filter_simple.filter_compar[i] == EQUAL))
+            {
+                DisplayLog( LVL_FULL, LISTMGR_TAG, "Special filter on empty directory" );
+                strcpy( filter_str, "id NOT IN (SELECT distinct(parent_id) from ENTRIES)" );
+                *dir_attr_index = index;
+                return FILTERDIR_EMPTY;
+            }
+            else
+            {
+                char val[1024];
+                db_type_u typeu = p_filter->filter_simple.filter_value[i];
+                printdbtype( p_mgr, val, field_infos[index].db_type, &typeu );
+
+                sprintf(filter_str, "dirattr%s%s", compar2str( p_filter->filter_simple.filter_compar[i] ),
+                        val);
+                *dir_attr_index = index;
+                return FILTERDIR_OTHER;
+            }
+        }
+    }
+#endif
+    return FILTERDIR_NONE;
+}
+
 
 int filter2str( lmgr_t * p_mgr, char *str, const lmgr_filter_t * p_filter,
                 table_enum table, int leading_and, int prefix_table )
@@ -700,7 +718,12 @@ int filter2str( lmgr_t * p_mgr, char *str, const lmgr_filter_t * p_filter,
             fname[0] = '\0';
 
             /* filter on generated fields are not allowed */
-            if ( field_infos[index].flags & GENERATED )
+            if ( field_infos[index].flags & DIR_ATTR )
+            {
+                DisplayLog( LVL_FULL, LISTMGR_TAG, "Special filter on dir attribute '%s'", field_infos[index].field_name );
+                continue;
+            }
+            else if ( field_infos[index].flags & GENERATED )
             {
                 DisplayLog( LVL_CRIT, LISTMGR_TAG, "Cannot use filter on generated field '%s'", field_infos[index].field_name );
                 return -DB_INVALID_ARG;
@@ -828,6 +851,20 @@ int filter2str( lmgr_t * p_mgr, char *str, const lmgr_filter_t * p_filter,
     return nbfields;
 }                               /* filter2str */
 
+const char * dirattr2str( unsigned int attr_index )
+{
+    switch (attr_index)
+    {
+        case ATTR_INDEX_dircount:
+            return "COUNT(*)";
+        case ATTR_INDEX_avgsize:
+            return "ROUND(AVG(size),0)";
+        default:
+            DisplayLog( LVL_CRIT, LISTMGR_TAG, "Unexpected attr index %u in %s", attr_index, __func__ );
+            return NULL;
+    }
+}
+
 
 /* special masks values for id2pk and pk2id */
 #define MASK_ID2PK  0
@@ -838,7 +875,7 @@ int entry_id2pk( lmgr_t * p_mgr, const entry_id_t * p_id, int add_if_not_exists,
                  PK_PARG_T p_pk )
 {
 #ifndef FID_PK
-    snprintf( p_pk, PK_LEN, "%"PRI_DT":%LX", p_id->device,
+    snprintf( p_pk, PK_LEN, "%"PRI_DT":%LX", p_id->fs_key,
               (unsigned long long)p_id->inode );
 #else /* FID_PK */
     snprintf( p_pk, FID_LEN, DFID_NOBRACE, PFID(p_id) );
@@ -852,7 +889,7 @@ int pk2entry_id( lmgr_t * p_mgr, PK_ARG_T pk, entry_id_t * p_id )
 #ifndef FID_PK
     unsigned long long tmp_ino;
 
-    if ( sscanf( pk, "%"PRI_DT":%LX", &p_id->device, &tmp_ino ) != 2 )
+    if ( sscanf( pk, "%"PRI_DT":%LX", &p_id->fs_key, &tmp_ino ) != 2 )
         return DB_INVALID_ARG;
     else
     {
@@ -865,6 +902,16 @@ int pk2entry_id( lmgr_t * p_mgr, PK_ARG_T pk, entry_id_t * p_id )
     else
         return DB_SUCCESS;
 #endif
+}
+
+unsigned int append_size_range_fields(char * str, int leading_comma, char *prefix)
+{
+    unsigned int i, l;
+    l=0;
+    for (i = 0; i < SZ_PROFIL_COUNT; i++)
+        l += sprintf( str+l, "%s %s%s", leading_comma || (i > 0)?",":"",
+                      prefix, sz_field[i] );
+    return l;
 }
 
 /* those functions are used for begin/commit/rollback */

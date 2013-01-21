@@ -27,6 +27,93 @@
 #include <stdlib.h>
 
 
+/* append a directory condition (sort or filter on dirattr) to an iterator request */
+void append_dir_req(char * outstr, const char * req_start, const char * table_filter,
+                    const char * sort_dirattr_str, filter_dir_e filter_dir,
+                    const char * filter_dir_str, unsigned int filter_dir_index)
+{
+    char * currstr = outstr;
+
+    if (sort_dirattr_str == NULL)
+    {
+        switch (filter_dir)
+        {
+            case FILTERDIR_NONE:
+                /* no dirattr involved */
+                strcpy(outstr, req_start); /* no "where" needed */
+                currstr += strlen(outstr);
+                if (table_filter)
+                    sprintf( currstr, " WHERE %s", table_filter );
+                break;
+            case FILTERDIR_EMPTY:
+                /* only empty dir filter is to be appended */
+                currstr += sprintf( outstr, "%s WHERE %s", req_start, filter_dir_str);
+                if (table_filter)
+                    sprintf( currstr, " AND %s", table_filter );
+                break;
+            case FILTERDIR_OTHER:
+                /* must join on dirattr_filter */
+                currstr += sprintf( outstr, "%s LEFT JOIN (SELECT parent_id, %s as dirattr from ENTRIES "
+                             "GROUP BY parent_id) as da ON id=da.parent_id "
+                             "WHERE %s", req_start, dirattr2str(filter_dir_index),
+                             filter_dir_str );
+                if (table_filter)
+                    sprintf( currstr, " AND %s", table_filter );
+                break;
+            default:
+                DisplayLog( LVL_CRIT, LISTMGR_TAG, "Unexpected filter on directory attribute in %s(): %#x",
+                            __func__, filter_dir );
+                /* ignore dir filter */
+                append_dir_req( outstr, req_start, table_filter, sort_dirattr_str,
+                                FILTERDIR_NONE, NULL, 0);
+                break;
+        }
+    }
+    else /* sorting on dirattr */
+    {
+        /* sort on 1 dirattr, possibly needs a second for filter */
+        switch (filter_dir)
+        {
+            case FILTERDIR_NONE:
+                /* left join with dirattr_sort */
+                /* @TODO directly perform request on parent_id if no table_filter? */
+                currstr += sprintf( outstr, "%s LEFT JOIN (SELECT parent_id, %s as dirattr_sort "
+                                    "FROM ENTRIES GROUP BY parent_id) as da ON id=da.parent_id",
+                                    req_start, sort_dirattr_str );
+                if (table_filter)
+                    sprintf( currstr, " WHERE %s", table_filter );
+                break;
+            case FILTERDIR_EMPTY:
+                /* left join with dirattr_sort + add empty dir filter */
+                currstr += sprintf( outstr, "%s LEFT JOIN (SELECT parent_id, %s as dirattr_sort "
+                                   "FROM ENTRIES GROUP BY parent_id) as da ON id=da.parent_id "
+                                   "WHERE %s", req_start, sort_dirattr_str, filter_dir_str );
+                if (table_filter)
+                    sprintf( currstr, " AND %s", table_filter );
+                break;
+            case FILTERDIR_OTHER:
+                /* must join on dirattr_filter */
+                /* @TODO: optimize if dirattr_sort is the same as dirattr */
+                currstr += sprintf( outstr, "%s LEFT JOIN (SELECT parent_id, %s as dirattr, "
+                               "%s as dirattr_sort FROM ENTRIES GROUP BY parent_id) "
+                               "as da ON id=da.parent_id WHERE %s", req_start,
+                               dirattr2str(filter_dir_index), sort_dirattr_str,
+                               filter_dir_str);
+                if (table_filter)
+                    sprintf( currstr, " AND %s", table_filter );
+                break;
+            default:
+                DisplayLog( LVL_CRIT, LISTMGR_TAG, "Unexpected filter on directory attribute in %s(): %#x",
+                            __func__, filter_dir );
+                /* ignore dir filter */
+                append_dir_req( outstr, req_start, table_filter, sort_dirattr_str,
+                                FILTERDIR_NONE, NULL, 0);
+                break;
+        }
+    }
+}
+
+/** get an iterator on a list of entries */
 struct lmgr_iterator_t *ListMgr_Iterator( lmgr_t * p_mgr,
                                           const lmgr_filter_t * p_filter,
                                           const lmgr_sort_type_t *
@@ -37,6 +124,9 @@ struct lmgr_iterator_t *ListMgr_Iterator( lmgr_t * p_mgr,
     char           filter_str_annex[2048];
     char           filter_str_stripe_info[2048];
     char           filter_str_stripe_items[2048];
+    char           filter_dir_str[512];
+    filter_dir_e   filter_dir_type = FILTERDIR_NONE;
+    unsigned int   filter_dir_index = 0;
     int            filter_main = 0;
     int            filter_annex = 0;
     int            filter_stripe_info = 0;
@@ -46,6 +136,7 @@ struct lmgr_iterator_t *ListMgr_Iterator( lmgr_t * p_mgr,
     char           tables[2048];
     lmgr_iterator_t *it;
     table_enum     sort_table = T_NONE;
+    int            sort_dirattr = 0;
     int            do_sort = 0;
 
     filter_str_main[0] = '\0';
@@ -73,6 +164,8 @@ struct lmgr_iterator_t *ListMgr_Iterator( lmgr_t * p_mgr,
             sort_table = T_STRIPE_INFO;
         else if ( field_infos[p_sort_type->attr_index].db_type == DB_STRIPE_ITEMS )
             sort_table = T_STRIPE_ITEMS;
+        else if ( is_dirattr(p_sort_type->attr_index) )
+            sort_dirattr = 1;
         else
         {
             DisplayLog( LVL_CRIT, LISTMGR_TAG, "Invalid field for sort order (index=%d)", p_sort_type->attr_index );
@@ -91,6 +184,9 @@ struct lmgr_iterator_t *ListMgr_Iterator( lmgr_t * p_mgr,
 
     if ( p_filter )
     {
+        filter_dir_type = dir_filter(p_mgr, p_filter, filter_dir_str, &filter_dir_index);
+        /* is sort dirattr the same as filter dirattr? */
+
         filter_main = filter2str( p_mgr, filter_str_main, p_filter, T_MAIN,
                                   FALSE, TRUE );
 
@@ -110,56 +206,100 @@ struct lmgr_iterator_t *ListMgr_Iterator( lmgr_t * p_mgr,
                         || ( filter_stripe_info > 0 ), TRUE );
 
 
-        if ( ( filter_main == 0 ) && ( filter_annex == 0 ) && ( filter_stripe_items == 0 )
-             && ( filter_stripe_info == 0 ) )
+        if (( filter_main == 0 ) && ( filter_annex == 0 ) && ( filter_stripe_items == 0 )
+             && ( filter_stripe_info == 0 ))
         {
+            /* for dirattr filter, we can deal with table mixing */
+
             /* all records */
-            DisplayLog( LVL_FULL, LISTMGR_TAG, "Empty filter: all records will be affected" );
+            if (filter_dir_type == FILTERDIR_NONE)
+                DisplayLog( LVL_FULL, LISTMGR_TAG, "Empty filter: all records will be affected" );
+
             if ( do_sort )
             {
                 /* entries must be selected depending on sort order */
                 if ( sort_table == T_MAIN )
-                    strcpy( query, "SELECT id FROM " MAIN_TABLE );
+                    append_dir_req(query, "SELECT id FROM " MAIN_TABLE, NULL,
+                                   sort_dirattr ? dirattr2str(p_sort_type->attr_index) : NULL,
+                                   filter_dir_type, filter_dir_str, filter_dir_index);
                 else if ( sort_table == T_ANNEX )
-                    strcpy( query, "SELECT id FROM " ANNEX_TABLE );
+                    append_dir_req(query, "SELECT id FROM " ANNEX_TABLE, NULL,
+                                   sort_dirattr ? dirattr2str(p_sort_type->attr_index) : NULL,
+                                   filter_dir_type, filter_dir_str, filter_dir_index);
                 else if ( sort_table == T_STRIPE_INFO )
-                    strcpy( query, "SELECT id FROM " STRIPE_INFO_TABLE );
+                    append_dir_req(query, "SELECT id FROM " STRIPE_INFO_TABLE, NULL,
+                                   sort_dirattr ? dirattr2str(p_sort_type->attr_index) : NULL,
+                                   filter_dir_type, filter_dir_str, filter_dir_index);
                 else if ( sort_table == T_STRIPE_ITEMS )
-                    strcpy( query, "SELECT DISTINCT(id) FROM " STRIPE_ITEMS_TABLE );
+                    append_dir_req(query, "SELECT DISTINCT(id) FROM " STRIPE_ITEMS_TABLE, NULL,
+                                   sort_dirattr ? dirattr2str(p_sort_type->attr_index) : NULL,
+                                   filter_dir_type, filter_dir_str, filter_dir_index);
+                else if ( sort_dirattr )
+                {
+                    if (filter_dir_type == FILTERDIR_NONE)
+                        sprintf( query, "SELECT parent_id, %s as dirattr_sort FROM "MAIN_TABLE" GROUP BY parent_id",
+                                 dirattr2str(p_sort_type->attr_index) );
+                    else if (filter_dir_type == FILTERDIR_EMPTY)
+                    {
+                        DisplayLog( LVL_MAJOR, LISTMGR_TAG, "Unexpected case: sort %s for empty directories",
+                                    dirattr2str(p_sort_type->attr_index) );
+                        return NULL;
+                    }
+                    else
+                    {
+                        sprintf( query, "SELECT parent_id, %s as dirattr, %s as dirattr_sort FROM "MAIN_TABLE
+                                 " GROUP BY parent_id HAVING %s",
+                                 dirattr2str(filter_dir_index), dirattr2str(p_sort_type->attr_index),
+                                 filter_dir_str);
+                    }
+                }
             }
             else
             {
-                strcpy( query, "SELECT id FROM " MAIN_TABLE );
+                append_dir_req(query, "SELECT id FROM " MAIN_TABLE, NULL, NULL,
+                               filter_dir_type, filter_dir_str, filter_dir_index);
             }
         }
         else if ( filter_main && !( filter_annex || filter_stripe_items || filter_stripe_info )
-                  && ( !do_sort || ( sort_table == T_MAIN ) ) )
+                  && ( !do_sort || ( sort_table == T_MAIN ) || sort_dirattr ) )
         {
             DisplayLog( LVL_FULL, LISTMGR_TAG, "Filter is only on " MAIN_TABLE " table" );
-            sprintf( query, "SELECT id FROM " MAIN_TABLE " WHERE %s", filter_str_main );
+
+            /* filter/sort on main table
+             * + optionally filter/sort on dirattrs
+             */
+            append_dir_req(query, "SELECT id FROM " MAIN_TABLE, filter_str_main,
+                           sort_dirattr ? dirattr2str(p_sort_type->attr_index) : NULL,
+                           filter_dir_type, filter_dir_str, filter_dir_index);
         }
         else if ( filter_annex && !( filter_main || filter_stripe_items || filter_stripe_info )
-                  && ( !do_sort || ( sort_table == T_ANNEX ) ) )
+                  && ( !do_sort || ( sort_table == T_ANNEX ) || sort_dirattr ) )
         {
             DisplayLog( LVL_FULL, LISTMGR_TAG, "Filter is only on " ANNEX_TABLE " table" );
-            sprintf( query, "SELECT id FROM " ANNEX_TABLE " WHERE %s", filter_str_annex );
+
+            append_dir_req(query, "SELECT id FROM " ANNEX_TABLE, filter_str_annex,
+                           sort_dirattr ? dirattr2str(p_sort_type->attr_index) : NULL,
+                           filter_dir_type, filter_dir_str, filter_dir_index);
         }
         else if ( filter_stripe_info && !( filter_main || filter_annex || filter_stripe_items )
-                  && ( !do_sort || ( sort_table == T_STRIPE_INFO ) ) )
+                  && ( !do_sort || ( sort_table == T_STRIPE_INFO ) || sort_dirattr ) )
         {
             DisplayLog( LVL_FULL, LISTMGR_TAG, "Filter is only on " STRIPE_INFO_TABLE " table" );
-            sprintf( query,
-                     "SELECT id FROM " STRIPE_INFO_TABLE " WHERE %s", filter_str_stripe_info );
+
+            append_dir_req(query, "SELECT id FROM " STRIPE_INFO_TABLE, filter_str_stripe_info,
+                           sort_dirattr ? dirattr2str(p_sort_type->attr_index) : NULL,
+                           filter_dir_type, filter_dir_str, filter_dir_index);
         }
         else if ( filter_stripe_items && !( filter_main || filter_annex || filter_stripe_info )
-                  && ( !do_sort || ( sort_table == T_STRIPE_ITEMS ) ) )
+                  && ( !do_sort || ( sort_table == T_STRIPE_ITEMS ) || sort_dirattr ) )
         {
             DisplayLog( LVL_FULL, LISTMGR_TAG, "Filter is only on " STRIPE_ITEMS_TABLE " table" );
-            sprintf( query,
-                     "SELECT DISTINCT(id) FROM " STRIPE_ITEMS_TABLE
-                     " WHERE %s", filter_str_stripe_items );
+
+            append_dir_req(query, "SELECT DISTINCT(id) FROM " STRIPE_ITEMS_TABLE, filter_str_stripe_items,
+                           sort_dirattr ? dirattr2str(p_sort_type->attr_index) : NULL,
+                           filter_dir_type, filter_dir_str, filter_dir_index);
         }
-        else
+        else /* filter or sort on several tables */
         {
             char          *curr_fields = fields;
             char          *curr_tables = tables;
@@ -266,14 +406,20 @@ struct lmgr_iterator_t *ListMgr_Iterator( lmgr_t * p_mgr,
                 curr_tables += sprintf( curr_tables, "%s", STRIPE_INFO_TABLE );
             }
 
-            sprintf( query, "SELECT %s.id AS id FROM %s WHERE %s", first_table, tables, fields );
+            DisplayLog(LVL_FULL, LISTMGR_TAG, "first_table=%s, tables=%s",
+                       first_table, tables);
 
+            char tmp[1024];
+            sprintf( tmp, "SELECT %s.id AS id FROM %s", first_table, tables );
+            append_dir_req( query, tmp, fields,
+                            sort_dirattr ? dirattr2str(p_sort_type->attr_index) : NULL,
+                            filter_dir_type, filter_dir_str, filter_dir_index );
         }
     }
     else if ( do_sort )
     {
 
-        /* entries must be selected depending on sort order */
+        /* no filter: entries must be selected depending on sort order */
         if ( sort_table == T_MAIN )
             strcpy( query, "SELECT id FROM " MAIN_TABLE );
         else if ( sort_table == T_ANNEX )
@@ -282,7 +428,9 @@ struct lmgr_iterator_t *ListMgr_Iterator( lmgr_t * p_mgr,
             strcpy( query, "SELECT DISTINCT(id) FROM " STRIPE_ITEMS_TABLE );
         else if ( sort_table == T_STRIPE_INFO )
             strcpy( query, "SELECT id FROM " STRIPE_INFO_TABLE );
-
+        else if (sort_dirattr)
+            sprintf( query, "SELECT parent_id, %s as dirattr_sort FROM "MAIN_TABLE" GROUP BY parent_id",
+                    dirattr2str(p_sort_type->attr_index) );
     }
     else
     {
@@ -295,7 +443,6 @@ struct lmgr_iterator_t *ListMgr_Iterator( lmgr_t * p_mgr,
     /* sort order */
     if ( do_sort )
     {
-
         if ( sort_table == T_MAIN )
         {
             query_end +=
@@ -316,6 +463,10 @@ struct lmgr_iterator_t *ListMgr_Iterator( lmgr_t * p_mgr,
         {
             query_end += sprintf( query_end, " ORDER BY " STRIPE_INFO_TABLE ".pool_name " );
         }
+        else if ( sort_dirattr )
+        {
+            query_end += sprintf( query_end, " ORDER BY dirattr_sort " );
+        }
 
         if ( p_sort_type->order == SORT_ASC )
             query_end += sprintf( query_end, "ASC" );
@@ -332,6 +483,15 @@ struct lmgr_iterator_t *ListMgr_Iterator( lmgr_t * p_mgr,
     /* allocate a new iterator */
     it = ( lmgr_iterator_t * ) MemAlloc( sizeof( lmgr_iterator_t ) );
     it->p_mgr = p_mgr;
+    if (p_opt)
+    {
+        it->opt = *p_opt;
+        it->opt_is_set = 1;
+    }
+    else
+    {
+        it->opt_is_set = 0;
+    }
 
 #ifdef _DEBUG_DB
     printf( "Iterator is specified by: %s\n", query );
@@ -347,7 +507,6 @@ struct lmgr_iterator_t *ListMgr_Iterator( lmgr_t * p_mgr,
     }
     else
         return it;
-
 }
 
 
@@ -355,7 +514,8 @@ struct lmgr_iterator_t *ListMgr_Iterator( lmgr_t * p_mgr,
 int ListMgr_GetNext( struct lmgr_iterator_t *p_iter, entry_id_t * p_id, attr_set_t * p_info )
 {
     int            rc = 0;
-    char          *idstr;
+    /* can contain id+dirattr+dirattr_sort in case of directory listing */
+    char          *idstr[3];
     DEF_PK(pk);
 
     int            entry_disappeared = FALSE;
@@ -364,14 +524,15 @@ int ListMgr_GetNext( struct lmgr_iterator_t *p_iter, entry_id_t * p_id, attr_set
     {
         entry_disappeared = FALSE;
 
-        rc = db_next_record( &p_iter->p_mgr->conn, &p_iter->select_result, &idstr, 1 );
+        idstr[0] = idstr[1] = idstr[2] = NULL;
+        rc = db_next_record( &p_iter->p_mgr->conn, &p_iter->select_result, idstr, 3 );
 
         if ( rc )
             return rc;
         if ( idstr == NULL )
             return DB_REQUEST_FAILED;
 
-        if ( sscanf( idstr, SPK, PTR_PK(pk) ) != 1 )
+        if ( sscanf( idstr[0], SPK, PTR_PK(pk) ) != 1 )
             return DB_REQUEST_FAILED;
 
         /* retrieve entry id (except validator) */
@@ -385,9 +546,31 @@ int ListMgr_GetNext( struct lmgr_iterator_t *p_iter, entry_id_t * p_id, attr_set
 
         /* Idem */
         rc = listmgr_get_by_pk( p_iter->p_mgr, pk, p_info );
-        if ( rc == DB_NOT_EXISTS )
-            entry_disappeared = TRUE;
 
+        if ( rc == DB_NOT_EXISTS )
+        {
+            if (p_iter->opt_is_set && p_iter->opt.allow_no_attr)
+            {
+                /* clear missing fields */
+                p_info->attr_mask &= dir_attr_set;
+                /* special field dircount */
+                if (dirattr_fields( p_info->attr_mask ))
+                {
+                    if (listmgr_get_dirattrs(p_iter->p_mgr, pk, p_info))
+                    {
+                        DisplayLog( LVL_MAJOR, LISTMGR_TAG, "listmgr_get_dirattr failed for "DPK, pk );
+                        p_info->attr_mask &= ~dir_attr_set;
+                    }
+                }
+
+                /* compute generated fields if asked */
+                generate_fields( p_info );
+
+                rc = 0;
+            }
+            else
+                entry_disappeared = TRUE;
+        }
     }
     while ( entry_disappeared );        /* goto next record if entry desappered */
 

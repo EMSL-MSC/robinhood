@@ -47,7 +47,7 @@ static void   *scan_starter( void *arg )
         return NULL;
     }
 
-    /* no a one-shot mode */
+    /* not a one-shot mode */
     while ( !terminate )
     {
         rc = Robinhood_CheckScanDeadlines(  );
@@ -63,13 +63,25 @@ static void   *scan_starter( void *arg )
 
 
 /** Start FS Scan info collector */
-int FSScan_Start( fs_scan_config_t *module_config, int flags )
+int FSScan_Start( fs_scan_config_t *module_config, int flags, const char * partial_root )
 {
     int            rc;
     fs_scan_config = *module_config;
     fsscan_flags = flags;
+    partial_scan_root = partial_root;
 
-    rc = Robinhood_InitScanModule(  );
+    if (partial_root)
+    {
+        /* check that partial_root is under FS root */
+        if (strncmp(global_config.fs_path, partial_scan_root, strlen(global_config.fs_path)))
+        {
+            DisplayLog( LVL_CRIT, FSSCAN_TAG, "ERROR scan root %s is not under fs root %s",
+                        partial_scan_root, global_config.fs_path );
+            return EINVAL;
+        }
+    }
+
+    rc = Robinhood_InitScanModule();
     if ( rc )
         return rc;
 
@@ -171,7 +183,7 @@ int FSScan_DumpStats(  )
 
         DisplayLog( LVL_MAJOR, "STATS", "duration    = %s (%u s)", tmp_buff, stats.last_duration );
         DisplayLog( LVL_MAJOR, "STATS", "status      = %s",
-                    ( stats.scan_complete ? "complete" : "partial" ) );
+                    ( stats.scan_complete ? "complete" : "incomplete" ) );
     }
 
     if ( stats.current_scan_interval != 0 )
@@ -259,6 +271,7 @@ int FSScan_SetDefaultConfig( void *module_config, char *msg_out )
 
     conf->ignore_list = NULL;
     conf->ignore_count = 0;
+    strncpy( conf->completion_command, "", RBH_PATH_MAX );
 
     return 0;
 }
@@ -280,6 +293,7 @@ int FSScan_WriteDefaultConfig( FILE * output )
     print_line( output, 1, "spooler_check_interval :  1min" );
     print_line( output, 1, "nb_prealloc_tasks      :   256" );
     print_line( output, 1, "ignore                 :  NONE" );
+    print_line( output, 1, "completion_command     :  NONE" );
     print_end_block( output, 0 );
     return 0;
 }
@@ -305,6 +319,7 @@ int FSScan_ReadConfig( config_file_t config, void *module_config, char *msg_out,
         "scan_interval", "min_scan_interval", "max_scan_interval",
         "scan_retry_delay", "nb_threads_scan", "scan_op_timeout",
         "exit_on_timeout", "spooler_check_interval", "nb_prealloc_tasks",
+		"completion_command",
         IGNORE_BLOCK, NULL
     };
 
@@ -399,6 +414,13 @@ int FSScan_ReadConfig( config_file_t config, void *module_config, char *msg_out,
                            ( int * ) &conf->nb_prealloc_tasks, NULL, NULL, msg_out );
     if ( ( rc != 0 ) && ( rc != ENOENT ) )
         return rc;
+
+    rc = GetStringParam( fsscan_block, FSSCAN_CONFIG_BLOCK, "completion_command",
+                         STR_PARAM_ABSOLUTE_PATH, /* can contain wildcards: {cfg} or {fspath} */
+                         conf->completion_command, RBH_PATH_MAX, NULL, NULL, msg_out );
+    if ( ( rc != 0 ) && ( rc != ENOENT ) )
+        return rc;
+
 
     /* Find and parse "ignore" blocks */
     for ( blc_index = 0; blc_index < rh_config_GetNbItems( fsscan_block ); blc_index++ )
@@ -552,6 +574,15 @@ int FSScan_ReloadConfig( void *module_config )
         fs_scan_config.spooler_check_interval = conf->spooler_check_interval;
     }
 
+    if ( strcmp( conf->completion_command, fs_scan_config.completion_command ) )
+    {   
+        DisplayLog( LVL_EVENT, "FS_Scan_Config",
+                    FSSCAN_CONFIG_BLOCK "::completion_command updated: '%s'->'%s'",
+                    fs_scan_config.completion_command, conf->completion_command );
+        strcpy( fs_scan_config.completion_command, conf->completion_command);
+    }
+
+
     /* Parameters that canNOT be modified dynamically */
 
     if ( conf->nb_threads_scan != fs_scan_config.nb_threads_scan )
@@ -579,17 +610,22 @@ int FSScan_WriteConfigTemplate( FILE * output )
 {
     print_begin_block( output, 0, FSSCAN_CONFIG_BLOCK, NULL );
 
-    print_line( output, 1, "# Min/max intervals for scanning filesystem namespace." );
-    print_line( output, 1, "# The interval for scanning is computed according to this formula:" );
-    print_line( output, 1, "# min + (100%% - max storage usage)*(max-min)" );
-    print_line( output, 1,
-                "# so the more the filesystem is full, the more frequently it is scanned." );
-#ifdef _LUSTRE_HSM
-    print_line( output, 1, "min_scan_interval      =   24h ;" );
-    print_line( output, 1, "max_scan_interval      =    7d ;" );
+    print_line( output, 1, "# simple scan interval (fixed)" );
+#ifdef HAVE_CHANGELOGS
+    print_line( output, 1, "scan_interval      =   2d ;" );
 #else
-    print_line( output, 1, "min_scan_interval      =    2h ;" );
-    print_line( output, 1, "max_scan_interval      =   12h ;" );
+    print_line( output, 1, "scan_interval      =   6h ;" );
+#endif
+    fprintf( output, "\n" );
+
+    print_line( output, 1, "# min/max for adaptive scan interval:" );
+    print_line( output, 1, "# the more the filesystem is full, the more frequently it is scanned." );
+#ifdef HAVE_CHANGELOGS
+    print_line( output, 1, "#min_scan_interval      =   24h ;" );
+    print_line( output, 1, "#max_scan_interval      =    7d ;" );
+#else
+    print_line( output, 1, "#min_scan_interval      =    2h ;" );
+    print_line( output, 1, "#max_scan_interval      =   12h ;" );
 #endif
     fprintf( output, "\n" );
     print_line( output, 1, "# number of threads used for scanning the filesystem" );
@@ -602,6 +638,10 @@ int FSScan_WriteConfigTemplate( FILE * output )
     print_line( output, 1, "scan_op_timeout        =    1h ;" );
     print_line( output, 1, "# exit if operation timeout is reached?" );
     print_line( output, 1, "exit_on_timeout        =    TRUE ;" );
+    print_line( output, 1, "# external command called on scan termination");
+    print_line( output, 1, "# special arguments can be specified: {cfg} = config file path,");
+    print_line( output, 1, "# {fspath} = path to managed filesystem");
+    print_line( output, 1, "#completion_command     =    \"/path/to/my/script.sh -f {cfg} -p {fspath}\" ;" );
     fprintf( output, "\n" );
 
     print_line( output, 1,

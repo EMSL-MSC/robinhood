@@ -52,13 +52,6 @@ static int lmgr_gen_name( void * tgt, const void * src )
     return 0;
 }
 
-static int lmgr_gen_type( void * tgt, const void * src )
-{
-   char * type = (char*)tgt;
-   strcpy(type, "file"); 
-   return 0;
-}
-
 static int lmgr_gen_depth( void * tgt, const void * src )
 {
     const char * fullpath = (char*)src;
@@ -102,13 +95,19 @@ typedef enum
   STATUS_ARCHIVE_RUNNING,       /* file is being archived */
   STATUS_SYNCHRO,               /* file has been synchronized in HSM, file can be purged */
   STATUS_RELEASED,              /* file is released (nothing to do). XXX should not be in DB? */
-  STATUS_RELEASE_PENDING    	/* file is being released */
+  STATUS_RELEASE_PENDING,    	/* file is being released */
+
+  STATUS_COUNT                  /* number of possible file status */
 } file_status_t;
 
 %attrdef
 
 # /!\ Entry attribute type must fit with DB type
 # name, 		C type, 	db type, size (C and db), flags (INIT_ONLY, FREQ_ACCESS or ANNEX_INFO)
+
+parent_id,      entry_id_t,    DB_ID,          0, FREQ_ACCESS | INDEXED
+dircount,       unsigned int,  DB_UINT,        0, DIR_ATTR, type, NULL
+avgsize,        uint64_t,      DB_BIGUINT,     0, DIR_ATTR, type, NULL
 
 # fields used for sorting/filtering
 
@@ -134,7 +133,7 @@ fullpath,		char,		DB_TEXT,   RBH_PATH_MAX, ANNEX_INFO
 path_update,    unsigned int, DB_UINT, 0,    ANNEX_INFO
 
 # generated fields
-type,           char,   DB_TEXT, 32,         GENERATED, , lmgr_gen_type 
+type,           char,   DB_TEXT, 32,         FREQ_ACCESS
 name,			char,		DB_TEXT,   RBH_NAME_MAX,  GENERATED, fullpath, lmgr_gen_name
 depth, 	        unsigned int, DB_UINT, 0, GENERATED, fullpath, lmgr_gen_depth
 

@@ -30,6 +30,7 @@
 #endif
 #include <dirent.h>
 #include <stdint.h>
+#include "xplatform_print.h"
 
 /**
  *  Miscelaneous parsing macros
@@ -63,6 +64,22 @@
 #endif
 #ifndef V
 #define V(_mutex_) pthread_mutex_unlock(&(_mutex_))
+#endif
+
+/* displaying FID */
+#ifndef _HAVE_FID
+#undef DFID
+#undef PFID
+#undef SFID
+#undef RFID
+
+#define DFID "%"PRIX64"/%"PRI_STI
+#define PFID(_pid) (_pid)->fs_key, (_pid)->inode
+#define SFID "0X%"PRIX64"/%"PRI_STI
+#define RFID(_pid) &((_pid)->fs_key), &((_pid)->inode)
+#define FID_SCAN_CNT 2
+#else
+#define FID_SCAN_CNT 3
 #endif
 
 /**
@@ -100,18 +117,42 @@ char          *gid2str( gid_t gid, char *groupname );
  * Also return the associated device number.
  * (for STAY_IN_FS security option).
  */
-int            CheckFSInfo( char *path, char *expected_type, dev_t * p_fs_dev,
+int            CheckFSInfo( char *path, char *expected_type,
+                            dev_t * p_fs_dev, char * fsname,
                             int check_mounted, int save_fs );
+
+
+/**
+ * Initialize filesystem access and retrieve current devid/fs_key
+ * - global_config must be set
+ * - initialize mount_point, fsname and dev_id
+ */
+int InitFS();
+
+/**
+ * This is to be called after a dev_id change was detected
+ * return 0 if fskey is unchanged and update mount_point, fsname and dev_id
+ * else, return -1
+ */
+int ResetFS();
+
 
 /**
  *  Check that FS path is the same as the last time.
  */
 int            CheckLastFS(  );
 
+/* retrieve FS info */
+const char    *get_mount_point( unsigned int * plen );
+const char    *get_fsname(  );
+dev_t          get_fsdev();
+uint64_t       get_fskey();
+
 /**
  * extract relative path from full path
  */
 int relative_path( const char * fullpath, const char * root, char * rel_path );
+
 
 #ifdef _LUSTRE
 
@@ -127,10 +168,6 @@ int            File_GetStripeByPath( const char *entry_path, stripe_info_t * p_s
 int File_CreateSetStripe( const char * path, const stripe_info_t * stripe );
 #endif
 
-void           set_mount_point( char *mntpnt );
-char          *get_mount_point(  );
-void           set_fsname( char *name );
-char          *get_fsname(  );
 #ifdef _HAVE_FID
 int            BuildFidPath( const entry_id_t * p_id /* IN */ , char *path /* OUT */  );
 int            Lustre_GetFullPath( const entry_id_t * p_id, char *fullpath, unsigned int len );
@@ -167,7 +204,7 @@ int LustreHSM_Action( enum hsm_user_action action, const entry_id_t * p_id,
 #endif
 
 /** Retrieve OST usage info ('ost df') */
-int            Get_OST_usage( char *fs_path, unsigned int ost_index, struct statfs *ost_statfs );
+int            Get_OST_usage( const char *fs_path, unsigned int ost_index, struct statfs *ost_statfs );
 
 #ifdef HAVE_LLAPI_GETPOOL_INFO
 /** Retrieve pool usage info */
@@ -296,5 +333,14 @@ int str_replace( char * str_in_out, const char * to_be_replaced,
  * Execute a shell command and analyze the return code
  */
 int execute_shell_command( const char * cmd, int argc, ... );
+
+/**
+ * Replace special parameters {cfgfile}, {fspath}, ...
+ * in the given cmd line.
+ * Result string is allocated using malloc()
+ * and must be released using free().
+ */
+char * replace_cmd_parameters(const char * cmd_in);
+
 
 #endif

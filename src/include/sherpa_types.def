@@ -44,12 +44,12 @@ typedef lustre_fid entry_id_t;
 #define INUM_PK
 typedef struct __entry_id__
 {
-  dev_t device;
+  uint64_t fs_key;
   ino_t inode;
   int validator;
 } entry_id_t;
 
-#define entry_id_equal( _p_id_1, _p_id_2 ) ( ((_p_id_1)->device == (_p_id_2)->device) && ((_p_id_1)->inode == (_p_id_2)->inode)  )
+#define entry_id_equal( _p_id_1, _p_id_2 ) ( ((_p_id_1)->fs_key == (_p_id_2)->fs_key) && ((_p_id_1)->inode == (_p_id_2)->inode)  )
 
 #endif
 
@@ -111,10 +111,12 @@ typedef enum
   STATUS_UNKNOWN = 0,           /* undetermined status */
   STATUS_NO_REF,                /* file does not exists in reference */
   STATUS_MODIFIED,              /* file must be archived */
-  STATUS_RESTORE_RUNNING,        /* file is being retrieved */
+  STATUS_RESTORE_RUNNING,       /* file is being retrieved */
   STATUS_ARCHIVE_RUNNING,       /* file is being archived */
   STATUS_OUT_OF_DATE,           /* file is older than reference */
-  STATUS_SYNCHRO                /* file has been synchronized in reference, file can be purged */
+  STATUS_SYNCHRO,               /* file has been synchronized in reference, file can be purged */
+
+  STATUS_COUNT                  /* number of possible file status */
 } file_status_t;
 
 
@@ -123,6 +125,9 @@ typedef enum
 # /!\ Entry attribute type must fit with DB type
 # name, 		C type, 	db type, size (C and db), flags (INIT_ONLY, FREQ_ACCESS or ANNEX_INFO)
 
+parent_id,      entry_id_t,    DB_ID,          0, FREQ_ACCESS | INDEXED
+dircount, 	    unsigned int,  DB_UINT,        0, DIR_ATTR, type, NULL
+avgsize, 	    uint64_t,      DB_BIGUINT,     0, DIR_ATTR, type, NULL
 
 # stripe info (stripe size, pool)
 stripe_info, 		stripe_info_t, 	DB_STRIPE_INFO,   0, 	 INIT_ONLY
@@ -137,7 +142,6 @@ size,        		size_t,		DB_BIGUINT, 0,    FREQ_ACCESS
 blocks, 	    unsigned long long, DB_BIGUINT, 0, FREQ_ACCESS
 owner, 			char, 		DB_TEXT,   128,  FREQ_ACCESS
 gr_name, 		char, 		DB_TEXT,   128,  FREQ_ACCESS
-dircount, 	    unsigned int, DB_UINT, 0, ANNEX_INFO
 
 # refpath is generated outside listmgr
 refpath,		char,		DB_TEXT,   RBH_PATH_MAX, GENERATED, fullpath, NULL

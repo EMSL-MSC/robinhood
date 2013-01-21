@@ -4,9 +4,9 @@
 
 AC_PREREQ(2.59)
 
-AC_INIT([robinhood], [2.3.4], [robinhood-support@lists.sourceforge.net])
-RELEASE="1"
-AC_DEFINE_UNQUOTED(RELEASE, "$RELEASE", [release info])
+AC_INIT( [robinhood], [2.4.0], [robinhood-support@lists.sourceforge.net])
+RELEASE="4"
+AC_DEFINE_UNQUOTED(RELEASE, "$RELEASE", [release info] )
 AC_SUBST(RELEASE)
 
 AC_CONFIG_AUX_DIR([autotools])
@@ -15,7 +15,7 @@ AC_CONFIG_HEADER([src/include/config.h])
 AC_CONFIG_SRCDIR([src/list_mgr/listmgr_init.c])
 
 AM_INIT_AUTOMAKE([-Wall -Werror tar-pax foreign])
-m4_ifdef([AM_SILENT_RULES], [AM_SILENT_RULES])
+m4_ifdef([AM_SILENT_RULES], [AM_SILENT_RULES([yes])])
 
 AC_PREFIX_DEFAULT([/usr])
 
@@ -34,6 +34,11 @@ AC_PROG_LIBTOOL
 # define everything necessary for accessing large files (64bits offset)
 AC_SYS_LARGEFILE
 
+# gcc options
+#CC_OPT="-Wall -Werror"
+CC_OPT="-Wall"
+AC_SUBST(CC_OPT)
+
 AC_CHECK_SIZEOF([nlink_t])
 AC_CHECK_SIZEOF([off_t])
 AC_CHECK_SIZEOF([ino_t])
@@ -41,6 +46,8 @@ AC_CHECK_SIZEOF([dev_t])
 AC_CHECK_SIZEOF([time_t])
 AC_CHECK_SIZEOF([size_t])
 AC_CHECK_SIZEOF([pthread_t])
+
+AX_ENABLE_FLAG([strict], [Compile with -Wall -Werror], [-Wall -Werror])
 
 # Flag for Lustre 1.4 with join() support
 AX_ENABLE_FLAG([lustre14_bull], [Bull distribution of Lustre 1.4], [-DHAVE_LUSTRE_JOIN_TYPE])
@@ -56,9 +63,6 @@ AX_ENABLE_FLAG([debug-hash], [enables debug traces internal hash tables], [-D_DE
 
 # behavior flags
 AX_ENABLE_FLAG( [fid2path-leading-slash], [must be enabled if fid2path() returns a leading slash], [-D_FID2PATH_LEADING_SLASH] )
-AX_ENABLE_FLAG( [cl-rename-overwrite], [changelog correctly reflects overwriting rename (lu543)], [-D_CL_RNM_OVER] )
-AX_ENABLE_FLAG( [lu543], [same as cl-rename-overwrite], [-D_CL_RNM_OVER] )
-
 
 
 # program to be used for mailing
@@ -81,6 +85,17 @@ if test "x$support_lustre" = "xyes" ; then
 
         # this defines LVERSION and LPACKAGE variables
         AX_LUSTRE_VERSION
+
+        if test "$LVERSION" = "2.2" ; then
+            # lu543 is fixed in Lustre 2.2
+            # then is replaced in Lustre 2.3
+            AC_MSG_NOTICE([lu543 is fixed in Lustre 2.2])
+            CFLAGS="$CFLAGS -D_CL_RNM_OVER"
+        else
+            # for previous version, or customized, use --enable-lu543 to activate it
+            AX_ENABLE_FLAG( [cl-rename-overwrite], [changelog correctly reflects overwriting rename (lu543)], [-D_CL_RNM_OVER] )
+            AX_ENABLE_FLAG( [lu543], [same as cl-rename-overwrite], [-D_CL_RNM_OVER] )
+        fi
 
         if test -z "$LVERSION"; then
             LDEFINES=""
@@ -170,11 +185,11 @@ AC_CHECK_LIB([pthread], [pthread_getsequence_np], [have_pthread_getsequence_np="
 
 # Purpose ?
 
-AC_ARG_WITH( [purpose], AS_HELP_STRING([--with-purpose=TMP_FS_MGR|LUSTRE_HSM|HSM_LITE|BACKUP|SHOOK|SHERPA],[specify the purpose of the daemon] ),
+AC_ARG_WITH( [purpose], AS_HELP_STRING([--with-purpose=TMPFS|LUSTRE_HSM|HSM_LITE|BACKUP|SHOOK|SHERPA],[specify the purpose of the daemon] ),
              PURPOSE="$withval", PURPOSE="TMP_FS_MGR")
 
 AM_CONDITIONAL(LUSTRE_HSM,     test "$PURPOSE" = "LUSTRE_HSM")
-AM_CONDITIONAL(TMP_FS_MGR,     test "$PURPOSE" = "TMP_FS_MGR")
+AM_CONDITIONAL(TMP_FS_MGR,     test "$PURPOSE" = "TMP_FS_MGR" -o "$PURPOSE" = "TMPFS" )
 AM_CONDITIONAL(HSM_LITE, test "$PURPOSE" = "HSM_LITE" -o  "$PURPOSE" = "SHOOK" -o  "$PURPOSE" = "BACKUP" )
 AM_CONDITIONAL(SHERPA, test "$PURPOSE" = "SHERPA")
 
@@ -197,7 +212,7 @@ case $PURPOSE in
         AC_DEFINE([HAVE_RM_POLICY], [1], [HSM removal policy for Lustre-HSM purpose])
         AC_DEFINE([HAVE_PURGE_POLICY], [1], [Purge policy for Lustre-HSM purpose])
         ;;
-    TMP_FS_MGR)
+    TMP_FS_MGR | TMPFS)
         PURPOSE_CFLAGS="-D_TMP_FS_MGR"
         PURPOSE_BIN="robinhood"
         PURPOSE_EXT="tmpfs"

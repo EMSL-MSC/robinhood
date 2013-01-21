@@ -86,7 +86,7 @@ int db_connect( db_conn_t * conn )
         return DB_CONNECT_FAILED;
     }
 
-    DisplayLog( LVL_FULL, LISTMGR_TAG, "Logged on to database sucessfully" );
+    DisplayLog( LVL_FULL, LISTMGR_TAG, "Logged on to database successfully" );
 
     set_cache_size( *conn );
 
@@ -293,5 +293,5 @@ unsigned long long db_last_id( db_conn_t * conn )
 void db_escape_string( db_conn_t * conn, char * str_out, size_t out_size, const char * str_in )
 {
     /* using slqite3_snprintf with "%q" format, to escape strings */
-    sqlite3_snprintf( str_out, out_size, str_in );
+    sqlite3_snprintf( out_size, str_out, str_in );
 }

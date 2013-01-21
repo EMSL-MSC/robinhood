@@ -135,12 +135,13 @@ static int heuristic_end_of_list( time_t last_access_time )
 
     /* XXX Tip for optimization:
      * we build a void entry with last_access = last_access_time
-     * and last_restore_time = last_access_time.
+     * and last_restore_time = last_access_time = creation_time.
      * If it doesn't match any policy, next entries won't match too
      * because entries are sorted by last access time,
      * so it is not necessary to continue.
-     * (Note that we have last_restore_time < last_access_time
-     * (because entries are not purged)).
+     * Note we have last_restore_time < last_access_time
+     * (because entries are not purged), and of course
+     * creation_time < last_access_time.
      */
     memset( &void_id, 0, sizeof( entry_id_t ) );
     memset( &void_attr, 0, sizeof( attr_set_t ) );
@@ -148,9 +149,13 @@ static int heuristic_end_of_list( time_t last_access_time )
     ATTR_MASK_INIT( &void_attr );
     ATTR_MASK_SET( &void_attr, last_access );
     ATTR( &void_attr, last_access ) = last_access_time;
-#ifdef ATTR_INDEX_restore
+#ifdef ATTR_INDEX_last_restore
     ATTR_MASK_SET( &void_attr, last_restore );
     ATTR( &void_attr, last_restore ) = last_access_time;
+#endif
+#ifdef ATTR_INDEX_creation_time
+    ATTR_MASK_SET( &void_attr, creation_time );
+    ATTR( &void_attr, creation_time ) = last_access_time;
 #endif
 
     if ( PolicyMatchAllConditions( &void_id, &void_attr, PURGE_POLICY, NULL ) == POLICY_NO_MATCH )
@@ -600,6 +605,7 @@ int perform_purge( lmgr_t * lmgr, purge_param_t * p_purge_param,
     /* start with a limited count of entries, to save memory */
     opt.list_count_max = resmon_config.db_request_limit;
     opt.force_no_acct = FALSE;
+    opt.allow_no_attr = FALSE;
     nb_returned = 0;
     total_returned = 0;
 
@@ -836,6 +842,10 @@ inline static int update_entry( lmgr_t * lmgr, entry_id_t * p_entry_id, attr_set
 
     /* also unset read only attrs */
     tmp_attrset.attr_mask &= ~readonly_attr_set;
+#ifdef ATTR_INDEX_creation_time
+    /* never update creation time */
+    ATTR_MASK_UNSET( &tmp_attrset, creation_time );
+#endif
 
     /* update DB and skip the entry */
     rc = ListMgr_Update( lmgr, p_entry_id, &tmp_attrset );
@@ -1020,18 +1030,19 @@ else
         return PURGE_ENTRY_MOVED;
     }
 
-    /* 3) check entry id */
+    /* 3) check entry id and fskey */
+
     if ( ( entry_md.st_ino != p_item->entry_id.inode )
-         || ( entry_md.st_dev != p_item->entry_id.device ) )
+         || ( get_fskey() != p_item->entry_id.fs_key ) )
     {
         /* If it has changed, invalidate the entry (fullpath does not match entry_id, it will be updated or removed at next FS scan). */
         DisplayLog( LVL_DEBUG, PURGE_TAG, "Inode of %s changed: old=<%llu,%llu>, "
                     "new=<%llu,%llu>. Tagging it invalid.",
                     ATTR(  &p_item->entry_attr, fullpath ),
                     ( unsigned long long ) p_item->entry_id.inode,
-                    ( unsigned long long ) p_item->entry_id.device,
+                    ( unsigned long long ) p_item->entry_id.fs_key,
                     ( unsigned long long ) entry_md.st_ino,
-                    ( unsigned long long ) entry_md.st_dev );
+                    ( unsigned long long ) get_fskey() );
 
         invalidate_entry( lmgr, &p_item->entry_id );
 

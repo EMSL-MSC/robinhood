@@ -122,7 +122,21 @@ void free_extra_info( void * ptr )
     op_extra_info_t * p_info = (op_extra_info_t*)ptr;
 
     if ( p_info->is_changelog_record && p_info->log_record.p_log_rec )
+    {
         llapi_changelog_free( &p_info->log_record.p_log_rec );
+    }
+}
+
+void free_extra_info2( void * ptr )
+{
+    op_extra_info_t * p_info = (op_extra_info_t*)ptr;
+
+    if ( p_info->is_changelog_record && p_info->log_record.p_log_rec )
+    {
+        /* if this is a locally allocated record, just "free" it */
+        free(p_info->log_record.p_log_rec);
+        p_info->log_record.p_log_rec = NULL;
+    }
 }
 
 
@@ -133,9 +147,9 @@ void free_extra_info( void * ptr )
 int log_record_callback( lmgr_t *lmgr, struct entry_proc_op_t * pop, void * param )
 {
     int rc;
-    const char * mount_point = get_mount_point();
+    const char * mount_point = get_mount_point(NULL);
     reader_thr_info_t * p_info = (reader_thr_info_t *) param;
-    struct changelog_rec * logrec = pop->extra_info.log_record.p_log_rec;
+    CL_REC_TYPE * logrec = pop->extra_info.log_record.p_log_rec;
 
     /** Check that a log record is set for this entry
      * (should always be the case).
@@ -207,7 +221,8 @@ static const char * event_name[] = {
 /**
  * This handles a single log record.
  */
-static int process_log_rec( reader_thr_info_t * p_info, struct changelog_rec * p_rec )
+#define PLR_FLG_FREE2 0x0001 /* use gmalloc free */
+static int process_log_rec( reader_thr_info_t * p_info, CL_REC_TYPE * p_rec, int flags )
 {
     entry_proc_op_t op;
     int            st;
@@ -317,10 +332,9 @@ static int process_log_rec( reader_thr_info_t * p_info, struct changelog_rec * p
         case CL_SOFTLINK:
         case CL_MKDIR:
         case CL_RMDIR:
-#ifndef _LUSTRE_HSM
             /* handle those events for non-HSM purposes */
             break;
-#endif
+
         case CL_MARK:
         case CL_HARDLINK:
         case CL_MKNOD:
@@ -353,7 +367,10 @@ static int process_log_rec( reader_thr_info_t * p_info, struct changelog_rec * p
     op.extra_info.log_record.mdt =
         chglog_reader_config.mdt_def[p_info->thr_index].mdt_name;
 
-    op.extra_info_free_func = free_extra_info;
+    if (flags & PLR_FLG_FREE2)
+        op.extra_info_free_func = free_extra_info2;
+    else
+        op.extra_info_free_func = free_extra_info;
 
     /* set callback function + args */
     op.callback_func = log_record_callback;
@@ -375,14 +392,17 @@ static int process_log_rec( reader_thr_info_t * p_info, struct changelog_rec * p
     {
             DisplayLog( LVL_CRIT, CHGLOG_TAG,
                         "CRITICAL ERROR: EntryProcessor_Push returned %d", st );
-            free_extra_info(&op.extra_info);
+            if (flags & PLR_FLG_FREE2)
+                free_extra_info2(&op.extra_info);
+            else
+                free_extra_info(&op.extra_info);
             return st;
     }
 
     return 0; 
 }
 
-static inline void cl_update_stats(reader_thr_info_t * info, struct changelog_rec * p_rec)
+static inline void cl_update_stats(reader_thr_info_t * info, CL_REC_TYPE * p_rec)
 {
         /* update thread info */
         info->last_read_time = time(NULL);
@@ -394,7 +414,7 @@ static inline void cl_update_stats(reader_thr_info_t * info, struct changelog_re
 /* get a changelog line (with retries) */
 typedef enum {cl_ok, cl_continue, cl_stop} cl_status_e;
 
-static cl_status_e cl_get_one(reader_thr_info_t * info,  struct changelog_rec ** pp_rec)
+static cl_status_e cl_get_one(reader_thr_info_t * info,  CL_REC_TYPE ** pp_rec)
 {
     int rc;
     /* get next record */
@@ -427,7 +447,7 @@ static cl_status_e cl_get_one(reader_thr_info_t * info,  struct changelog_rec **
             {
                 DisplayLog( LVL_EVENT, CHGLOG_TAG,
                     "WARNING: EOF reached on ChangeLog whereas FOLLOW flag "
-                    "was specified. Re-openning in 1 sec..." );
+                    "was specified. Re-opening in 1 sec..." );
                     rh_sleep( 1 );
                     flags = CHANGELOG_FLAG_BLOCK | CHANGELOG_FLAG_FOLLOW;
             }
@@ -467,7 +487,7 @@ static cl_status_e cl_get_one(reader_thr_info_t * info,  struct changelog_rec **
         return cl_continue;
     }
 
-    /* sucessfully retrieved a record */
+    /* successfully retrieved a record */
 
     /* update thread info */
     cl_update_stats(info, *pp_rec);
@@ -480,7 +500,7 @@ static cl_status_e cl_get_one(reader_thr_info_t * info,  struct changelog_rec **
 void * chglog_reader_thr( void *  arg )
 {
     reader_thr_info_t * info = (reader_thr_info_t*) arg;
-    struct changelog_rec * p_rec = NULL;
+    CL_REC_TYPE * p_rec = NULL;
     cl_status_e st;
 
     do
@@ -491,7 +511,48 @@ void * chglog_reader_thr( void *  arg )
         else if (st == cl_stop)
             break;
 
-#ifdef _CL_RNM_OVER
+#ifdef HAVE_CHANGELOG_EXTEND_REC
+        /* extended record: 1 single RENME record per rename op */
+        if ((p_rec->cr_type == CL_RENAME) && CHANGELOG_REC_EXTENDED(p_rec))
+        {
+            if (!FID_IS_ZERO(&p_rec->cr_tfid))
+            {
+                /* rename overwriting target entry */
+                struct changelog_ext_rec * p_rec2 = (CL_REC_TYPE*)malloc(CR_MAXSIZE);
+
+                p_rec2->cr_namelen = p_rec->cr_namelen;
+                p_rec2->cr_flags = p_rec->cr_flags; /* may contain CLF_UNLINK_LAST */
+                p_rec2->cr_type = CL_UNLINK;
+                p_rec2->cr_index = p_rec->cr_index - 1; /* we don't want to acknowledge
+                    this record as long as the 2 records are not processed.
+                    acknowledge n-1 instead */
+                p_rec2->cr_prev = p_rec->cr_prev;
+                p_rec2->cr_time = p_rec->cr_time;
+                p_rec2->cr_tfid = p_rec->cr_tfid; /* the same */
+                p_rec2->cr_pfid = p_rec->cr_pfid; /* the same */
+                strcpy(p_rec2->cr_name, p_rec->cr_name);
+
+                DisplayLog( LVL_DEBUG, CHGLOG_TAG,
+                           "Unlink: object="DFID", name=%.*s",
+                            PFID(&p_rec->cr_tfid), p_rec->cr_namelen,
+                            p_rec->cr_name );
+
+                process_log_rec( info, p_rec2, PLR_FLG_FREE2 );
+            }
+
+            DisplayLog( LVL_DEBUG, CHGLOG_TAG,
+                        "Rename: object="DFID", old_name=%s, new_name=%.*s",
+                        PFID(&p_rec->cr_sfid), changelog_rec_sname(p_rec),
+                        p_rec->cr_namelen, p_rec->cr_name );
+            /* change rename to RNMTO, to remain compatible with previous versions */
+            p_rec->cr_type = CL_EXT;
+            p_rec->cr_tfid = p_rec->cr_sfid;
+            process_log_rec( info, p_rec, 0);
+        }
+        else /* other record or old-style RNMFM/RNMTO */
+        {
+#endif
+#if defined(_CL_RNM_OVER) || defined(HAVE_CHANGELOG_EXTEND_REC)
         /* First rename record indicates the renamed entry.
          * Second rename record eventually indicates the overwritten entry, 
          * and the target name.
@@ -504,7 +565,7 @@ void * chglog_reader_thr( void *  arg )
         if (p_rec->cr_type == CL_RENAME)
         {
             /* read next record */
-            struct changelog_rec * p_rec2 = NULL;
+            CL_REC_TYPE * p_rec2 = NULL;
 
             st = cl_get_one(info, &p_rec2); 
             if (st == cl_continue)
@@ -517,8 +578,8 @@ void * chglog_reader_thr( void *  arg )
                 DisplayLog( LVL_MAJOR, CHGLOG_TAG,
                            "CL_RENAME record not immediatly followed by CL_EXT" );
                 /* process record(s) as usual... */
-                process_log_rec( info, p_rec );
-                process_log_rec( info, p_rec2 );
+                process_log_rec( info, p_rec, 0 );
+                process_log_rec( info, p_rec2, 0 );
             }
             else if (FID_IS_ZERO(&p_rec2->cr_tfid))
             {
@@ -531,7 +592,7 @@ void * chglog_reader_thr( void *  arg )
                            "Standard rename: object="DFID", name=%.*s",
                             PFID(&p_rec2->cr_tfid), p_rec2->cr_namelen,
                             p_rec2->cr_name );
-                process_log_rec(info, p_rec2);
+                process_log_rec(info, p_rec2, 0);
                 /* 1st p_rec can be freed */
                 llapi_changelog_free( &p_rec );
             }
@@ -565,8 +626,8 @@ void * chglog_reader_thr( void *  arg )
                             PFID(&p_rec2->cr_tfid), p_rec2->cr_namelen,
                             p_rec2->cr_name );
                 /* process unlink before rename, to make sure there is no name conflict */
-                process_log_rec( info, p_rec );
-                process_log_rec( info, p_rec2 );
+                process_log_rec( info, p_rec, 0 );
+                process_log_rec( info, p_rec2, 0 );
             }
         }
         else
@@ -574,8 +635,11 @@ void * chglog_reader_thr( void *  arg )
             /* single record */
 #endif
             /* handle the line and push it to the pipeline */
-            process_log_rec( info, p_rec );
-#ifdef _CL_RNM_OVER
+            process_log_rec( info, p_rec, 0 );
+#if defined(_CL_RNM_OVER) || defined(HAVE_CHANGELOG_EXTEND_REC)
+        }
+#endif
+#if defined(HAVE_CHANGELOG_EXTEND_REC)
         }
 #endif
 
@@ -619,15 +683,6 @@ int            ChgLogRdr_Start( chglog_reader_config_t * p_config, int flags )
 #ifdef _LLAPI_FORKS
     struct sigaction act_sigchld ;
 #endif
-
-    /* check that the FS is mounted and has the good type */
-    if ( CheckFSInfo( global_config.fs_path, "lustre", NULL,
-                      global_config.check_mounted, TRUE ) )
-    {
-        DisplayLog(LVL_CRIT, CHGLOG_TAG, "ERROR checking filesystem %s",
-            global_config.fs_path );
-        return EINVAL;
-    }
 
     /* check parameters */
 #ifdef _DEBUG_CHGLOG
@@ -707,7 +762,7 @@ int            ChgLogRdr_Start( chglog_reader_config_t * p_config, int flags )
          * don't use the CHANGELOG_FLAG_FOLLOW flag)
          */
         rc = llapi_changelog_start( &reader_info[i].chglog_hdlr,
-                                    (one_shot || p_config->force_polling?0:CHANGELOG_FLAG_FOLLOW)
+                                    ((one_shot || p_config->force_polling)?0:CHANGELOG_FLAG_FOLLOW)
                                     | CHANGELOG_FLAG_BLOCK,
                                     mdtdevice, last_rec );
 
