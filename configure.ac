@@ -4,8 +4,8 @@
 
 AC_PREREQ(2.59)
 
-AC_INIT( [robinhood], [2.4.0], [robinhood-support@lists.sourceforge.net])
-RELEASE="4"
+AC_INIT( [robinhood], [2.5.0], [robinhood-support@lists.sourceforge.net])
+RELEASE="0.beta1"
 AC_DEFINE_UNQUOTED(RELEASE, "$RELEASE", [release info] )
 AC_SUBST(RELEASE)
 
@@ -24,19 +24,25 @@ AC_GNU_SOURCE
 # disable shared libraries generation
 AC_ENABLE_SHARED(no)
 
-# Checks for programs.
+# required for automake 1.12 (since fedora 18)
+m4_ifdef([AM_PROG_AR], [AM_PROG_AR])
+
+AC_PROG_LIBTOOL
 AC_PROG_CC
+
+# required for automake 1.12 (since fedora 18)
+m4_ifdef([AM_PROG_CC_C_O], [AM_PROG_CC_C_O])
+
 AC_C_INLINE
 AM_PROG_LEX
 AC_PROG_YACC
-AC_PROG_LIBTOOL
 
 # define everything necessary for accessing large files (64bits offset)
 AC_SYS_LARGEFILE
 
 # gcc options
 #CC_OPT="-Wall -Werror"
-CC_OPT="-Wall"
+CC_OPT="-Wall -Wstrict-prototypes -Wmissing-prototypes -Wmissing-declarations"
 AC_SUBST(CC_OPT)
 
 AC_CHECK_SIZEOF([nlink_t])
@@ -49,9 +55,6 @@ AC_CHECK_SIZEOF([pthread_t])
 
 AX_ENABLE_FLAG([strict], [Compile with -Wall -Werror], [-Wall -Werror])
 
-# Flag for Lustre 1.4 with join() support
-AX_ENABLE_FLAG([lustre14_bull], [Bull distribution of Lustre 1.4], [-DHAVE_LUSTRE_JOIN_TYPE])
-
 # debug flags
 AX_ENABLE_FLAG([debug-db], [enables debug traces for database operations], [-D_DEBUG_DB])
 AX_ENABLE_FLAG([debug-parsing], [enables debug traces for configuration file parsing], [-D_DEBUG_PARSING])
@@ -61,9 +64,14 @@ AX_ENABLE_FLAG([debug-pipeline], [enables debug traces for entry processor pipel
 AX_ENABLE_FLAG([debug-policies], [enables debug traces for entry processor pipeline], [-D_DEBUG_POLICIES])
 AX_ENABLE_FLAG([debug-hash], [enables debug traces internal hash tables], [-D_DEBUG_HASH])
 
-# behavior flags
-AX_ENABLE_FLAG( [fid2path-leading-slash], [must be enabled if fid2path() returns a leading slash], [-D_FID2PATH_LEADING_SLASH] )
+AX_ENABLE_FLAG([bench-scan], [build version for scan benchmarking], [-D_BENCH_SCAN])
+AX_ENABLE_FLAG([bench-db], [build version for DB benchmarking], [-D_BENCH_DB])
+AX_ENABLE_FLAG([gprof], [Add gprof info to the binaries], [-g -pg])
 
+# behavior flags
+AX_DISABLE_FLAG([atfunc], [Don't use 'at' functions for scanning], [-D_NO_AT_FUNC])
+
+AX_ENABLE_FLAG( [fid2path-leading-slash], [must be enabled if fid2path() returns a leading slash], [-D_FID2PATH_LEADING_SLASH] )
 
 # program to be used for mailing
 AX_PROG_MAIL
@@ -73,6 +81,14 @@ AC_ARG_ENABLE( [lustre], AS_HELP_STRING([--disable-lustre],
                [support_lustre="$enableval"],[support_lustre="yes"] )
 
 if test "x$support_lustre" = "xyes" ; then
+    # Lustre location
+    AC_ARG_WITH( [lustre], AS_HELP_STRING([--with-lustre=<lustre_src_dir>],[indicate alternative location for lustre]),
+                 LDIR="$withval")
+
+    if test -n "$LDIR"; then
+        CFLAGS="$CFLAGS -I$LDIR/lustre/include"
+        LDFLAGS="$LDFLAGS -L$LDIR/lustre/utils"
+    fi
 
     AC_CHECK_LIB([lustreapi], [llapi_obd_statfs], [have_liblustre_api="yes"])
     AM_CONDITIONAL( LUSTRE, test  "x$have_liblustre_api" = "xyes" )
@@ -83,25 +99,28 @@ if test "x$support_lustre" = "xyes" ; then
 
         AC_DEFINE(_LUSTRE, 1, [liblustreapi is available])
 
-        # this defines LVERSION and LPACKAGE variables
-        AX_LUSTRE_VERSION
-
-        if test "$LVERSION" = "2.2" ; then
-            # lu543 is fixed in Lustre 2.2
-            # then is replaced in Lustre 2.3
-            AC_MSG_NOTICE([lu543 is fixed in Lustre 2.2])
-            CFLAGS="$CFLAGS -D_CL_RNM_OVER"
-        else
-            # for previous version, or customized, use --enable-lu543 to activate it
-            AX_ENABLE_FLAG( [cl-rename-overwrite], [changelog correctly reflects overwriting rename (lu543)], [-D_CL_RNM_OVER] )
-            AX_ENABLE_FLAG( [lu543], [same as cl-rename-overwrite], [-D_CL_RNM_OVER] )
+        AC_CHECK_HEADER([lustre/lustreapi.h], have_new_lustre_header="true", have_new_lustre_header="false")
+        if test "$have_new_lustre_header" = "true"; then
+            AC_DEFINE(_LUSTRE_API_HEADER, 1, [New lustreapi header])
+            # this comes with Lustre 2.4, so disable features of Lustre < 2.4 at the same time
+            AC_DEFINE(_MDT_SPECIFIC_LOVEA, 1, [MDT LOV EA is no longer the same as lov_user_md])
         fi
 
-        if test -z "$LVERSION"; then
-            LDEFINES=""
+        # this defines LVERSION and LPACKAGE variables
+        if test -z "$LDIR" ; then
+            AX_LUSTRE_VERSION
         else
-            LDEFINES="--define=\"lversion $LVERSION\" --define=\"lpackage $LPACKAGE\""
+            # get version from sources
+            AX_LUSTRE_SRC_VERSION("$LDIR")
+        fi
+
+        LDEFINES=""
+        if test -n "$LVERSION"; then
+            LDEFINES="--define=\"lversion $LVERSION\""
             AC_DEFINE_UNQUOTED(LUSTRE_VERSION, "$LVERSION",  [Lustre version])
+        fi
+        if test -n "$LPACKAGE"; then
+            LDEFINES="$LDEFINES --define=\"lpackage $LPACKAGE\""
         fi
         AC_SUBST(LDEFINES)
 
@@ -131,6 +150,14 @@ if test "x$support_lustre" = "xyes" ; then
             test "x$have_fid" = "xyes" && AC_DEFINE(_HAVE_FID, 1, [lustre supports fids])
         fi
 
+        # check if fd2fid function exists
+        AC_CHECK_LIB([lustreapi], [llapi_fd2fid], [have_fd2fid="yes"])
+        test "x$have_fd2fid" = "xyes" && AC_DEFINE(HAVE_FD2FID, 1, [llapi_fd2fid function is available])
+
+        # check for DNE support
+        AC_CHECK_LIB([lustreapi], [llapi_file_fget_mdtidx], [have_dne_support="yes"])
+        test "x$have_dne_support" = "xyes" && AC_DEFINE(HAVE_DNE, 1, [this version of Lustre supports DNE]) # FIXME wrong test (works with 2.1!)
+
         AC_ARG_ENABLE( [changelogs], AS_HELP_STRING([--disable-changelogs],[Don't use ChangeLogs]),
                    use_changelogs=$enableval, use_changelogs='yes' )
 
@@ -141,12 +168,19 @@ if test "x$support_lustre" = "xyes" ; then
 	    	AC_CHECK_LIB([lustreapi],[llapi_changelog_start],[have_llapi_changelog_start="yes"])
 		    if test "x$have_llapi_changelog_start" = "xyes"; then 
 		        AC_DEFINE(HAVE_CHANGELOGS, 1, [Lustre changelogs records are structures])
-                AC_CHECK_DECL([CL_MTIME],AC_DEFINE(CL_SPLITTED_TIME,1,[Changelog time events are splitted]),[],[
+                AC_CHECK_DECL([CL_IOCTL],AC_DEFINE(_HAVE_CL_IOCTL,1,[CL_IOCTL is defined]),[],[
                     #define LPX64 "%#llx"
                     #include <sys/types.h>
                     #include <asm/types.h>
                     #include <lustre/lustre_user.h>
                 ])
+                AC_CHECK_DECL([CL_LAYOUT],AC_DEFINE(HAVE_CL_LAYOUT,1,[Layout change emit changelog records]),[],[
+                    #define LPX64 "%#llx"
+                    #include <sys/types.h>
+                    #include <asm/types.h>
+                    #include <lustre/lustre_user.h>
+                ])
+
             fi
 
             if test "x$have_llapi_changelog_start" = "xyes" && \
@@ -167,13 +201,31 @@ if test "x$support_lustre" = "xyes" ; then
             AC_DEFINE(HAVE_LLAPI_GETPOOL_INFO, 1, [llapi_getpool functions are available])
 
 
+        AC_CHECK_MEMBER([struct lov_user_ost_data_v1.l_object_seq], [have_obj_seq="yes"],  [have_obj_seq="no"], [
+                    #define LPX64 "%#llx"
+                    #include <sys/types.h>
+                    #include <asm/types.h>
+                    #include <lustre/lustre_user.h>
+        ])
+        test "x$have_obj_seq" = "xyes" && AC_DEFINE(HAVE_OBJ_SEQ, 1, [lov_user_ost_data_v1 has l_object_seq field])
+
+        AC_CHECK_MEMBER([struct lov_user_ost_data_v1.l_object_id], [have_obj_id="yes"],  [have_obj_id="no"], [
+                    #define LPX64 "%#llx"
+                    #include <sys/types.h>
+                    #include <asm/types.h>
+                    #include <lustre/lustre_user.h>
+        ])
+        test "x$have_obj_id" = "xyes" && AC_DEFINE(HAVE_OBJ_ID, 1, [lov_user_ost_data_v1 has l_object_id field])
+
+
     fi
 
     AM_CONDITIONAL(CHANGELOGS,  test  "x$have_llapi_changelog_start" = "xyes" )
-
+    AM_CONDITIONAL(USER_LOVEA, [test  "x$have_new_lustre_header" != "xtrue" && test "x$have_llapi_changelog_start" = "xyes"])
 else
     AM_CONDITIONAL(LUSTRE, test 0 = 1 )
     AM_CONDITIONAL(CHANGELOGS, test 0 = 1 ) 
+    AM_CONDITIONAL( USER_LOVEA, test  0 = 1 )
 
 fi # end of Lustre support
 
@@ -185,13 +237,12 @@ AC_CHECK_LIB([pthread], [pthread_getsequence_np], [have_pthread_getsequence_np="
 
 # Purpose ?
 
-AC_ARG_WITH( [purpose], AS_HELP_STRING([--with-purpose=TMPFS|LUSTRE_HSM|HSM_LITE|BACKUP|SHOOK|SHERPA],[specify the purpose of the daemon] ),
+AC_ARG_WITH( [purpose], AS_HELP_STRING([--with-purpose=TMPFS|LUSTRE_HSM|HSM_LITE|BACKUP|SHOOK],[specify the purpose of the daemon] ),
              PURPOSE="$withval", PURPOSE="TMP_FS_MGR")
 
 AM_CONDITIONAL(LUSTRE_HSM,     test "$PURPOSE" = "LUSTRE_HSM")
 AM_CONDITIONAL(TMP_FS_MGR,     test "$PURPOSE" = "TMP_FS_MGR" -o "$PURPOSE" = "TMPFS" )
 AM_CONDITIONAL(HSM_LITE, test "$PURPOSE" = "HSM_LITE" -o  "$PURPOSE" = "SHOOK" -o  "$PURPOSE" = "BACKUP" )
-AM_CONDITIONAL(SHERPA, test "$PURPOSE" = "SHERPA")
 
 # purpose dependent flags
 case $PURPOSE in
@@ -205,9 +256,9 @@ case $PURPOSE in
         fi
 
         PURPOSE_CFLAGS="-D_LUSTRE_HSM"
-        PURPOSE_BIN="rbh-hsm"
-        PURPOSE_EXT="hsm"
-        PURPOSE_SVC="robinhood-hsm"
+        PURPOSE_BIN="rbh-lhsm"
+        PURPOSE_EXT="lhsm"
+        PURPOSE_SVC="robinhood-lhsm"
         AC_DEFINE([HAVE_MIGR_POLICY], [1], [Migration policy for Lustre-HSM purpose])
         AC_DEFINE([HAVE_RM_POLICY], [1], [HSM removal policy for Lustre-HSM purpose])
         AC_DEFINE([HAVE_PURGE_POLICY], [1], [Purge policy for Lustre-HSM purpose])
@@ -220,18 +271,7 @@ case $PURPOSE in
         AC_DEFINE([HAVE_RMDIR_POLICY], [1], [Dir removal policy for TMP_FS_MGR purpose])
         AC_DEFINE([HAVE_PURGE_POLICY], [1], [Purge policy for TMP_FS_MGR purpose])
         ;;
-    SHERPA)
-        PURPOSE_CFLAGS="-D_SHERPA"
-        PURPOSE_LDFLAGS="-lSherpaCacheP -lsherpa_cfg_parsing -lSherpaCache"
-        PURPOSE_BIN="rbh-sherpa"
-        PURPOSE_EXT="sherpa"
-        PURPOSE_SVC="robinhood-sherpa"
-
-        AC_DEFINE([HAVE_MIGR_POLICY], [1], [Migration policy for SHERPA purpose])
-        AC_DEFINE([HAVE_RMDIR_POLICY], [1], [Dir removal policy for SHERPA purpose])
-        AC_DEFINE([HAVE_PURGE_POLICY], [1], [Purge policy for SHERPA purpose])
-        ;;
-
+    
     BACKUP | HSM_LITE | SHOOK)
         # check pre-requisites
         if test "x$have_liblustre_api" != "xyes" ; then
@@ -285,8 +325,8 @@ case $PURPOSE in
         ;;
 esac
 
-AM_CONDITIONAL( SHOOK, test  "$PURPOSE_EXT" = "shook" )
-AM_CONDITIONAL( BACKUP, test  "$PURPOSE_EXT" = "backup" )
+AM_CONDITIONAL(SHOOK, test  "$PURPOSE_EXT" = "shook")
+AM_CONDITIONAL(BACKUP, test  "$PURPOSE_EXT" = "backup")
 
 AC_SUBST(PURPOSE_CFLAGS)
 AC_SUBST(PURPOSE_LDFLAGS)
@@ -360,6 +400,16 @@ AC_CHECK_FUNC([getmntent_r],[getmntent_r=yes],[getmntent_r=no])
 test "$getmntent_r" = "yes" && AC_DEFINE(HAVE_GETMNTENT_R, 1, [Reentrant version of getmntent exists])
 AM_CONDITIONAL(MNTENTCOMPAT, test "$getmntent_r" = "no" )
 
+AS_AC_EXPAND(CONFDIR, $sysconfdir)
+if test $prefix = NONE && test "$CONFDIR" = "/usr/etc"  ; then
+    CONFDIR="/etc"
+fi
+AC_MSG_NOTICE([Using config dir $CONFDIR])
+AC_DEFINE_UNQUOTED([SYSCONFDIR],"$CONFDIR", [Configuration directory])
+AC_SUBST(CONFDIR)
+
+AS_AC_EXPAND(SBINDIR, $sbindir)
+AC_SUBST(SBINDIR)
 
 # for exporting to spec file
 AC_SUBST(ac_configure_args)
@@ -382,6 +432,7 @@ AC_CONFIG_FILES([Makefile
          src/policy_modules/rmdir/Makefile
          src/backend_ext/Makefile
          src/robinhood/Makefile
+         src/tools/Makefile
          src/tests/Makefile
          scripts/Makefile
          scripts/robinhood.init

@@ -44,9 +44,14 @@ static struct option option_tab[] =
     /* recovery options */
     {"start", no_argument, NULL, 'S'},
     {"resume", no_argument, NULL, 'r'},
+    {"run", no_argument, NULL, 'r'},
     {"complete", no_argument, NULL, 'c'},
     {"status", no_argument, NULL, 's'},
     {"reset", no_argument, NULL, 'Z'},
+    {"list", required_argument, NULL, 'L'},
+
+    {"ost", required_argument, NULL, 'o'},
+    {"since", required_argument, NULL, 'b'},
 
     {"dir", required_argument, NULL, 'D'},
     {"retry", no_argument, NULL, 'e'},
@@ -57,7 +62,7 @@ static struct option option_tab[] =
 
     /* log options */
     {"log-level", required_argument, NULL, 'l'},
-    {"output-dir", required_argument, NULL, 'o'},
+//    {"output-dir", required_argument, NULL, 'o'},
 
     /* miscellaneous options */
     {"help", no_argument, NULL, 'h'},
@@ -67,14 +72,18 @@ static struct option option_tab[] =
 
 };
 
-#define SHORT_OPT_STRING    "SrcZsD:eyf:l:o:hV"
+#define SHORT_OPT_STRING    "SrcZsD:eyf:l:o:b:hVL:"
 
 /* global variables */
 
 static lmgr_t  lmgr;
 static int terminate = FALSE; /* abort signal received */
+
 static char * path_filter = NULL;
 static char path_buff[RBH_PATH_MAX];
+static value_list_t ost_list = {0, NULL};
+static char ost_range_str[256] = "";
+static time_t since_time = 0;
 
 /* special character sequences for displaying help */
 
@@ -93,32 +102,44 @@ static const char *help_string =
     "\n"
     _B "Disaster recovery actions:" B_ "\n"
     "    " _B "--start" B_ ", " _B "-S" B_ "\n"
-    "        bla.\n"
-    "    " _B "--resume" B_ ", " _B "-r" B_ "\n"
-    "        bla.\n"
+    "        Initialize a disaster recovery process.\n"
+    "    "_B "--run" B_", " _B "--resume" B_ ", " _B "-r" B_ "\n"
+    "        Run/resume the recovery process.\n"
     "    " _B "--complete" B_ ", " _B "-c" B_ "\n"
-    "        bla.\n"
+    "        Terminate the recovery.\n"
     "    " _B "--status" B_ ", " _B "-s" B_ "\n"
-    "        bla.\n"
+    "        Show current recovery progress.\n"
+    "    " _B "--list" B_ " "_U"state"U_", " _B "-L"B_" "_U"state"U_ "\n"
+    "        List entries for the given "_U"state"U_": all, done, failed, or todo.\n"
     "    " _B "--reset" B_ ", " _B "-Z" B_ "\n"
-    "        bla.\n"
+    "        Abort current recovery (/!\\ non-recovered entries are lost).\n"
     "\n"
-    _B "Recovery options:" B_ "\n"
+    _B "Start options:" B_ "\n"
+    "    "  _B "--ost" B_ " " _U "ost_index" U_ "|" _U "ost_set" U_"\n"
+    "        Perform the recovery only for files striped on the given OST \n"
+    "        or set of OSTs (e.g. 3,5-8).\n"
+    "    "  _B "--since" B_ " " _U "date_time" U_ "\n"
+    "        Perform the recovery only for files updated after the given "_U"date_time"U_".\n"
+    "        The expected date/time format is yyyymmdd[HHMM[SS]].\n"
+//    "    " _B "--with-data" B_ "\n"
+//    "        Used with --ost: only recover files that really have data on the OST.\n"
+    _B "Resume options:" B_ "\n"
     "    " _B "--dir" B_ "=" _U "path" U_ ", " _B "-D" B_ " " _U "path" U_ "\n"
-    "        (used with --resume action) only recover files in the given directory.\n"
+    "        Only recover files in the given directory.\n"
     "    " _B "--retry" B_ ", " _B "-e" B_ "\n"
-    "        (used with --resume action) recover entries even if previous recovery failed on them.\n"
+    "        Recover entries even if previous recovery failed on them.\n"
+    _B "Reset options:" B_ "\n"
     "    " _B "--yes" B_ ", " _B "-y" B_ "\n"
-    "        (used with --reset action) do not prompt for confirmation.\n"
+    "        Do not prompt for confirmation.\n"
     "\n"
     _B "Config file options:" B_ "\n"
     "    " _B "-f" B_ " " _U "file" U_ ", " _B "--config-file=" B_ _U "file" U_ "\n"
     "        Path to configuration file (or short name).\n"
     "\n"
-    _B "Output options:" B_ "\n"
-    "    " _B "-o" B_ " " _U "dir" U_ ", " _B "--output-dir=" B_ _U "dir" U_ "\n"
-    "        Directory where recovery reports will be written (default=current dir).\n"
-    "\n"
+//    _B "Output options:" B_ "\n"
+//    "    " _B "-o" B_ " " _U "dir" U_ ", " _B "--output-dir=" B_ _U "dir" U_ "\n"
+//    "        Directory where recovery reports will be written (default=current dir).\n"
+//    "\n"
     _B "Miscellaneous options:" B_ "\n"
     "    " _B "-l" B_ " " _U "level" U_ ", " _B "--log-level=" B_ _U "level" U_ "\n"
     "        Force the log verbosity level (overides configuration value).\n"
@@ -147,8 +168,6 @@ static inline void display_version( char *bin_name )
     printf( "    Lustre-HSM Policy Engine\n" );
 #elif defined(_TMP_FS_MGR)
     printf( "    Temporary filesystem manager\n" );
-#elif defined(_SHERPA)
-    printf( "    SHERPA cache zapper\n" );
 #elif defined(_HSM_LITE)
     printf( "    Backup filesystem to external storage\n" );
 #else
@@ -207,37 +226,81 @@ static void print_recov_stats( int forecast, const lmgr_recov_stat_t * p_stat )
     char buff[128];
     unsigned long long diff;
 
-    FormatFileSize( buff, 128, p_stat->status_size[RS_OK] );
+    FormatFileSize( buff, 128, p_stat->status_size[RS_FILE_OK]
+                    + p_stat->status_size[RS_FILE_EMPTY] );
     if (forecast)
-        printf( "   - full recovery:   %10Lu entries (%s)\n", p_stat->status_count[RS_OK], buff );
+        printf( "   - full recovery: %Lu files (%s), %Lu non-files\n",
+                p_stat->status_count[RS_FILE_OK] + p_stat->status_count[RS_FILE_EMPTY],
+                buff, p_stat->status_count[RS_NON_FILE] );
     else
-        printf( "   - successfully recovered: %3Lu entries (%s)\n", p_stat->status_count[RS_OK], buff );
+        printf( "   - successfully recovered: %Lu files (%s), %Lu non-files\n",
+                p_stat->status_count[RS_FILE_OK] + p_stat->status_count[RS_FILE_EMPTY], buff,
+                p_stat->status_count[RS_NON_FILE] );
 
-    FormatFileSize( buff, 128, p_stat->status_size[RS_DELTA] );
-    printf( "   - old version:     %10Lu entries (%s)\n", p_stat->status_count[RS_DELTA], buff );
+    FormatFileSize( buff, 128, p_stat->status_size[RS_FILE_DELTA] );
+    printf( "   - old version:     %10Lu entries (%s)\n", p_stat->status_count[RS_FILE_DELTA], buff );
     FormatFileSize( buff, 128, p_stat->status_size[RS_NOBACKUP] );
     printf( "   - not recoverable: %10Lu entries (%s)\n", p_stat->status_count[RS_NOBACKUP], buff );
 
-    diff = p_stat->total - p_stat->status_count[RS_OK] - p_stat->status_count[RS_DELTA]
-           - p_stat->status_count[RS_NOBACKUP] - p_stat->status_count[RS_ERROR];
+    diff = p_stat->total - p_stat->status_count[RS_FILE_OK] - p_stat->status_count[RS_FILE_DELTA]
+           - p_stat->status_count[RS_FILE_EMPTY] - p_stat->status_count[RS_NOBACKUP]
+             - p_stat->status_count[RS_NON_FILE] - p_stat->status_count[RS_ERROR];
 
     FormatFileSize( buff, 128, p_stat->status_size[RS_ERROR] );
 
     if ( forecast )
         printf( "   - other/errors:    %10Lu/%Lu (%s)\n", diff, p_stat->status_count[RS_ERROR], buff );
     else {
-        printf( "   - errors:          %10Lu entries (%s)\n", p_stat->status_count[RS_ERROR], buff ); 
+        printf( "   - errors:          %10Lu entries (%s)\n", p_stat->status_count[RS_ERROR], buff );
         printf( "   - still to be recovered: %4Lu entries\n", diff );
     }
 }
 
 
-int recov_start()
+static int recov_start( void )
 {
     lmgr_recov_stat_t stats;
     int rc;
 
-    rc = ListMgr_RecovInit( &lmgr, &stats );
+    /* is there a filter to be applied? */
+    if (ost_list.count > 0 || since_time != 0)
+    {
+        lmgr_filter_t  filter;
+        filter_value_t fv;
+
+        lmgr_simple_filter_init( &filter );
+
+        /* ost filter? */
+        if (ost_list.count == 1)
+        {
+            printf( "only recovering files striped on OST#%u\n", ost_list.values[0].val_uint);
+            fv.value.val_uint = ost_list.values[0].val_uint;
+            lmgr_simple_filter_add( &filter, ATTR_INDEX_stripe_items, EQUAL, fv, 0 );
+        }
+        else if (ost_list.count > 1)
+        {
+            printf( "only recovering files striped on OSTs[%s]\n", ost_range_str);
+            fv.list = ost_list;
+            lmgr_simple_filter_add( &filter, ATTR_INDEX_stripe_items, IN, fv,
+                                    FILTER_FLAG_ALLOC_LIST ); /* allow it to free ost_list->values */
+        }
+
+        /* update time filter */
+        if (since_time)
+        {
+            char date[128];
+            struct tm t;
+            strftime( date, 128, "%Y/%m/%d %T", localtime_r( &since_time, &t ) );
+            printf( "only recovering files updated after %s (timestamp: %lu)\n", date, since_time);
+            fv.value.val_uint = since_time;
+
+            lmgr_simple_filter_add( &filter, ATTR_INDEX_md_update, MORETHAN, fv, 0 );
+        }
+
+        rc = ListMgr_RecovInit( &lmgr, &filter, &stats );
+    }
+    else
+        rc = ListMgr_RecovInit( &lmgr, NULL, &stats );
 
     if ( rc == 0 )
     {
@@ -251,7 +314,8 @@ int recov_start()
         printf( "\nERROR: a recovery is already in progress, or a previous recovery\n"
                 "was not completed properly (see --resume, --complete or --reset option).\n\n" );
 
-        unsigned long long total = stats.status_count[RS_OK] + stats.status_count[RS_DELTA]
+        unsigned long long total = stats.status_count[RS_FILE_OK] + stats.status_count[RS_FILE_DELTA]
+                           + stats.status_count[RS_NON_FILE]  + stats.status_count[RS_FILE_EMPTY]
                            + stats.status_count[RS_NOBACKUP] + stats.status_count[RS_ERROR];
         printf( "The progress of this recovery is %Lu/%Lu entries\n", total, stats.total );
         print_recov_stats( FALSE, &stats );
@@ -265,7 +329,7 @@ int recov_start()
     }
 }
 
-int recov_reset(int force)
+static int recov_reset(int force)
 {
     int rc;
 
@@ -310,7 +374,7 @@ int recov_reset(int force)
     return ListMgr_RecovReset( &lmgr );
 }
 
-int recov_resume( int retry_errors )
+static int recov_resume( int retry_errors )
 {
     struct lmgr_iterator_t * it;
     int rc, st;
@@ -330,7 +394,7 @@ int recov_resume( int retry_errors )
     attrs.attr_mask = RECOV_ATTR_MASK;
 
     while ( !terminate &&
-            ((rc = ListMgr_RecovGetNext( it, &id, &attrs )) != DB_END_OF_LIST) )
+            ((rc = ListMgr_RecovGetNext( it, &id, &attrs, NULL )) != DB_END_OF_LIST) )
     {
         if (rc)
         {
@@ -346,17 +410,15 @@ int recov_resume( int retry_errors )
         else
             printf("Restoring "DFID" (%s)...", PFID(&id), buff);
 
-        if ( ATTR_MASK_TEST( &attrs, status ) && (ATTR(&attrs, status ) == STATUS_NEW)
-             && !ATTR_MASK_TEST( &attrs, backendpath ) )
-        {
-            printf("\nThis entry is new and is probably not saved in backend. Trying anyway...");
-        }
-
         /* TODO process entries asynchronously, in parallel, in separate threads*/
         st = rbhext_recover( &id, &attrs, &new_id, &new_attrs, NULL );
 
-        if ( (st == RS_OK) || (st == RS_DELTA) )
+        if ((st == RS_FILE_OK) || (st == RS_FILE_EMPTY) || (st == RS_NON_FILE)
+            || (st == RS_FILE_DELTA))
         {
+            /* don't insert readonly attrs */
+            new_attrs.attr_mask &= ~readonly_attr_set;
+
             /* insert the entry in the database, and update recovery status */
             rc = ListMgr_Insert( &lmgr, &new_id, &new_attrs, TRUE );
             if (rc)
@@ -372,8 +434,10 @@ int recov_resume( int retry_errors )
 
         switch (st)
         {
-            case RS_OK: printf(" OK\n"); break;
-            case RS_DELTA: printf(" OK (old version)\n"); break;
+            case RS_FILE_OK: printf(" OK\n"); break;
+            case RS_FILE_DELTA: printf(" OK (old version)\n"); break;
+            case RS_NON_FILE: printf(" OK (non-file)\n"); break;
+            case RS_FILE_EMPTY: printf(" OK (empty file)\n"); break;
             case RS_NOBACKUP: printf(" No backup available\n"); break;
             case RS_ERROR: printf(" FAILED\n"); break;
             default: printf(" ERROR st=%d, rc=%d\n", st, rc ); break;
@@ -386,7 +450,7 @@ int recov_resume( int retry_errors )
     return 0;
 }
 
-int recov_complete()
+static int recov_complete( void )
 {
     int rc;
     lmgr_recov_stat_t stats;
@@ -417,7 +481,7 @@ int recov_complete()
     }
 }
 
-int recov_status()
+static int recov_status( void )
 {
     int rc;
     lmgr_recov_stat_t stats;
@@ -435,6 +499,76 @@ int recov_status()
     printf("\n");
     return 0;
 }
+
+static int recov_list(recov_type_e state)
+{
+    struct lmgr_iterator_t * it;
+    int rc;
+    entry_id_t  id;
+    attr_set_t  attrs;
+    char buff[128];
+    recov_status_t st;
+    const char * status;
+
+    /* TODO iter opt */
+    it = ListMgr_RecovList( &lmgr, state );
+    if ( it == NULL )
+    {
+        fprintf( stderr, "ERROR: cannot get the list of entries\n");
+        return -1;
+    }
+
+    attrs.attr_mask = RECOV_ATTR_MASK;
+    printf("%-8s %-15s %-40s %s\n", "type", "state", "path", "size");
+
+    while ( !terminate &&
+            ((rc = ListMgr_RecovGetNext( it, &id, &attrs, &st )) != DB_END_OF_LIST) )
+    {
+        if (rc)
+        {
+            fprintf( stderr, "ERROR %d getting entry from recovery table\n", rc );
+            ListMgr_CloseIterator( it );
+            return rc;
+        }
+
+        FormatFileSize( buff, 128, ATTR( &attrs, size ) );
+        switch (st)
+        {
+            case RS_FILE_OK:
+                status = "done";
+                break;
+            case RS_FILE_DELTA:
+                status = "done_old_data";
+                break;
+            case RS_NON_FILE:
+                status = "done_non_file";
+                break;
+            case RS_FILE_EMPTY:
+                status = "done_empty";
+                break;
+            case RS_NOBACKUP:
+                status = "done_no_backup";
+                break;
+            case RS_ERROR:
+                status = "failed";
+                break;
+            case -1:
+                status = "todo";
+                break;
+            default:
+                status = "?";
+        }
+
+        printf("%-8s %-15s %-40s %s\n", ATTR(&attrs, type), status, ATTR(&attrs, fullpath), buff);
+
+        /* reset mask */
+        attrs.attr_mask = RECOV_ATTR_MASK;
+    }
+
+    return 0;
+}
+
+
 
 #define RETRY_ERRORS 0x00000001
 #define NO_CONFIRM   0x00000002
@@ -458,6 +592,7 @@ int main( int argc, char **argv )
     int            do_resume = FALSE;
     int            do_complete = FALSE;
     int            do_status = FALSE;
+    int            list_state = -1;
     int            force_log_level = FALSE;
 
     int            log_level = 0;
@@ -468,6 +603,7 @@ int main( int argc, char **argv )
     robinhood_config_t config;
     struct sigaction act_sigterm;
     int chgd = 0;
+    char    badcfg[RBH_PATH_MAX];
 
     /* parse command line options */
     while ( ( c = getopt_long( argc, argv, SHORT_OPT_STRING, option_tab, &option_index ) ) != -1 )
@@ -489,6 +625,21 @@ int main( int argc, char **argv )
         case 'r':
             do_resume = TRUE;
             break;
+        case 'L':
+            if (!strcasecmp(optarg, "all"))
+                list_state = RT_ALL;
+            else if (!strcasecmp(optarg, "done"))
+                list_state = RT_DONE;
+            else if (!strcasecmp(optarg, "failed"))
+                list_state = RT_FAILED;
+            else if (!strcasecmp(optarg, "todo"))
+                list_state = RT_TODO;
+            else
+            {
+                fprintf(stderr, "Invalid parameter for option --list: all, done, failed or todo expected.\n");
+                exit(1);
+            }
+            break;
         case 'e':
             local_flags |= RETRY_ERRORS;
             break;
@@ -508,6 +659,36 @@ int main( int argc, char **argv )
             {
                 strncpy( path_buff, optarg, MAX_OPT_LEN );
                 path_filter = path_buff;
+            }
+            break;
+        case 'o':
+            if ( !optarg )
+            {
+                fprintf(stderr, "Missing mandatory argument <ost_index> for --ost\n");
+                exit(1);
+            }
+            /* parse it as a set */
+            if (lmgr_range2list(optarg, DB_UINT, &ost_list))
+            {
+                fprintf( stderr,
+                         "Invalid value '%s' for --ost option: integer or set expected (e.g. 2 or 3,5-8,10-12).\n",
+                         optarg );
+                exit( 1 );
+            }
+            /* copy arg to display it */
+            strncpy(ost_range_str, optarg, sizeof(ost_range_str));
+            break;
+        case 'b':
+            if ( !optarg )
+            {
+                fprintf(stderr, "Missing mandatory argument <date_time> for --since\n");
+                exit(1);
+            }
+            since_time = str2date(optarg);
+            if (since_time == (time_t)-1) {
+                fprintf( stderr,
+                         "Invalid date format: yyyymmdd[HH[MM[SS]]] expected\n" );
+                exit(1);
             }
             break;
         case 'l':
@@ -546,9 +727,9 @@ int main( int argc, char **argv )
     }
 
     /* get default config file, if not specified */
-    if ( SearchConfig( config_file, config_file, &chgd ) != 0 )
+    if ( SearchConfig( config_file, config_file, &chgd, badcfg ) != 0 )
     {
-        fprintf(stderr, "No config file found in '/etc/robinhood.d/"PURPOSE_EXT"', ...\n" );
+        fprintf(stderr, "No config file (or too many) found matching %s\n", badcfg );
         exit(2);
     }
     else if (chgd)
@@ -641,6 +822,8 @@ int main( int argc, char **argv )
 
     if (do_status)
         rc = recov_status();
+    else if (list_state != -1)
+        rc = recov_list(list_state);
     else if (do_start)
         rc = recov_start();
     else if (do_reset)
@@ -649,9 +832,13 @@ int main( int argc, char **argv )
         rc = recov_resume( local_flags & RETRY_ERRORS );
     else if (do_complete)
         rc = recov_complete();
+    else
+    {
+        display_help( bin );
+        rc = 1;
+    }
 
     ListMgr_CloseAccess( &lmgr );
 
     return rc;
-
 }

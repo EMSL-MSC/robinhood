@@ -27,7 +27,7 @@
 #include <pthread.h>
 
 
-int ListMgr_Update( lmgr_t * p_mgr, const entry_id_t * p_id, const attr_set_t * p_update_set )
+int ListMgr_Update(lmgr_t * p_mgr, entry_id_t *p_id, attr_set_t *p_update_set)
 {
     int            rc, main_count, annex_count;
     char           query[4096];
@@ -44,14 +44,12 @@ int ListMgr_Update( lmgr_t * p_mgr, const entry_id_t * p_id, const attr_set_t * 
         return DB_INVALID_ARG;
     }
 
-    rc = entry_id2pk( p_mgr, p_id, FALSE, PTR_PK(pk) );
-    if (rc)
-        return rc;
+    entry_id2pk(p_id, PTR_PK(pk));
 
     /* check how many tables are to be updated */
     if ( main_fields( p_update_set->attr_mask ) )
     {
-        main_count = attrset2updatelist( p_mgr, fields, p_update_set, T_MAIN, FALSE );
+        main_count = attrset2updatelist(p_mgr, fields, p_update_set, T_MAIN, FALSE, FALSE);
         if ( main_count < 0 )
             return -main_count;
         if ( main_count > 0 )
@@ -60,9 +58,12 @@ int ListMgr_Update( lmgr_t * p_mgr, const entry_id_t * p_id, const attr_set_t * 
     else
         main_count = 0;
 
+    /* For the NAMES tables. */
+    nb_tables++;
+
     if ( annex_table && annex_fields( p_update_set->attr_mask ) )
     {
-        annex_count = attrset2updatelist( p_mgr, annex_fields, p_update_set, T_ANNEX, FALSE );
+        annex_count = attrset2updatelist(p_mgr, annex_fields, p_update_set, T_ANNEX, FALSE, FALSE);
         if ( annex_count < 0 )
             return -annex_count;
         if ( annex_count > 0 )
@@ -95,6 +96,41 @@ int ListMgr_Update( lmgr_t * p_mgr, const entry_id_t * p_id, const attr_set_t * 
             goto rollback;
     }
 
+    /* update names table */
+    if (ATTR_MASK_TEST(p_update_set, name) && ATTR_MASK_TEST(p_update_set, parent_id))
+    {
+        char          *fields_curr;
+        char          *values_curr;
+        char           values[4096];
+        char          *set;
+
+        strcpy( fields, "id" );
+        sprintf( values, DPK, pk );
+        fields_curr = fields + strlen( fields );
+        values_curr = values + strlen( values );
+
+        /* create field and values lists */
+        attrmask2fieldlist( fields_curr, p_update_set->attr_mask, T_DNAMES, TRUE, FALSE, "", "" );
+        attrset2valuelist( p_mgr, values_curr, p_update_set, T_DNAMES, TRUE );
+
+        // FIXME this update operation may zero column content if some values are not specified
+        set = query + sprintf(query, "INSERT INTO " DNAMES_TABLE "(%s, pkn) VALUES (%s, "HNAME_DEF") "
+                "ON DUPLICATE KEY UPDATE id=VALUES(id)", fields, values);
+        /* append the field values for 'ON DUPLICATE KEY...' */
+        attrset2updatelist(p_mgr, set, p_update_set, T_DNAMES, TRUE, TRUE);
+
+        rc = db_exec_sql( &p_mgr->conn, query, NULL );
+        if ( rc )
+            goto rollback;
+    }
+    else if (ATTR_MASK_TEST(p_update_set, name) || ATTR_MASK_TEST(p_update_set, parent_id))
+    {
+        DisplayLog(LVL_MAJOR, LISTMGR_TAG, "WARNING: missing attribute to update name information"
+                   " (entry "DPK"): name %s, parent_id %s", pk,
+                   ATTR_MASK_TEST(p_update_set, name) ? "is set" : "is not set",
+                   ATTR_MASK_TEST(p_update_set, parent_id) ? "is set" : "is not set");
+    }
+
     /* update annex table (if any) */
     if ( annex_count > 0 )
     {
@@ -104,29 +140,39 @@ int ListMgr_Update( lmgr_t * p_mgr, const entry_id_t * p_id, const attr_set_t * 
             goto rollback;
     }
 
-    /* insert new stripe info if provided (and eventually remove previous values) */
+    /* insert new stripe info if provided (and remove previous values if any) */
+#ifdef _LUSTRE
     if ( ATTR_MASK_TEST( p_update_set, stripe_info ) )
     {
-        rc = insert_stripe_info( p_mgr, pk, VALID(p_id), &ATTR( p_update_set, stripe_info ),
-                                 ATTR_MASK_TEST( p_update_set, stripe_items ) ?
-                                    &ATTR( p_update_set, stripe_items ) : NULL, TRUE );
-        if ( rc )
+        const stripe_items_t *p_items = NULL;
+
+        if (ATTR_MASK_TEST(p_update_set, stripe_items))
+            p_items = &ATTR(p_update_set, stripe_items);
+
+        rc = update_stripe_info(p_mgr, pk, VALID(p_id),
+                                &ATTR(p_update_set, stripe_info), p_items, TRUE);
+        if (rc)
             goto rollback;
     }
-
+#endif
 
     if ( nb_tables > 1 )
-        return lmgr_commit( p_mgr );
+    {
+        rc = lmgr_commit( p_mgr );
+        if (!rc)
+            p_mgr->nbop[OPIDX_UPDATE]++;
+        return rc;
+    }
     else
+    {
+        p_mgr->nbop[OPIDX_UPDATE]++;
         return DB_SUCCESS;
+    }
 
   rollback:
     lmgr_rollback( p_mgr );
     return rc;
 }
-
-
-
 
 
 int ListMgr_MassUpdate( lmgr_t * p_mgr,
@@ -155,7 +201,7 @@ int ListMgr_MassUpdate( lmgr_t * p_mgr,
 
     /* /!\ possible cases:
      * - simplest: the fields of the filter and the attributes to be changed are in the same table
-     * - harder: the fields of the filter are in the same table and attributes are in another different table 
+     * - harder: the fields of the filter are in the same table and attributes are in another different table
      */
 
     /* 1) check the location of filters */
@@ -227,7 +273,7 @@ int ListMgr_MassUpdate( lmgr_t * p_mgr,
         return rc;
 
     /* perform updates on MAIN TABLE */
-    count = attrset2updatelist( p_mgr, fields, p_attr_set, T_MAIN, FALSE );
+    count = attrset2updatelist(p_mgr, fields, p_attr_set, T_MAIN, FALSE, FALSE);
     if ( count < 0 )
         return -count;
     if ( count > 0 )
@@ -342,7 +388,7 @@ int ListMgr_MassUpdate( lmgr_t * p_mgr,
     /* update on annex table ? */
     if ( annex_table )
     {
-        count = attrset2updatelist( p_mgr, fields, p_attr_set, T_ANNEX, FALSE );
+        count = attrset2updatelist(p_mgr, fields, p_attr_set, T_ANNEX, FALSE, FALSE);
         if ( count < 0 )
             return -count;
         if ( count > 0 )
@@ -467,8 +513,7 @@ int ListMgr_MassUpdate( lmgr_t * p_mgr,
 
     if ( tmp_table_created )
     {
-        sprintf( query, "DROP TABLE %s", tmp_table_name );
-        rc = db_exec_sql( &p_mgr->conn, query, NULL );
+        rc = db_drop_component(&p_mgr->conn, DBOBJ_TABLE, tmp_table_name);
         if ( rc )
             goto rollback;
     }
@@ -477,5 +522,45 @@ int ListMgr_MassUpdate( lmgr_t * p_mgr,
 
   rollback:
     lmgr_rollback( p_mgr );
+    return rc;
+}
+
+int ListMgr_Replace(lmgr_t * p_mgr, entry_id_t *old_id, attr_set_t *old_attrs,
+                    entry_id_t *new_id, attr_set_t *new_attrs,
+                    int src_is_last, int update_target_if_exists)
+{
+    char query[4096];
+    DEF_PK(oldpk);
+    DEF_PK(newpk);
+
+    int rc = lmgr_begin(p_mgr);
+    if (rc)
+        return rc;
+
+    /* delete the old entry */
+    rc = listmgr_remove_no_tx(p_mgr, old_id, old_attrs, src_is_last);
+    if (rc)
+        goto rollback;
+
+    /* create the new one */
+    rc = listmgr_batch_insert_no_tx(p_mgr, &new_id, &new_attrs, 1,
+                                    update_target_if_exists);
+    if (rc)
+        goto rollback;
+
+    /* update parent ids in NAMES table */
+    entry_id2pk(old_id, PTR_PK(oldpk));
+    entry_id2pk(new_id, PTR_PK(newpk));
+
+    sprintf(query, "UPDATE "DNAMES_TABLE" SET parent_id="DPK" WHERE parent_id="DPK,
+            newpk, oldpk);
+    rc = db_exec_sql(&p_mgr->conn, query, NULL);
+    if (rc)
+        goto rollback;
+
+    return lmgr_commit(p_mgr);
+
+rollback:
+    lmgr_rollback(p_mgr);
     return rc;
 }

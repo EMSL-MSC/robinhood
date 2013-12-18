@@ -17,7 +17,7 @@
  * \brief Module for managing the queue of files to be purged.
  */
 
-#include "SemN.h"
+#include <semaphore.h>
 #include <time.h>
 #include <pthread.h>
 
@@ -39,9 +39,9 @@ typedef struct entry_queue_t
     pthread_mutex_t queue_lock;
 
     /* token for free slots */
-    semaphore_t    sem_empty;
+    sem_t          sem_empty;
     /* token for filled slots */
-    semaphore_t    sem_full;
+    sem_t          sem_full;
 
     /* ==== stats ==== */
 
@@ -66,7 +66,7 @@ typedef struct entry_queue_t
 
 /**
  * Queue initialization.
- * @param queue_size: buffer size (over this count, inserts are blocking). 
+ * @param queue_size: buffer size (over this count, inserts are blocking).
  * @param max_status: the max value for status (will keep track of acknowledgments from 0 to this value)
  * @param feedback_count: the number of feedback values from workers
  */

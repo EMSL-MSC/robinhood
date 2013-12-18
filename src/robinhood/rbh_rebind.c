@@ -57,10 +57,6 @@ static struct option option_tab[] =
 
 #define SHORT_OPT_STRING    "f:l:hV"
 
-/* global variables */
-
-static lmgr_t  lmgr;
-
 /* special character sequences for displaying help */
 
 /* Bold start character sequence */
@@ -109,8 +105,6 @@ static inline void display_version( char *bin_name )
     printf( "    Lustre-HSM Policy Engine\n" );
 #elif defined(_TMP_FS_MGR)
     printf( "    Temporary filesystem manager\n" );
-#elif defined(_SHERPA)
-    printf( "    SHERPA cache zapper\n" );
 #elif defined(_HSM_LITE)
     printf( "    Backup filesystem to external storage\n" );
 #else
@@ -246,6 +240,7 @@ int main( int argc, char **argv )
     char           err_msg[4096];
     robinhood_config_t config;
     int chgd = 0;
+    char badcfg[RBH_PATH_MAX];
 
     /* parse command line options */
     while ( ( c = getopt_long( argc, argv, SHORT_OPT_STRING, option_tab,
@@ -299,9 +294,9 @@ int main( int argc, char **argv )
     }
 
     /* get default config file, if not specified */
-    if ( SearchConfig( config_file, config_file, &chgd ) != 0 )
+    if ( SearchConfig( config_file, config_file, &chgd, badcfg ) != 0 )
     {
-        fprintf(stderr, "No config file found in '/etc/robinhood.d/"PURPOSE_EXT"', ...\n" );
+        fprintf(stderr, "No config file (or too many) found matching %s\n", badcfg );
         exit(2);
     }
     else if (chgd)
@@ -345,27 +340,6 @@ int main( int argc, char **argv )
     if (rc)
         exit(rc);
 
-    /* Initialize list manager */
-    rc = ListMgr_Init( &config.lmgr_config, FALSE );
-    if ( rc )
-    {
-        DisplayLog( LVL_CRIT, LOGTAG, "Error %d initializing list manager", rc );
-        exit( rc );
-    }
-    else
-        DisplayLog( LVL_DEBUG, LOGTAG, "ListManager successfully initialized" );
-
-    if ( CheckLastFS(  ) != 0 )
-        exit( 1 );
-
-    /* Create database access */
-    rc = ListMgr_InitAccess( &lmgr );
-    if ( rc )
-    {
-        DisplayLog( LVL_CRIT, LOGTAG, "Error %d: cannot connect to database", rc );
-        exit( rc );
-    }
-
 #ifdef _HSM_LITE
     rc = Backend_Start( &config.backend_config, 0 );
     if ( rc )
@@ -379,8 +353,6 @@ int main( int argc, char **argv )
         rc = rebind_helper(argv[optind], argv[optind+1], NULL);
     else if (optind == argc - 3)
         rc = rebind_helper(argv[optind], argv[optind+1], argv[optind+2]);
-
-    ListMgr_CloseAccess( &lmgr );
 
     return rc;
 }

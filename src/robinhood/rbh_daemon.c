@@ -37,6 +37,7 @@
 #include "RobinhoodConfig.h"
 #include "RobinhoodLogs.h"
 #include "RobinhoodMisc.h"
+#include "cmd_helpers.h"
 
 #include <unistd.h>
 #include <getopt.h>
@@ -48,7 +49,7 @@
 #include <signal.h>
 
 #ifdef _LUSTRE
-#include <lustre/liblustreapi.h>
+#include "lustre_extended_types.h"
 #endif
 
 #ifdef _HSM_LITE
@@ -75,6 +76,8 @@ static time_t  boot_time;
 #define NO_LIMIT          281
 #define TEST_SYNTAX       282
 #define PARTIAL_SCAN      283
+#define SHOW_DIFF         284
+#define NO_GC             285
 
 #define ACTION_MASK_SCAN                0x00000001
 #define ACTION_MASK_PURGE               0x00000002
@@ -97,16 +100,6 @@ static time_t  boot_time;
 #   else
 #       define DEFAULT_ACTION_MASK     (ACTION_MASK_SCAN | ACTION_MASK_PURGE | ACTION_MASK_RMDIR)
 #       define DEFAULT_ACTION_HELP   "--scan --purge --rmdir"
-#   endif
-
-#elif defined (_SHERPA)
-
-#   ifdef HAVE_CHANGELOGS
-#       define DEFAULT_ACTION_MASK     (ACTION_MASK_HANDLE_EVENTS | ACTION_MASK_PURGE | ACTION_MASK_RMDIR | ACTION_MASK_MIGRATE)
-#       define DEFAULT_ACTION_HELP   "--read-log --purge --rmdir --migrate"
-#   else
-#       define DEFAULT_ACTION_MASK     (ACTION_MASK_SCAN | ACTION_MASK_PURGE | ACTION_MASK_RMDIR | ACTION_MASK_MIGRATE)
-#       define DEFAULT_ACTION_HELP   "--scan --purge --rmdir --migrate"
 #   endif
 
 #elif defined (_HSM_LITE )
@@ -140,7 +133,9 @@ static int     action_mask = DEFAULT_ACTION_MASK;
 static struct option option_tab[] = {
 
     /* Actions selectors */
-    {"scan", no_argument, NULL, 'S'},
+    {"scan", optional_argument, NULL, 'S'},
+    {"diff", required_argument, NULL, SHOW_DIFF},
+    /* kept for compatibility */
     {"partial-scan", required_argument, NULL, PARTIAL_SCAN},
 #ifdef HAVE_PURGE_POLICY
     {"purge", no_argument, NULL, 'P'},
@@ -154,9 +149,14 @@ static struct option option_tab[] = {
     {"sync", no_argument, NULL, 's'},
 #endif
 #ifdef HAVE_CHANGELOGS
+#ifdef HAVE_DNE
+    {"readlog", optional_argument, NULL, 'r'},
+    {"read-log", optional_argument, NULL, 'r'},
+#else
     {"readlog", no_argument, NULL, 'r'},
     {"read-log", no_argument, NULL, 'r'},
     {"handle-events", no_argument, NULL, 'r'}, /* for backward compatibility */
+#endif
 #endif
 
     /* XXX we use the same letter 'R' for the 2 purposes
@@ -211,6 +211,7 @@ static struct option option_tab[] = {
     {"once", no_argument, NULL, 'O'},
     {"detach", no_argument, NULL, 'd'},
     {"no-limit", no_argument, NULL, NO_LIMIT},
+    {"no-gc", no_argument, NULL, NO_GC},
 
     /* config file options */
     {"config-file", required_argument, NULL, 'f'},
@@ -262,8 +263,9 @@ typedef struct rbh_options {
     double         usage_target;
     int            purge_class;
     char           purge_target_class[128];
-    int            partial_scan; 
+    int            partial_scan;
     char           partial_scan_path[RBH_PATH_MAX];
+    int            diff_mask;
 
 #ifdef HAVE_MIGR_POLICY
 #ifdef _LUSTRE
@@ -318,8 +320,8 @@ static const char *help_string =
     _B "Usage:" B_ " %s [options]\n"
     "\n"
     _B "Action switches:" B_ "\n"
-    "    " _B "-S" B_ ", " _B "--scan" B_ "\n"
-    "        Scan filesystem namespace.\n"
+    "    " _B "-S" B_", " _B "--scan" B_ "[=" _U "dir" U_ "]\n"
+    "        Scan the filesystem namespace. If "_U"dir"U_" is specified, only scan the specified subdir.\n"
 #ifdef HAVE_PURGE_POLICY
     "    " _B "-P" B_ ", " _B "--purge" B_ "\n"
     "        Purge non-directory entries according to policy.\n"
@@ -335,17 +337,21 @@ static const char *help_string =
     "        Copy \"dirty\" entries to HSM.\n"
 #endif
 #ifdef HAVE_CHANGELOGS
-    "    " _B "-r" B_ ", " _B "--read-log" B_ "\n"
+    "    " _B "-r" B_ ", " _B "--read-log" B_ "[=" _U "mdt_idx" U_ "]\n"
     "        Read events from MDT ChangeLog.\n"
+    "        If "_U"mdt_idx"U_" is specified, only read ChangeLogs for the given MDT.\n"
+    "        Else, start 1 changelog reader thread per MDT (with DNE).\n"
 #endif
 #ifdef HAVE_RM_POLICY
     "    " _B "-R" B_ ", " _B "--hsm-remove" B_ "\n"
     "        Perform deferred removal in HSM.\n"
 #endif
-    "    " _B "--partial-scan=" B_ _U "dir" U_ "\n"
-    "        Scan a subset of the filesystem namespace.\n"
     "\n"
-    "    Default is: "DEFAULT_ACTION_HELP"\n"
+    "    If nothing is specified, the default action set is: "DEFAULT_ACTION_HELP"\n"
+    "\n"
+    "    " _B "--diff"B_"="_U"attrset"U_ " : when scanning or reading changelogs,\n"
+    "        display changes for the given set of attributes (to stdout).\n"
+    "        "_U"attrset"U_" is a list of options in: path,posix,stripe,all,notimes,noatime.\n"
     "\n"
 #ifdef HAVE_PURGE_POLICY
     _B "Manual purge actions:" B_ "\n"
@@ -389,6 +395,11 @@ static const char *help_string =
     "        Daemonize the process (detach from parent process).\n"
     "    " _B "--no-limit"B_"\n"
     "        Don't limit the maximum number of migrations (per pass).\n"
+    "    " _B "--no-gc"B_"\n"
+    "        Garbage collection of entries in DB is a long operation when terminating\n"
+    "        a scan. This skips this operation if you don't care about removed\n"
+    "        entries (or don't expect entries to be removed).\n"
+    "        This is also recommended for partial scanning (see -scan=dir option).\n"
     "\n"
     _B "Config file options:" B_ "\n"
     "    " _B "-f" B_ " " _U "file" U_ ", " _B "--config-file=" B_ _U "file" U_ "\n"
@@ -441,8 +452,6 @@ static inline void display_version( char *bin_name )
     printf( "    Lustre-HSM Policy Engine\n" );
 #elif defined(_TMP_FS_MGR)
     printf( "    Temporary filesystem manager\n" );
-#elif defined(_SHERPA)
-    printf( "    SHERPA cache zapper\n" );
 #elif defined(_HSM_LITE)
     printf( "    Basic HSM binding\n" );
 #else
@@ -720,8 +729,17 @@ static void   *signal_handler_thr( void *arg )
             /* 4 - entry processor can be stopped */
             if ( action_mask & ( ACTION_MASK_SCAN | ACTION_MASK_HANDLE_EVENTS ) )
             {
-                /* flush processor pipeline and terminate threads */
-                EntryProcessor_Terminate(  );
+                /* drop pipeline waiting operations and terminate threads */
+                EntryProcessor_Terminate( FALSE );
+
+#ifdef HAVE_CHANGELOGS
+                if ( action_mask & ACTION_MASK_HANDLE_EVENTS )
+                {
+                    /* Ack last changelog records. */
+                    ChgLogRdr_Done( );
+                }
+#endif
+
                 FlushLogs(  );
             }
 
@@ -745,6 +763,11 @@ static void   *signal_handler_thr( void *arg )
 #ifdef _HSM_LITE
             Backend_Stop();
 #endif
+            if (lmgr_init)
+            {
+                ListMgr_CloseAccess(&lmgr);
+                lmgr_init = FALSE;
+            }
 
             DisplayLog( LVL_MAJOR, SIGHDL_TAG, "Exiting." );
             FlushLogs(  );
@@ -831,7 +854,7 @@ static inline int do_write_template( const char *file )
         if ( stream == NULL )
         {
             rc = errno;
-            fprintf( stderr, "Error opening file '%s' for writting: %s.\n", file, strerror( rc ) );
+            fprintf( stderr, "Error opening file '%s' for writing: %s.\n", file, strerror( rc ) );
             return rc;
         }
     }
@@ -840,7 +863,7 @@ static inline int do_write_template( const char *file )
 
     rc = WriteConfigTemplate( stream );
     if ( rc )
-        fprintf( stderr, "Error writting configuration template: %s\n", strerror( rc ) );
+        fprintf( stderr, "Error writing configuration template: %s\n", strerror( rc ) );
     else if ( stream != stdout )
         fprintf( stderr, "Configuration template successfully written to '%s'.\n", file );
 
@@ -907,6 +930,8 @@ int main( int argc, char **argv )
     char           err_msg[4096];
     robinhood_config_t rh_config;
     int chgd = 0;
+    char           badcfg[RBH_PATH_MAX];
+    int mdtidx = -1; /* all MDTs */
 
     boot_time = time( NULL );
 
@@ -917,9 +942,33 @@ int main( int argc, char **argv )
     {
         switch ( c )
         {
+        case PARTIAL_SCAN:
+            fprintf(stderr, "Warning: --partial-scan is deprecated. Use '--scan=<dir>' instead.\n");
+            /* same as 'scan' with optarg != NULL
+             * => continue to -S:
+             */
         case 'S':
             SET_ACTION_FLAG( ACTION_MASK_SCAN );
+
+            if (optarg) {       /* optional argument => partial scan*/
+                options.flags |= FLAG_ONCE;
+                options.partial_scan = TRUE;
+                strncpy(options.partial_scan_path, optarg, RBH_PATH_MAX);
+                /* clean final slash */
+                if (FINAL_SLASH(options.partial_scan_path))
+                    REMOVE_FINAL_SLASH(options.partial_scan_path);
+            }
             break;
+
+        case SHOW_DIFF:
+            if (parse_diff_mask(optarg, &options.diff_mask, err_msg))
+            {
+                fprintf(stderr,
+                        "Invalid argument for --diff: %s\n", err_msg);
+                exit( 1 );
+            }
+            break;
+
         case 'C':
             SET_ACTION_FLAG( ACTION_MASK_PURGE );
             options.flags |= FLAG_CHECK_ONLY;
@@ -933,7 +982,7 @@ int main( int argc, char **argv )
 #elif HAVE_RM_POLICY
             SET_ACTION_FLAG( ACTION_MASK_UNLINK );
 #else
-            fprintf( stderr, "-R option is not supported.\n" ); 
+            fprintf( stderr, "-R option is not supported.\n" );
             exit(1);
 #endif
             break;
@@ -963,6 +1012,15 @@ int main( int argc, char **argv )
             exit( 1 );
 #else
             SET_ACTION_FLAG( ACTION_MASK_HANDLE_EVENTS );
+#ifdef HAVE_DNE
+            if (optarg) {  /* optional argument => MDT index */
+                mdtidx = str2int(optarg);
+                if (mdtidx == -1) {
+                    fprintf(stderr, "Invalid argument to --read-log: expected numeric value for <mdt_index>.\n");
+                    exit(1);
+                }
+            }
+#endif
 #endif
             break;
 
@@ -972,21 +1030,14 @@ int main( int argc, char **argv )
         case NO_LIMIT:
             options.flags |= FLAG_NO_LIMIT;
             break;
+        case NO_GC:
+            options.flags |= FLAG_NO_GC;
+            break;
         case DRY_RUN:
             options.flags |= FLAG_DRY_RUN;
             break;
         case 'i':
             options.flags |= FLAG_IGNORE_POL;
-            break;
-
-        case PARTIAL_SCAN:
-            options.flags |= FLAG_ONCE;
-            SET_ACTION_FLAG( ACTION_MASK_SCAN );
-            options.partial_scan = TRUE;
-            strncpy(options.partial_scan_path, optarg, RBH_PATH_MAX);
-            /* clean final slash */
-            if (FINAL_SLASH(options.partial_scan_path))
-                REMOVE_FINAL_SLASH(options.partial_scan_path);
             break;
 
 #ifdef _LUSTRE
@@ -1158,9 +1209,16 @@ int main( int argc, char **argv )
                  "Error: --purge-ost and --purge-fs cannot be used together\n" );
         exit( 1 );
     }
-    
+
+    if (options.diff_mask && (action_mask != ACTION_MASK_SCAN)
+        && (action_mask != ACTION_MASK_HANDLE_EVENTS))
+    {
+        fprintf( stderr, "Error: --diff option only applies to --scan and --readlog actions\n");
+        exit(1);
+    }
+
 #ifdef HAVE_MIGR_POLICY
-    if ( options.migrate_user + options.migrate_group 
+    if ( options.migrate_user + options.migrate_group
 #ifdef _LUSTRE
         + options.migrate_ost
 #endif
@@ -1211,9 +1269,9 @@ int main( int argc, char **argv )
     parsing_mask = action2parsing_mask(action_mask);
 
     /* get default config file, if not specified */
-    if ( SearchConfig( options.config_file, options.config_file, &chgd ) != 0 )
+    if ( SearchConfig( options.config_file, options.config_file, &chgd, badcfg ) != 0 )
     {
-        fprintf(stderr, "No config file found\n" );
+        fprintf(stderr, "No config file (or too many) found matching %s\n", badcfg);
         exit(2);
     }
     else if (chgd)
@@ -1270,21 +1328,6 @@ int main( int argc, char **argv )
     }
 #endif
 
-#ifdef _SHERPA
-    /* read sherpa configuration */
-    rc = InitSherpa(global_config.sherpa_config, rh_config.log_config.log_file, rh_config.log_config.report_file);
-
-    if ( rc )
-    {
-        fprintf( stderr, "Sherpa initialization error!\n");
-        exit( 1 );
-    }
-
-    if ( flags & FLAG_DRY_RUN )
-        /* sherpa config */
-        config.attitudes.modes_fonctionnement |= SANS_EFFACEMENT;
-#endif
-
     /* Initialize logging */
     rc = InitializeLogs( bin, &rh_config.log_config );
     if ( rc )
@@ -1336,13 +1379,6 @@ int main( int argc, char **argv )
     else
         DisplayLog( LVL_VERB, MAIN_TAG, "Signal handler thread started successfully" );
 
-    if ( options.flags & FLAG_ONCE )
-    {
-        /* used for dumping stats in one shot mode */
-        currently_running_mask = 0;
-        pthread_create( &stat_thread, NULL, stats_thr, &currently_running_mask );
-    }
-
     /* Initialize list manager */
     rc = ListMgr_Init( &rh_config.lmgr_config, FALSE );
     if ( rc )
@@ -1356,10 +1392,21 @@ int main( int argc, char **argv )
     if ( CheckLastFS(  ) != 0 )
         exit( 1 );
 
+    if ( options.flags & FLAG_ONCE )
+    {
+        /* used for dumping stats in one shot mode */
+        currently_running_mask = 0;
+        pthread_create( &stat_thread, NULL, stats_thr, &currently_running_mask );
+    }
+
     if ( action_mask & ( ACTION_MASK_SCAN | ACTION_MASK_HANDLE_EVENTS ) )
     {
+        if (options.diff_mask)
+            rh_config.entry_proc_config.diff_mask = options.diff_mask;
+
         /* Initialise Pipeline */
-        rc = EntryProcessor_Init( &rh_config.entry_proc_config, options.flags );
+        rc = EntryProcessor_Init(&rh_config.entry_proc_config, STD_PIPELINE,
+                                 options.flags, NULL);
         if ( rc )
         {
             DisplayLog( LVL_CRIT, MAIN_TAG, "Error %d initializing EntryProcessor pipeline", rc );
@@ -1407,7 +1454,7 @@ int main( int argc, char **argv )
     {
 
         /* Start reading changelogs */
-        rc = ChgLogRdr_Start( &rh_config.chglog_reader_config, options.flags );
+        rc = ChgLogRdr_Start(&rh_config.chglog_reader_config, options.flags, mdtidx);
         if ( rc )
         {
             DisplayLog( LVL_CRIT, MAIN_TAG, "Error %d initializing ChangeLog Reader", rc );
@@ -1431,7 +1478,15 @@ int main( int argc, char **argv )
     if ( (options.flags & FLAG_ONCE) && (  action_mask & ( ACTION_MASK_SCAN | ACTION_MASK_HANDLE_EVENTS ) ) )
     {
         /* Pipeline must be flushed */
-        EntryProcessor_Terminate(  );
+        EntryProcessor_Terminate( TRUE );
+
+#ifdef HAVE_CHANGELOGS
+        if ( action_mask & ACTION_MASK_HANDLE_EVENTS )
+        {
+            /* Ack last changelog records. */
+            ChgLogRdr_Done( );
+        }
+#endif
     }
 
 #ifdef HAVE_MIGR_POLICY
@@ -1486,7 +1541,7 @@ int main( int argc, char **argv )
         rc = Start_Migration( &rh_config.migr_config, migr_opt );
         if ( rc == ENOENT )
         {
-            DisplayLog( LVL_CRIT, MAIN_TAG, "Migration module is disabled." ); 
+            DisplayLog( LVL_CRIT, MAIN_TAG, "Migration module is disabled." );
             /* unset it in parsing mask to avoid dumping stats */
             parsing_mask &= ~MODULE_MASK_MIGRATION;
             action_mask &= ~ACTION_MASK_MIGRATE;
@@ -1551,7 +1606,7 @@ int main( int argc, char **argv )
         rc = Start_ResourceMonitor( &rh_config.res_mon_config, resmon_opt );
         if ( rc == ENOENT )
         {
-            DisplayLog( LVL_CRIT, MAIN_TAG, "Resource Monitor is disabled." ); 
+            DisplayLog( LVL_CRIT, MAIN_TAG, "Resource Monitor is disabled." );
             /* unset it in parsing mask to avoid dumping stats */
             parsing_mask &= ~MODULE_MASK_RES_MONITOR;
             action_mask &= ~ACTION_MASK_PURGE;
@@ -1584,7 +1639,7 @@ int main( int argc, char **argv )
         rc = Start_Rmdir( &rh_config.rmdir_config, options.flags );
         if ( rc == ENOENT )
         {
-            DisplayLog( LVL_CRIT, MAIN_TAG, "Directory removal is disabled." ); 
+            DisplayLog( LVL_CRIT, MAIN_TAG, "Directory removal is disabled." );
             /* unset it in parsing mask to avoid dumping stats */
             parsing_mask &= ~MODULE_MASK_RMDIR;
             action_mask &= ~ACTION_MASK_RMDIR;
@@ -1617,7 +1672,7 @@ int main( int argc, char **argv )
         rc = Start_HSMRm( &rh_config.hsm_rm_config, options.flags );
         if ( rc == ENOENT )
         {
-            DisplayLog( LVL_CRIT, MAIN_TAG, "HSM removal is disabled." ); 
+            DisplayLog( LVL_CRIT, MAIN_TAG, "HSM removal is disabled." );
             /* unset it in parsing mask to avoid dumping stats */
             parsing_mask &= ~MODULE_MASK_UNLINK;
             action_mask &= ~ACTION_MASK_UNLINK;

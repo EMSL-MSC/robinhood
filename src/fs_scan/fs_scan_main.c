@@ -12,7 +12,7 @@
  * accept its terms.
  */
 /**
- * FS scan stop/start routines 
+ * FS scan stop/start routines
  */
 
 #ifdef HAVE_CONFIG_H
@@ -99,33 +99,27 @@ int FSScan_Start( fs_scan_config_t *module_config, int flags, const char * parti
 }
 
 /** Wait for scan termination */
-int FSScan_Wait(  )
+void FSScan_Wait( void )
 {
     wait_scan_finished(  );
-    return 0;
 }
 
 
 /** Stop FS Scan info collector */
-int FSScan_Terminate(  )                         /* @TODO */
+void FSScan_Terminate( void )                         /* @TODO */
 {
-    int            rc;
-
     terminate = TRUE;
 
-    rc = Robinhood_StopScanModule( );
-    return rc;
+    Robinhood_StopScanModule( );
 }
 
 /** Store FS Scan into database */
-int FSScan_StoreStats( lmgr_t * lmgr )
+void FSScan_StoreStats( lmgr_t * lmgr )
 {
-    int            rc;
     robinhood_fsscan_stat_t stats;
     char           tmp_buff[256];
 
-    if ( ( rc = Robinhood_StatsScan( &stats ) ) )
-        return rc;
+    Robinhood_StatsScan( &stats );
 
     /* store the number of scanning threads */
     sprintf( tmp_buff, "%i", fs_scan_config.nb_threads_scan );
@@ -154,22 +148,18 @@ int FSScan_StoreStats( lmgr_t * lmgr )
     sprintf(tmp_buff, "%u", stats.nb_hang);
     ListMgr_SetVar( lmgr, LAST_SCAN_TIMEOUTS, tmp_buff);
 
-    return 0;
-
 }
 
 
 /** Dump FS Scan stats to log file */
-int FSScan_DumpStats(  )
+void FSScan_DumpStats( void )
 {
-    int            rc;
     robinhood_fsscan_stat_t stats;
     struct tm      paramtm;
     char           tmp_buff[256];
     char           tmp_buff2[256];
 
-    if ( ( rc = Robinhood_StatsScan( &stats ) ) )
-        return rc;
+    Robinhood_StatsScan( &stats );
 
     DisplayLog( LVL_MAJOR, "STATS", "======== FS scan statistics =========" );
 
@@ -235,9 +225,8 @@ int FSScan_DumpStats(  )
 
     }
 
-    DisplayLog( LVL_MAJOR, "STATS", "nbr of scan operations timeouts = %u", stats.nb_hang );
-
-    return 0;
+    if (stats.nb_hang > 0)
+        DisplayLog( LVL_MAJOR, "STATS", "scan operation timeouts = %u", stats.nb_hang );
 
 }
 
@@ -264,7 +253,7 @@ int FSScan_SetDefaultConfig( void *module_config, char *msg_out )
 #endif
     conf->scan_retry_delay = HOUR;
     conf->nb_threads_scan = 2;
-    conf->scan_op_timeout = HOUR;
+    conf->scan_op_timeout = 0;
     conf->exit_on_timeout = FALSE;
     conf->spooler_check_interval = MINUTE;
     conf->nb_prealloc_tasks = 256;
@@ -288,7 +277,7 @@ int FSScan_WriteDefaultConfig( FILE * output )
 #endif
     print_line( output, 1, "scan_retry_delay       :    1h" );
     print_line( output, 1, "nb_threads_scan        :     2" );
-    print_line( output, 1, "scan_op_timeout        :    1h" );
+    print_line( output, 1, "scan_op_timeout        :     0 (disabled)" );
     print_line( output, 1, "exit_on_timeout        : FALSE" );
     print_line( output, 1, "spooler_check_interval :  1min" );
     print_line( output, 1, "nb_prealloc_tasks      :   256" );
@@ -416,7 +405,7 @@ int FSScan_ReadConfig( config_file_t config, void *module_config, char *msg_out,
         return rc;
 
     rc = GetStringParam( fsscan_block, FSSCAN_CONFIG_BLOCK, "completion_command",
-                         STR_PARAM_ABSOLUTE_PATH, /* can contain wildcards: {cfg} or {fspath} */
+                         0, /* can contain wildcards: {cfg} or {fspath} */
                          conf->completion_command, RBH_PATH_MAX, NULL, NULL, msg_out );
     if ( ( rc != 0 ) && ( rc != ENOENT ) )
         return rc;
@@ -486,7 +475,7 @@ static void update_ignore( whitelist_item_t * old_items, unsigned int old_count,
         if ( (old_items[i].attr_mask != new_items[i].attr_mask)
              || compare_boolexpr( &old_items[i].bool_expr, &new_items[i].bool_expr) )
         {
-           DisplayLog( LVL_MAJOR, RELOAD_TAG, "Ignore expression #%u changed in block '%s'. Only numerical values can be modified dynamically. Ignore update cancelled", i, block_name ); 
+           DisplayLog( LVL_MAJOR, RELOAD_TAG, "Ignore expression #%u changed in block '%s'. Only numerical values can be modified dynamically. Ignore update cancelled", i, block_name );
            return;
         }
    }
@@ -500,7 +489,7 @@ static void update_ignore( whitelist_item_t * old_items, unsigned int old_count,
             char criteriastr[2048];
             BoolExpr2str( &old_items[i].bool_expr, criteriastr, 2048 );
             DisplayLog( LVL_EVENT, RELOAD_TAG, "Ignore expression #%u in block '%s' has been updated and is now: %s",
-                i, block_name, criteriastr ); 
+                i, block_name, criteriastr );
        }
    }
 
@@ -575,7 +564,7 @@ int FSScan_ReloadConfig( void *module_config )
     }
 
     if ( strcmp( conf->completion_command, fs_scan_config.completion_command ) )
-    {   
+    {
         DisplayLog( LVL_EVENT, "FS_Scan_Config",
                     FSSCAN_CONFIG_BLOCK "::completion_command updated: '%s'->'%s'",
                     fs_scan_config.completion_command, conf->completion_command );
@@ -601,7 +590,7 @@ int FSScan_ReloadConfig( void *module_config )
                    conf->ignore_list, conf->ignore_count, FSSCAN_CONFIG_BLOCK );
 
     /* free conf structure */
-    free_ignore( conf->ignore_list, conf->ignore_count ); 
+    free_ignore( conf->ignore_list, conf->ignore_count );
 
     return 0;
 }

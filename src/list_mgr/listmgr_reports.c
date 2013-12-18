@@ -24,6 +24,7 @@
 #include "RobinhoodLogs.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <inttypes.h>
 
 
 typedef struct lmgr_report_t
@@ -45,7 +46,10 @@ typedef struct lmgr_report_t
 /* Return field string */
 static inline const char *field_str( unsigned int index )
 {
-    return field_infos[index].field_name;
+    if (index == (unsigned int)-1)
+        return "id";
+    else
+        return field_infos[index].field_name;
 }
 
 
@@ -61,17 +65,18 @@ static inline const char *field_str( unsigned int index )
 
 #define field_type( _f_ )   (field_infos[_f_].db_type)
 
-static void listmgr_fieldfilter( lmgr_report_t *p_report, lmgr_t * p_mgr, 
-                                    const report_field_descr_t *report_desc_array, 
-                                    char *attrstring, char *attrname, 
-                                    char *having, char **curr_having, 
+static void listmgr_fieldfilter( lmgr_report_t *p_report, lmgr_t * p_mgr,
+                                    const report_field_descr_t *report_desc_array,
+                                    char *attrstring, char *attrname,
+                                    char *having, char **curr_having,
                                     char *where, char **curr_where , int i )
 {
     /* is this field filtered ? */
     if ( report_desc_array[i].filter )
     {
+        /* TODO support list filters (IN NOT and IN) */
         printdbtype( p_mgr, attrstring, p_report->result_type_array[i],
-                     &report_desc_array[i].filter_value );
+                     &report_desc_array[i].filter_value.value );
 
         if ( report_desc_array[i].report_type != REPORT_GROUP_BY )
         {
@@ -96,14 +101,14 @@ static void listmgr_fieldfilter( lmgr_report_t *p_report, lmgr_t * p_mgr,
 }
 
 
-static void listmgr_optimizedstat( lmgr_report_t *p_report, lmgr_t * p_mgr, 
-                                    unsigned int report_descr_count, 
+static void listmgr_optimizedstat( lmgr_report_t *p_report, lmgr_t * p_mgr,
+                                    unsigned int report_descr_count,
                                     const report_field_descr_t *report_desc_array,
                                     const profile_field_descr_t * profile_descr,
-                                    char *fields, char **curr_field, 
-                                    char *group_by, char **curr_group_by, 
-                                    char *order_by, char **curr_sort, 
-                                    char *having, char **curr_having, 
+                                    char *fields, char **curr_field,
+                                    char *group_by, char **curr_group_by,
+                                    char *order_by, char **curr_sort,
+                                    char *having, char **curr_having,
                                     char *where, char **curr_where )
 {
     char           attrstring[1024];
@@ -125,7 +130,7 @@ static void listmgr_optimizedstat( lmgr_report_t *p_report, lmgr_t * p_mgr,
     for ( i = 0; i < report_descr_count; i++ )
     {
         sprintf( attrname, "attr%u", i );
-        if( is_acct_pk( report_desc_array[i].attr_index ) || is_acct_field( report_desc_array[i].attr_index ) 
+        if( is_acct_pk( report_desc_array[i].attr_index ) || is_acct_field( report_desc_array[i].attr_index )
                             || report_desc_array[i].report_type == REPORT_COUNT )
         {
             switch ( report_desc_array[i].report_type )
@@ -158,8 +163,8 @@ static void listmgr_optimizedstat( lmgr_report_t *p_report, lmgr_t * p_mgr,
                 p_report->result_type_array[i] = DB_BIGUINT;
                 break;
             case REPORT_COUNT_DISTINCT:
-                sprintf( attrstring, "COUNT(DISTINCT(%s)) as %s",
-                         field_str( report_desc_array[i].attr_index ), attrname );
+                sprintf(attrstring, "COUNT(DISTINCT(%s)) as %s",
+                        field_str( report_desc_array[i].attr_index ), attrname);
                 add_string( fields, *curr_field, attrstring );
                 p_report->result_type_array[i] = DB_BIGUINT;
                 break;
@@ -191,8 +196,8 @@ static void listmgr_optimizedstat( lmgr_report_t *p_report, lmgr_t * p_mgr,
             add_string( fields, *curr_field, attrstring );
             p_report->result_type_array[i] = DB_TEXT;
         }
-        listmgr_fieldfilter( p_report, p_mgr, report_desc_array, attrstring, attrname, 
-                            having, curr_having, where, curr_where, i ); 
+        listmgr_fieldfilter( p_report, p_mgr, report_desc_array, attrstring, attrname,
+                            having, curr_having, where, curr_where, i );
     }
     if (profile_descr)
     {
@@ -245,7 +250,7 @@ struct lmgr_report_t *ListMgr_Report( lmgr_t * p_mgr,
      *  - List of fields to be selected
      *  - FROM clause with joins
      *  - WHERE clause (filters)
-     *  - GROUP BY clause 
+     *  - GROUP BY clause
      *  - ORBER BY clause
      */
     char           fields[1024] = "";
@@ -255,6 +260,12 @@ struct lmgr_report_t *ListMgr_Report( lmgr_t * p_mgr,
     char           group_by[512] = "";
     char           order_by[512] = "";
     char           query[4096] = "";
+
+    /* filters on NAMES or STRIPE_ITEMS
+     * must be managed differently, as they
+     * can create duplicates (non uniq id) */
+    char           name_filter_str[1024] = "";
+    char           stripe_filter_str[1024] = "";
 
     char          *curr_field = fields;
     char          *curr_group_by = group_by;
@@ -269,14 +280,19 @@ struct lmgr_report_t *ListMgr_Report( lmgr_t * p_mgr,
     lmgr_report_t *p_report;
     int            rc;
 
+    table_enum     query_tab;
+    /* supported report fields: ENTRIES, ANNEX_INFO or ACCT */
     int            main_table_flag = FALSE;
     int            annex_table_flag = FALSE;
     int            acct_table_flag = FALSE;
     int            filter_main = 0;
     int            filter_annex = 0;
+    int            filter_stripe_info = 0;
+    int            filter_stripe_items = 0;
+    int            filter_names = 0;
     int            filter_acct = 0;
     int            full_acct = TRUE;
-    lmgr_iter_opt_t opt;
+    lmgr_iter_opt_t opt = {0};
     unsigned int   profile_len = 0;
     unsigned int   ratio = 0;
 
@@ -316,16 +332,8 @@ struct lmgr_report_t *ListMgr_Report( lmgr_t * p_mgr,
     /* initialy, no char * tab allocated */
     p_report->str_tab = NULL;
 
-    if ( p_opt == NULL )
-    {
-        opt.list_count_max = 0;
-        opt.force_no_acct = FALSE;
-        opt.allow_no_attr = FALSE;
-    }
-    else
-    {
+    if (p_opt)
         opt = *p_opt;
-    }
 
     for ( i = 0; i < report_descr_count; i++ )
     {
@@ -333,7 +341,7 @@ struct lmgr_report_t *ListMgr_Report( lmgr_t * p_mgr,
 #ifdef ATTR_INDEX_dircount
                 report_desc_array[i].attr_index != ATTR_INDEX_dircount &&
 #endif
-                !is_acct_field( report_desc_array[i].attr_index ) && 
+                !is_acct_field( report_desc_array[i].attr_index ) &&
                 !is_acct_pk( report_desc_array[i].attr_index ) )
             full_acct = FALSE;
     }
@@ -352,7 +360,7 @@ struct lmgr_report_t *ListMgr_Report( lmgr_t * p_mgr,
 
     if ( full_acct && !opt.force_no_acct )
     {
-        listmgr_optimizedstat( p_report, p_mgr, report_descr_count, report_desc_array, 
+        listmgr_optimizedstat( p_report, p_mgr, report_descr_count, report_desc_array,
                                profile_descr,
                                fields, &curr_field, group_by, &curr_group_by, order_by, &curr_sort,
                                having, &curr_having, where, &curr_where);
@@ -374,7 +382,9 @@ struct lmgr_report_t *ListMgr_Report( lmgr_t * p_mgr,
 
         for ( i = 0; i < report_descr_count; i++ )
         {
-            if ( report_desc_array[i].report_type != REPORT_COUNT ) /* no field for count */
+            /* no field for count or distinct count */
+            if ( report_desc_array[i].report_type != REPORT_COUNT &&
+                 report_desc_array[i].report_type != REPORT_COUNT_DISTINCT )
             {
                 /* in what table is this field ? */
                 if ( is_main_field( report_desc_array[i].attr_index ) )
@@ -427,7 +437,7 @@ struct lmgr_report_t *ListMgr_Report( lmgr_t * p_mgr,
                 break;
             case REPORT_COUNT_DISTINCT:
                 sprintf( attrstring, "COUNT(DISTINCT(%s)) as %s",
-                         field_str( report_desc_array[i].attr_index ), attrname );
+                field_str( report_desc_array[i].attr_index ), attrname );
                 add_string( fields, curr_field, attrstring );
                 p_report->result_type_array[i] = DB_BIGUINT;
                 break;
@@ -454,7 +464,7 @@ struct lmgr_report_t *ListMgr_Report( lmgr_t * p_mgr,
             }
 
             /* is this field filtered ? */
-            listmgr_fieldfilter( p_report, p_mgr, report_desc_array, attrstring, attrname, 
+            listmgr_fieldfilter( p_report, p_mgr, report_desc_array, attrstring, attrname,
                                 having, &curr_having, where, &curr_where, i );
         }
 
@@ -493,7 +503,7 @@ struct lmgr_report_t *ListMgr_Report( lmgr_t * p_mgr,
             }
         }
 
-    } 
+    }
     /* filter */
 
     if ( p_filter )
@@ -504,42 +514,124 @@ struct lmgr_report_t *ListMgr_Report( lmgr_t * p_mgr,
                                       ( where != curr_where ), TRUE );
             curr_where += strlen( curr_where );
             if ( filter_acct )
-                acct_table_flag =TRUE;    
+                acct_table_flag =TRUE;
         }
         else
         {
+            /* filter on main table? */
             filter_main = filter2str( p_mgr, curr_where, p_filter, T_MAIN,
                                       ( where != curr_where ), TRUE );
             curr_where += strlen( curr_where );
-        
+
             if ( filter_main )
                 main_table_flag = TRUE;
+
+            /* filter on annex table? */
             if ( annex_table )
             {
                 filter_annex = filter2str( p_mgr, curr_where, p_filter, T_ANNEX,
-                                           ( filter_main > 0 ), TRUE );
+                                           (where != curr_where), TRUE );
                 curr_where += strlen( curr_where );
 
                 if ( filter_annex )
                     annex_table_flag = TRUE;
             }
-        }
-        /* XXX ignore filters on stripe for now */
-    }
-    
 
-    /* from clause */
+            filter_stripe_info =
+                filter2str( p_mgr, curr_where, p_filter, T_STRIPE_INFO,
+                            (where != curr_where), TRUE );
+            curr_where += strlen( curr_where );
+
+           /*  filter on names table is particular as this may duplicate
+             * entries when computing the report (multiple hardlinks) */
+            filter_names = filter2str(p_mgr, name_filter_str, p_filter, T_DNAMES,
+                                      FALSE, FALSE );
+
+           /*  filter on stripe items table is particular as this may duplicate
+             * entries when computing the report (multiple stripes) */
+            filter_stripe_items = filter2str(p_mgr, stripe_filter_str, p_filter,
+                                             T_STRIPE_ITEMS, FALSE, FALSE);
+        }
+    }
+
+    /* FROM clause */
 
     if ( acct_table_flag )
+    {
         strcpy( from, ACCT_TABLE );
-    else if ( main_table_flag && annex_table_flag )
-        strcpy( from, MAIN_TABLE " LEFT JOIN " ANNEX_TABLE " ON "
-                MAIN_TABLE ".id = " ANNEX_TABLE ".id" );
-    else if ( main_table_flag )
-        strcpy( from, MAIN_TABLE );
-    else if ( annex_table_flag )
-        strcpy( from, ANNEX_TABLE );
+        query_tab = T_ACCT;
+    }
+    else
+    {
+        const char * first_table = NULL;
+        char * curr_from = from;
+        if ( main_table_flag ) {
+            strcpy(from, MAIN_TABLE);
+            curr_from = from + strlen(from);
+            first_table = MAIN_TABLE;
+            query_tab = T_MAIN;
+        }
 
+        if ( annex_table_flag )
+        {
+            if (first_table)
+                curr_from += sprintf(curr_from, " LEFT JOIN "ANNEX_TABLE" ON %s.id="ANNEX_TABLE".id",
+                                     first_table);
+            else
+            {
+                strcpy(from, ANNEX_TABLE);
+                curr_from = from + strlen(from);
+                first_table = ANNEX_TABLE;
+                query_tab = T_ANNEX;
+            }
+        }
+        if ( filter_stripe_info )
+        {
+            if (first_table)
+                curr_from += sprintf(curr_from, " INNER JOIN "STRIPE_INFO_TABLE" ON %s.id="STRIPE_INFO_TABLE".id",
+                                     first_table);
+            else
+            {
+                strcpy(from, STRIPE_INFO_TABLE);
+                curr_from = from + strlen(from);
+                first_table = STRIPE_INFO_TABLE;
+                query_tab = T_STRIPE_INFO;
+            }
+        }
+        if (filter_names)
+        {
+            if (first_table)
+                curr_from += sprintf(curr_from," INNER JOIN (SELECT DISTINCT(id)"
+                                     " FROM "DNAMES_TABLE" WHERE %s) N"
+                                     " ON %s.id=N.id", name_filter_str,
+                                     first_table);
+            else
+            {
+                DisplayLog(LVL_CRIT, LISTMGR_TAG, "Unexpected case: "DNAMES_TABLE
+                           " table can't be the query table in %s()", __func__);
+                goto free_field_tab;
+            }
+        }
+
+        if (filter_stripe_items)
+        {
+            if (first_table)
+                curr_from += sprintf(curr_from, " INNER JOIN (SELECT DISTINCT(id)"
+                                     " FROM "STRIPE_ITEMS_TABLE" WHERE %s) SI"
+                                     " ON %s.id=SI.id", stripe_filter_str,
+                                     first_table);
+            else
+            {
+                strcpy(from, STRIPE_ITEMS_TABLE);
+                curr_from = from + strlen(from);
+                strcpy(curr_where, stripe_filter_str);
+                curr_where += strlen(curr_where);
+                first_table = STRIPE_ITEMS_TABLE;
+                query_tab = T_STRIPE_ITEMS;
+                /* XXX the caller is supposed to select DISTINCT(id) in this case */
+            }
+        }
+    }
 
     /* Build the request */
 
@@ -669,7 +761,7 @@ int ListMgr_GetNextReportItem( struct lmgr_report_t *p_iter, db_value_t * p_valu
     {
         if (p_iter->profile_attr == ATTR_INDEX_size)
         {
-            db_type_u dbval; 
+            db_type_u dbval;
             for (i=0; i < p_iter->profile_count; i++)
             {
                 unsigned int idx = p_iter->result_count - p_iter->profile_count
@@ -710,3 +802,26 @@ void ListMgr_CloseReport( struct lmgr_report_t *p_iter )
     MemFree( p_iter->result_type_array );
     MemFree( p_iter );
 }
+
+int ListMgr_EntryCount(lmgr_t * p_mgr, uint64_t *count)
+{
+    int            rc;
+    result_handle_t result;
+    char          *str_count = NULL;
+
+    /* execute the request */
+    rc = db_exec_sql( &p_mgr->conn, "SELECT COUNT(*) FROM " MAIN_TABLE, &result );
+    if ( rc )
+        return rc;
+
+    rc = db_next_record( &p_mgr->conn, &result, &str_count, 1 );
+    if (rc)
+        return rc;
+
+    if ( sscanf( str_count, "%"SCNu64, count ) != 1 )
+        rc = DB_REQUEST_FAILED;
+
+    db_result_free( &p_mgr->conn, &result );
+    return rc;
+}
+

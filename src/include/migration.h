@@ -37,10 +37,19 @@ typedef struct migration_config_t
     time_t         pre_maintenance_window;
     time_t         maint_min_migr_delay;
 
+    /* min error percentage to suspend current migration (0=disable) */
+    double         suspend_error_pct;
+    /* min error count to suspend current migration (0=disable) */
+    unsigned int   suspend_error_min;
+
+    /* attr index of the sort order (e.g. last_mod, creation_time, ...) */
+    unsigned int   lru_sort_attr;
+
 #if defined( _LUSTRE_HSM) || defined(_HSM_LITE)
     unsigned int   backup_new_files:1;
 #endif
     unsigned int   check_copy_status_on_startup:1;
+    unsigned int   recheck_ignored_classes:1;
 
 } migration_config_t;
 
@@ -76,9 +85,9 @@ typedef struct migr_opt_t
 
 
 int            Start_Migration( migration_config_t * p_config, migr_opt_t options );
-int            Stop_Migration();
-int            Wait_Migration();
-void           Dump_Migration_Stats(  );
+int            Stop_Migration( void );
+int            Wait_Migration( void );
+void           Dump_Migration_Stats( void );
 
 int MigrateSingle( migration_config_t * p_config, const char * file, int flags );
 

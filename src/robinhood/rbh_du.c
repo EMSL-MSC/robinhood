@@ -243,7 +243,7 @@ static void print_stats(const char * name, stats_du_t * stats)
 }
 
 /* build filters depending on program options */
-static int mkfilters()
+static int mkfilters( void )
 {
 #ifdef ATTR_INDEX_status
     filter_value_t fv;
@@ -294,7 +294,7 @@ static int mkfilters()
     if (prog_options.match_status)
     {
         /* not part of user policies, only add it to DB filter */
-        fv.val_uint = prog_options.status;
+        fv.value.val_uint = prog_options.status;
         lmgr_simple_filter_add( &entry_filter, ATTR_INDEX_status, EQUAL, fv, 0 );
         lmgr_simple_filter_add( &parent_filter, ATTR_INDEX_status, EQUAL, fv, 0 );
     }
@@ -377,8 +377,6 @@ static inline void display_version( char *bin_name )
     printf( "    Lustre-HSM Policy Engine\n" );
 #elif defined(_TMP_FS_MGR)
     printf( "    Temporary filesystem manager\n" );
-#elif defined(_SHERPA)
-    printf( "    SHERPA cache zapper\n" );
 #elif defined(_HSM_LITE)
     printf( "    Backup filesystem to external storage\n" );
 #else
@@ -456,14 +454,14 @@ static int get_root_id(entry_id_t * root_id)
 
 #define REPCNT    4
 static report_field_descr_t dir_info[REPCNT] = {
-    {ATTR_INDEX_type, REPORT_GROUP_BY, SORT_NONE, FALSE, 0, {NULL}},
-    {0, REPORT_COUNT, SORT_NONE, FALSE, 0, {NULL}},
-    {ATTR_INDEX_blocks, REPORT_SUM, SORT_NONE, FALSE, 0, {NULL}},
-    {ATTR_INDEX_size, REPORT_SUM, SORT_NONE, FALSE, 0, {NULL}}
+    {ATTR_INDEX_type, REPORT_GROUP_BY, SORT_NONE, FALSE, 0, FV_NULL},
+    {0, REPORT_COUNT, SORT_NONE, FALSE, 0, FV_NULL},
+    {ATTR_INDEX_blocks, REPORT_SUM, SORT_NONE, FALSE, 0, FV_NULL},
+    {ATTR_INDEX_size, REPORT_SUM, SORT_NONE, FALSE, 0, FV_NULL}
 };
 
 /* directory callback */
-static int dircb(entry_id_t * id_list, attr_set_t * attr_list,
+static int dircb(wagon_t * id_list, attr_set_t * attr_list,
                  unsigned int entry_count, void * arg)
 {
     /* sum child entries stats for all directories */
@@ -478,7 +476,7 @@ static int dircb(entry_id_t * id_list, attr_set_t * attr_list,
 
     for (i = 0; i < entry_count; i++)
     {
-        fv.val_id = id_list[i];
+        fv.value.val_id = id_list[i].id;
         rc = lmgr_simple_filter_add_or_replace( &parent_filter,
                                                 ATTR_INDEX_parent_id,
                                                 EQUAL,
@@ -577,7 +575,7 @@ static int list_all(stats_du_t * stats, int display_stats)
  */
 static int list_content(char ** id_list, int id_count)
 {
-    entry_id_t * ids;
+    wagon_t *ids;
     int i, rc;
     attr_set_t root_attrs;
     entry_id_t root_id;
@@ -591,7 +589,7 @@ static int list_content(char ** id_list, int id_count)
     if (rc)
         return rc;
 
-    ids = MemCalloc(id_count, sizeof(entry_id_t));
+    ids = MemCalloc(id_count, sizeof(wagon_t));
     if (!ids)
         return -ENOMEM;
 
@@ -602,20 +600,31 @@ static int list_content(char ** id_list, int id_count)
 
         is_id = TRUE;
         /* is it a path or fid? */
-        if (sscanf(id_list[i], SFID, RFID(&ids[i])) != FID_SCAN_CNT)
+        if (sscanf(id_list[i], SFID, RFID(&ids[i].id)) != FID_SCAN_CNT)
         {
             is_id = FALSE;
             /* take it as a path */
-            rc = Path2Id(id_list[i], &ids[i]);
-            if (rc)
-            {
-                DisplayLog(LVL_MAJOR, DU_TAG, "Invalid parameter: %s: %s",
-                           id_list[i], strerror(-rc));
-                goto out;
-            }
+            rc = Path2Id(id_list[i], &ids[i].id);
+            if (!rc)
+                ids[i].fullname = id_list[i];
+        } else {
+#if _HAVE_FID
+            /* Take it as an FID. */
+            char path[RBH_PATH_MAX];
+            rc = Lustre_GetFullPath( &ids[i].id, path, sizeof(path));
+            if (!rc)
+                ids[i].fullname = strdup(path);
+#endif
         }
 
-        if (entry_id_equal(&ids[i], &root_id))
+        if (rc)
+        {
+            DisplayLog(LVL_MAJOR, DU_TAG, "Invalid parameter: %s: %s",
+                       id_list[i], strerror(-rc));
+            goto out;
+        }
+
+        if (entry_id_equal(&ids[i].id, &root_id))
         {
             /* the ID is FS root: use list_all instead */
             DisplayLog(LVL_DEBUG, DU_TAG, "Optimization: command argument is filesystem's root: performing bulk sum in DB");
@@ -627,7 +636,7 @@ static int list_content(char ** id_list, int id_count)
 
         /* get root attrs to print it (if it matches program options) */
         root_attrs.attr_mask = disp_mask | query_mask;
-        rc = ListMgr_Get(&lmgr, &ids[i], &root_attrs);
+        rc = ListMgr_Get(&lmgr, &ids[i].id, &root_attrs);
         if (rc == 0)
             dircb(&ids[i], &root_attrs, 1, stats);
         else
@@ -646,7 +655,7 @@ static int list_content(char ** id_list, int id_count)
                     ListMgr_GenerateFields( &root_attrs, disp_mask | query_mask);
                 }
             }
-            else if (entry_id_equal(&ids[i], &root_id))
+            else if (entry_id_equal(&ids[i].id, &root_id))
             {
                 /* this is root id */
                 struct stat st;
@@ -664,7 +673,7 @@ static int list_content(char ** id_list, int id_count)
         }
 
         /* sum root if it matches */
-        if (!is_expr || (EntryMatches(&ids[i], &root_attrs,
+        if (!is_expr || (EntryMatches(&ids[i].id, &root_attrs,
                          &match_expr, NULL) == POLICY_MATCH))
         {
             unsigned int idx = ListMgr2PolicyType(ATTR(&root_attrs, type));
@@ -677,6 +686,7 @@ static int list_content(char ** id_list, int id_count)
         {
             /* if not group all, run and display stats now */
             rc = rbh_scrub(&lmgr, &ids[i], 1, disp_mask, dircb, stats);
+
             if (rc)
                 return rc;
 
@@ -715,6 +725,7 @@ int main( int argc, char **argv )
     int            rc;
     int            chgd = 0;
     char           err_msg[4096];
+    char           badcfg[RBH_PATH_MAX];
 
     /* parse command line options */
     while ((c = getopt_long(argc, argv, SHORT_OPT_STRING, option_tab,
@@ -814,9 +825,9 @@ int main( int argc, char **argv )
 
 
     /* get default config file, if not specified */
-    if ( SearchConfig( config_file, config_file, &chgd ) != 0 )
+    if ( SearchConfig( config_file, config_file, &chgd, badcfg ) != 0 )
     {
-        fprintf(stderr, "No config file found\n" );
+        fprintf(stderr, "No config file (or too many) found matching %s\n", badcfg);
         exit(2);
     }
     else if (chgd)

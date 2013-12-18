@@ -26,16 +26,19 @@ extern entry_queue_t migr_queue;
 typedef enum
 {
     MIGR_OK = 0,                                 /* migration has been started correctly */
+
     MIGR_ENTRY_MOVED,           /* entry has been moved or deleted */
     MIGR_ENTRY_WHITELISTED,     /* entry is ignored for migration */
     MIGR_STATUS_CHGD,           /* HSM status flags has changed */
     MIGR_NO_POLICY,             /* entry matches no policy */
+    MIGR_BAD_TYPE,              /* migration policy does not apply to this type of entry */
     MIGR_BUSY,                  /* entry is is use */
     MIGR_ALREADY,               /* entry migration is already running */
+
     MIGR_PARTIAL_MD,            /* entry metadata is incomplete */
     MIGR_STAT_FAILURE,          /* stat failure */
-    MIGR_BAD_TYPE,              /* migration policy does not apply to this type of entry */
     MIGR_ERROR,                 /* migration call failed */
+
     MIGR_ABORT,                 /* migration aborted by signal */
 
     MIGR_ST_COUNT               /* last status index */
@@ -52,12 +55,14 @@ static const char __attribute__(( __unused__ )) *migr_status_descr[MIGR_ST_COUNT
     "whitelisted/ignored",
     "status flags have changed",
     "no matching policy",
+    "bad type for migration",
     "entry is in use/busy",
     "migration already running",
+
     "incomplete metadata",
     "stat failure",
-    "bad type for migration",
     "migration error",
+
     "migration aborted"
 };
 
@@ -66,6 +71,7 @@ typedef enum
 {
     MIGR_FDBK_NBR = 0,
     MIGR_FDBK_VOL,
+    MIGR_FDBK_VOL_NOK,
 
     MIGR_FDBK_COUNT
 } migr_fdbk_t;
@@ -104,7 +110,7 @@ int  check_current_migrations( lmgr_t * lmgr, unsigned int *p_nb_reset,
                                unsigned int * p_nb_total,
                                time_t timeout );
 
-void abort_migration();
+void abort_migration( void );
 
 int            migrate_one_file( const char * file, int flags );
 

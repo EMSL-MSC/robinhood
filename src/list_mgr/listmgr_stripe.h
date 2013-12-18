@@ -18,11 +18,18 @@
 #ifndef _LISTMGR_STRIPE_H
 #define _LISTMGR_STRIPE_H
 
-int            delete_stipe_info( lmgr_t * p_mgr, PK_ARG_T pk );
 int            insert_stripe_info( lmgr_t * p_mgr, PK_ARG_T pk,
                                    int validator, const stripe_info_t * p_stripe,
                                    const stripe_items_t * p_items,
                                    int update_if_exists );
+int            update_stripe_info( lmgr_t * p_mgr, PK_ARG_T pk,
+                                   int validator, const stripe_info_t * p_stripe,
+                                   const stripe_items_t * p_items,
+                                   int insert_if_absent );
+int batch_insert_stripe_info(lmgr_t *p_mgr, pktype *pklist, int *validators,
+                             attr_set_t **p_attrs,
+                             unsigned int count, int update_if_exists);
+
 int            get_stripe_info( lmgr_t * p_mgr, PK_ARG_T pk, stripe_info_t * p_stripe,
                                 stripe_items_t * p_items );
 void           free_stripe_items( stripe_items_t * p_stripe_items );

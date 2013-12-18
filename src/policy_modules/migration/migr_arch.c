@@ -26,10 +26,6 @@
 #include "Memory.h"
 #include "xplatform_print.h"
 
-#ifdef _SHERPA
-#include <SHERPA_CacheAcces.h>
-#include <SHERPA_CacheAccesP.h>
-#endif
 #ifdef _HSM_LITE
 #include "backend_mgr.h"
 #include "backend_ext.h"
@@ -49,6 +45,17 @@ migration_config_t migr_config;
 
 static int migr_flags = 0;
 static int migr_abort = FALSE;
+
+static time_t first_eligible = 0;
+
+struct __migr_info {
+    time_t  migr_start;
+    time_t  last_report;
+    unsigned int migr_count;
+    unsigned long migr_vol;
+    unsigned int skipped;
+    unsigned int errors;
+} migration_info;
 
 static const policy_modifier_t * migr_pol_mod = NULL;
 
@@ -70,38 +77,22 @@ void abort_migration()
  */
 
 #ifdef _LUSTRE_HSM
-static migr_status_t MigrateEntry_ByFid( const entry_id_t * p_entry_id,
-                                         char *hints, unsigned int archive_num )
+static migr_status_t MigrateEntry_ByFid(const entry_id_t * p_entry_id,
+                                        char *hints, unsigned int archive_id)
 {
-    if ( hints )
-        DisplayLog( LVL_EVENT, MIGR_TAG,
-            "Start archiving(" DFID_NOBRACE ", hints='%s', archive_num=%u)",
-            PFID( p_entry_id ), hints, archive_num );
+    if (hints)
+        DisplayLog(LVL_EVENT, MIGR_TAG,
+                 "Start archiving(" DFID_NOBRACE ", hints='%s', archive_id=%u)",
+                 PFID(p_entry_id), hints, archive_id);
     else
-        DisplayLog( LVL_EVENT, MIGR_TAG,
-            "Start archiving(" DFID_NOBRACE ", <no_hints>, archive_num=%u)",
-             PFID( p_entry_id ), archive_num );
+        DisplayLog(LVL_EVENT, MIGR_TAG,
+                 "Start archiving(" DFID_NOBRACE ", <no_hints>, archive_id=%u)",
+                 PFID(p_entry_id), archive_id);
 
     if (dry_run)
         return MIGR_OK;
 
-    return LustreHSM_Action( HUA_ARCHIVE, p_entry_id, hints, archive_num );
-}
-#elif defined(_SHERPA)
-static migr_status_t MigrateEntry_ByPath( const char * path, char *hints )
-{
-    char tmp[1024];
-    if ( hints )
-        DisplayLog( LVL_EVENT, MIGR_TAG,
-            "Starting sherpa_majref('%s', hints='%s')", path, hints );
-    else
-        DisplayLog( LVL_EVENT, MIGR_TAG,
-            "Starting sherpa_majref('%s', <no_hints>)", path );
-
-    if (dry_run)
-        return MIGR_OK;
-
-    return sherpa_maj_reference_entree(path, NULL, tmp, SHERPA_FLAG_ZAPPER);
+    return LustreHSM_Action(HUA_ARCHIVE, p_entry_id, hints, archive_id);
 }
 #elif defined(_HSM_LITE)
 
@@ -175,8 +166,10 @@ static void FreeMigrItem( migr_item_t * item )
     MemFree( item );
 }
 
+#define sort_attr_name  (field_infos[migr_config.lru_sort_attr].field_name)
 
-static int heuristic_end_of_list( time_t last_mod_time )
+
+static int heuristic_end_of_list( time_t last_time )
 {
     entry_id_t     void_id;
     attr_set_t     void_attr;
@@ -185,42 +178,75 @@ static int heuristic_end_of_list( time_t last_mod_time )
     if ( ignore_policies )
         return FALSE;
 
-    /* XXX Tip for optimization:
-     * we build a void entry with last_mod = last_mod_time
-     * and last_archive_time = last_mod_time.
-     * If it doesn't match any policy, next entries won't match too
-     * because entries are sorted by last modification time,
-     * so it is not necessary to continue.
-     * (Note that we have last_archive_time < last_modification_time (entry is dirty)).
-     * and creation_time < last_modification_time (except for faked mtime)
-     */
     memset( &void_id, 0, sizeof( entry_id_t ) );
     memset( &void_attr, 0, sizeof( attr_set_t ) );
-
     ATTR_MASK_INIT( &void_attr );
-    ATTR_MASK_SET( &void_attr, last_mod );
-    ATTR( &void_attr, last_mod ) = last_mod_time;
-#ifdef ATTR_INDEX_last_archive
-    ATTR_MASK_SET( &void_attr, last_archive );
-    ATTR( &void_attr, last_archive ) = last_mod_time;
-#endif
-#ifdef ATTR_INDEX_creation_time
-    ATTR_MASK_SET( &void_attr, creation_time );
-    ATTR( &void_attr, creation_time ) = last_mod_time;
-#endif
 
+    /* Optimization: we build a void entry with time attr = current sort attr
+     * If it doesn't match any policy, next entries won't match too
+     * because entries are sorted by this attribute, so it is not necessary
+     * to continue. */
+
+    /* We have creation_time <= last_archive <= last mod (entry is dirty) <= last_access
+     * so we can guess a maximum value for other times.
+     * E.g. if entry matches age > x with all times = last_access value
+     * it will match for older times.
+     */
+    if (migr_config.lru_sort_attr == ATTR_INDEX_last_access)
+    {
+        ATTR_MASK_SET( &void_attr, last_access );
+        ATTR( &void_attr, last_access ) = last_time;
+    }
+    if (migr_config.lru_sort_attr == ATTR_INDEX_last_mod ||
+        migr_config.lru_sort_attr == ATTR_INDEX_last_access)
+    {
+        ATTR_MASK_SET( &void_attr, last_mod );
+        ATTR( &void_attr, last_mod ) = last_time;
+    }
+    if (migr_config.lru_sort_attr == ATTR_INDEX_last_archive ||
+        migr_config.lru_sort_attr == ATTR_INDEX_last_mod ||
+        migr_config.lru_sort_attr == ATTR_INDEX_last_access)
+    {
+        ATTR_MASK_SET( &void_attr, last_archive );
+        ATTR( &void_attr, last_archive ) = last_time;
+    }
+#ifdef ATTR_INDEX_creation_time
+    if (migr_config.lru_sort_attr == ATTR_INDEX_creation_time
+        || migr_config.lru_sort_attr == ATTR_INDEX_last_mod
+        || migr_config.lru_sort_attr == ATTR_INDEX_last_archive
+        || migr_config.lru_sort_attr == ATTR_INDEX_last_access)
+    {
+        ATTR_MASK_SET( &void_attr, creation_time );
+        ATTR( &void_attr, creation_time ) = last_time;
+    }
+#endif
 
     if ( PolicyMatchAllConditions( &void_id, &void_attr, MIGR_POLICY,
                                    migr_pol_mod ) == POLICY_NO_MATCH )
     {
         DisplayLog( LVL_DEBUG, MIGR_TAG,
-                    "Optimization: entries with modification time later than %lu"
+                    "Optimization: entries with %s later than %lu"
                     " cannot match any policy condition. Stop retrieving DB entries.",
-                    last_mod_time );
+                    sort_attr_name, last_time );
         return TRUE;
     }
     else
         return FALSE;
+}
+
+
+static inline int get_sort_attr(const attr_set_t * p_attrs)
+{
+    if (migr_config.lru_sort_attr == ATTR_INDEX_creation_time)
+        return (ATTR_MASK_TEST(p_attrs, creation_time) ? ATTR(p_attrs, creation_time) : -1);
+    else if (migr_config.lru_sort_attr == ATTR_INDEX_last_mod)
+        return (ATTR_MASK_TEST(p_attrs, last_mod) ? ATTR(p_attrs, last_mod) : -1);
+    else if (migr_config.lru_sort_attr == ATTR_INDEX_last_access)
+        return (ATTR_MASK_TEST(p_attrs, last_access) ? ATTR(p_attrs, last_access) : -1);
+    else if (migr_config.lru_sort_attr == ATTR_INDEX_last_archive)
+        return (ATTR_MASK_TEST(p_attrs, last_archive) ? ATTR(p_attrs, last_archive) : -1);
+    else
+        return -1;
 }
 
 
@@ -238,10 +264,41 @@ static inline unsigned int ack_count( const unsigned int *status_tab )
     return sum;
 }
 
+static inline unsigned int skipped_count( const unsigned int *status_tab)
+{
+    int i;
+    unsigned int nb = 0;
+
+    /* skipped if it has changed, is whitelisted, matches no policy, is in use, already archiving,
+     * type not supported for archiving...
+     * i.e. status in MIGR_ENTRY_MOVED, MIGR_ENTRY_WHITELISTED, MIGR_STATUS_CHGD, MIGR_NO_POLICY,
+     * MIGR_BAD_TYPE, MIGR_BUSY, MIGR_ALREADY
+     */
+    for (i = MIGR_ENTRY_MOVED ; i <= MIGR_ALREADY; i++)
+        nb += status_tab[i];
+
+    return nb;
+}
+
+static inline unsigned int error_count( const unsigned int *status_tab)
+{
+    int i;
+    unsigned int nb = 0;
+
+    /* next status are errors */
+    for (i = MIGR_PARTIAL_MD ; i <= MIGR_ERROR; i++)
+        nb += status_tab[i];
+
+    return nb;
+}
+
+
 /* return 0 if limit is not reached, a non null value else */
 static inline int check_migration_limit( unsigned int count, unsigned long long vol,
-                                         int verbose )
+                                         unsigned int errors, int verbose )
 {
+    unsigned int total = count + errors;
+
     if ( no_limit )
         return 0;
 
@@ -257,6 +314,23 @@ static inline int check_migration_limit( unsigned int count, unsigned long long 
                     "max migration volume %llu is reached.", migr_config.max_migr_vol);
         return 1;
     }
+
+    if ((migr_config.suspend_error_pct > 0.0)
+        && (migr_config.suspend_error_min > 0)
+        && (errors >= migr_config.suspend_error_min))
+    {
+        /* total >= errors >= suspend_error_min  > 0 */
+        double pct = 100.0 * (float)errors/(float)total;
+        if (pct >= migr_config.suspend_error_pct)
+        {
+            DisplayLog(verbose ? LVL_EVENT : LVL_DEBUG, MIGR_TAG,
+                       "error count %u >= %u, error rate %.2f%% >= %.2f => suspending migration",
+                       errors, migr_config.suspend_error_min,
+                       pct, migr_config.suspend_error_pct);
+            return 1;
+        }
+    }
+
     return 0;
 }
 
@@ -280,7 +354,85 @@ static int set_migr_optimization_filters(lmgr_filter_t * p_filter)
         }
     }
 
+    if (!migr_config.recheck_ignored_classes)
+    {
+        int i;
+        filter_value_t fval;
+        /* don't select files in ignored classes */
+        for (i = 0; i < policies.migr_policies.ignore_count; i++)
+        {
+            int flags = 0;
+            fval.value.val_str = policies.migr_policies.ignore_list[i]->fileset_id;
+            if (i == 0)
+                flags = FILTER_FLAG_NOT | FILTER_FLAG_ALLOW_NULL;
+            else
+                flags = FILTER_FLAG_NOT;
+            lmgr_simple_filter_add( p_filter, ATTR_INDEX_archive_class, EQUAL, fval, flags );
+        }
+    }
+
+    /* avoid re-checking all old whitelisted entries at the beginning of the list,
+     * so start from the first non-whitelisted file.
+     * restart from initial file when no migration could be done. */
+    if (first_eligible)
+    {
+        filter_value_t fval;
+        char datestr[128];
+        struct tm ts;
+
+        fval.value.val_uint = first_eligible;
+        lmgr_simple_filter_add( p_filter, migr_config.lru_sort_attr, MORETHAN, fval, 0 );
+
+        strftime( datestr, 128, "%Y/%m/%d %T", localtime_r( &first_eligible, &ts ) );
+        DisplayLog( LVL_EVENT, MIGR_TAG, "Optimization: considering entries with %s newer than %s",
+                    sort_attr_name, datestr );
+    }
+
     return 0;
+}
+
+static void report_progress(const unsigned long long * pass_begin, const unsigned long long * pass_current,
+                            const unsigned int * status_tab_begin, const unsigned int * status_tab_current)
+{
+    /* migration_info contains the stats for the last pass */
+    unsigned int migr_count = migration_info.migr_count;
+    unsigned long migr_vol = migration_info.migr_vol;
+    unsigned int nb_skipped = migration_info.skipped;
+    unsigned int nb_errors = migration_info.errors;
+
+    /* add stats for the current pass */
+    if (pass_begin && pass_current)
+    {
+        migr_vol += pass_current[MIGR_FDBK_VOL] - pass_begin[MIGR_FDBK_VOL];
+        migr_count += pass_current[MIGR_FDBK_NBR] - pass_begin[MIGR_FDBK_NBR];
+    }
+    if (status_tab_begin && status_tab_current)
+    {
+        nb_skipped = skipped_count(status_tab_current)
+                        - skipped_count(status_tab_begin);
+        nb_errors = error_count(status_tab_current)
+                        - error_count(status_tab_begin);
+    }
+
+    /* say hello every runtime interval */
+    if (time(NULL) - migration_info.last_report >= migr_config.runtime_interval)
+    {
+        char buf1[128];
+        char buf2[128];
+        char buf3[128];
+        unsigned int spent = time(NULL) - migration_info.migr_start;
+        if (spent == 0)
+            return;
+        FormatDuration(buf1, 128, spent);
+        FormatFileSize(buf2, 128, migr_vol);
+        FormatFileSize(buf3, 128, migr_vol/spent);
+
+        DisplayLog(LVL_EVENT, MIGR_TAG, "Migration is running (started %s ago): %u files migrated (%.2f/sec); "
+                   "volume: %s (%s/sec); skipped: %u; errors: %u", buf1,
+                   migr_count, (float)migr_count/(float)spent, buf2, buf3,
+                   nb_skipped, nb_errors);
+        migration_info.last_report = time(NULL);
+    }
 }
 
 /** wait until the queue is empty or migrations timed-out.
@@ -291,10 +443,10 @@ static int wait_queue_empty( unsigned int nb_submitted,
                              const unsigned long long * feedback_init,
                              const unsigned int * status_tab_init,
                              unsigned long long * feedback_after,
+                             unsigned int * status_tab_after,
                              int long_sleep )
 {
     unsigned int nb_in_queue, nb_migr_pending;
-    unsigned int   status_tab[MIGR_ST_COUNT];
 
     /* Wait for end of migration pass */
     do
@@ -304,14 +456,14 @@ static int wait_queue_empty( unsigned int nb_submitted,
 
         RetrieveQueueStats( &migr_queue, NULL, &nb_in_queue,
                             &last_push, &last_pop, &last_ack,
-                            status_tab, feedback_after );
+                            status_tab_after, feedback_after );
 
         /* the last time a request was pushed/poped/acknowledged */
         last_activity = MAX3( last_push, last_pop, last_ack );
 
         /* nb of migr operation pending = nb_enqueued - ( nb ack after - nb ack before ) */
-        nb_migr_pending = nb_submitted + ack_count( status_tab_init )
-                            - ack_count( status_tab );
+        nb_migr_pending = nb_submitted - (ack_count(status_tab_after)
+                                          - ack_count(status_tab_init));
 
         if ( ( nb_in_queue != 0 ) || ( nb_migr_pending != 0 ) )
         {
@@ -326,6 +478,8 @@ static int wait_queue_empty( unsigned int nb_submitted,
                 return ETIME;
             }
 
+            report_progress(feedback_init, feedback_after, status_tab_init, status_tab_after);
+
             DisplayLog( LVL_DEBUG, MIGR_TAG,
                         "Waiting for the end of this migr pass: "
                         "still %u files to be archived "
@@ -338,7 +492,7 @@ static int wait_queue_empty( unsigned int nb_submitted,
             if ( long_sleep )
                 rh_sleep( CHECK_MIGR_INTERVAL );
             else
-                rh_usleep( 1000 );
+                rh_usleep( 1000 ); /* 1ms */
         }
         else
             DisplayLog( LVL_DEBUG, MIGR_TAG, "End of this migration pass" );
@@ -347,6 +501,76 @@ static int wait_queue_empty( unsigned int nb_submitted,
     while ( ( nb_in_queue != 0 ) || ( nb_migr_pending != 0 ) );
 
     return 0;
+}
+
+/* check if enqueued entries reach the limit.
+ * If so, wait for a while to recheck after some entries have been processed.
+ * return if no more entries are pending,
+ *     or if the limit is not reached
+ *     or if the limit is definitely reached.
+ *  return != 0 if migration must stop, 0 else
+ */
+static int check_queue_limit(unsigned int nb_submitted,
+                             unsigned long long vol_submitted,
+                             const unsigned long long * feedback_before,
+                             const unsigned int *status_before)
+{
+    unsigned int nb_in_queue, nb_ok, nb_err, nb_sk, nb_pending;
+    unsigned long long vol_ok, vol_pending;
+    unsigned long long feedback_after[MIGR_FDBK_COUNT];
+    unsigned int   status_after[MIGR_ST_COUNT];
+    unsigned int delay = 10000; /* 10ms */
+#define DELAY_MAX   1000000 /* 1s */
+
+    do {
+        RetrieveQueueStats( &migr_queue, NULL, &nb_in_queue, NULL, NULL, NULL,
+                            status_after, feedback_after );
+        nb_ok = status_after[MIGR_OK] - status_before[MIGR_OK] + migration_info.migr_count;
+        vol_ok = feedback_after[MIGR_FDBK_VOL] - feedback_before[MIGR_FDBK_VOL] + migration_info.migr_vol;
+        nb_err = error_count(status_after) - error_count(status_before) + migration_info.errors;
+        nb_sk = skipped_count(status_after) - skipped_count(status_before) + migration_info.skipped ;
+
+        nb_pending = nb_submitted - (ack_count(status_after) - ack_count(status_before));
+        vol_pending = vol_submitted - (feedback_after[MIGR_FDBK_VOL] - feedback_before[MIGR_FDBK_VOL])
+                                    - (feedback_after[MIGR_FDBK_VOL_NOK] - feedback_before[MIGR_FDBK_VOL_NOK]);
+
+        /* 1) check the limit of acknowledged status
+         * 1 => stop
+         */
+        if (check_migration_limit(nb_ok, vol_ok, nb_err, FALSE))
+            return TRUE;
+
+        /* 2) queue is empty and limit is not reached */
+        /* nb of migr operation pending = nb_enqueued - ( nb ack after - nb ack before ) */
+        if (nb_pending == 0)
+        {
+            DisplayLog(LVL_FULL, MIGR_TAG, "queue is empty => continuing");
+            return FALSE;
+        }
+
+        /* check the potential limit of acknowledged + pending
+         * 0 => continue enqueuing
+         * 1 => wait and retry
+         */
+        DisplayLog(LVL_FULL, MIGR_TAG, "OK requests + pending = %u", nb_ok + nb_pending);
+        if (check_migration_limit(nb_ok + nb_pending, vol_ok + vol_pending, nb_err, FALSE))
+        {
+            DisplayLog(LVL_DEBUG, MIGR_TAG,
+                       "Limit potentially reached (%u requests successful, "
+                       "%u requests in queue, volume: %Lu done, %Lu pending), "
+                       "waiting %ums before re-checking.", nb_ok, nb_pending,
+                       vol_ok, vol_pending, delay/1000);
+            rh_usleep(delay);
+            delay *= 2;
+            if (delay > DELAY_MAX)
+                delay = DELAY_MAX;
+            continue;
+        }
+        else
+            return FALSE;
+    } while(1);
+    DisplayLog(LVL_CRIT, MIGR_TAG, "ERROR: unexpected case line %u in %s", __LINE__, __FILE__);
+    return TRUE;
 }
 
 /* indicates attributes to be retrieved from db */
@@ -360,11 +584,12 @@ static int init_db_attr_mask( attr_set_t * p_attr_set )
 
     ATTR_MASK_INIT( p_attr_set );
 
-    /* Retrieve at least: fullpath, last_mod, last_archive, size
+    /* Retrieve at least: fullpath, last_mod, <sort_attr>, last_archive, size
      * for logging or computing statistics */
     ATTR_MASK_SET( p_attr_set, fullpath );
     ATTR_MASK_SET( p_attr_set, path_update );
     ATTR_MASK_SET( p_attr_set, last_mod );
+    p_attr_set->attr_mask |= (1 << migr_config.lru_sort_attr);
     ATTR_MASK_SET( p_attr_set, size );
     ATTR_MASK_SET( p_attr_set, md_update );
 #ifdef ATTR_INDEX_last_archive
@@ -409,13 +634,14 @@ int perform_migration( lmgr_t * lmgr, migr_param_t * p_migr_param,
     unsigned long long feedback_before[MIGR_FDBK_COUNT];
     unsigned long long feedback_after[MIGR_FDBK_COUNT];
 
-    unsigned int   status_tab[MIGR_ST_COUNT];
+    unsigned int   status_tab_before[MIGR_ST_COUNT];
+    unsigned int   status_tab_after[MIGR_ST_COUNT];
 
-    unsigned int   nb_submitted, migr_count;
-    unsigned long  submitted_vol, migr_vol;
+    unsigned int   nb_submitted;
+    unsigned long  submitted_vol;
 
-    int            last_mod_time = 0;
-    time_t         last_request_time = 0;
+    int            last_sort_time = 0;
+    time_t         first_request_time = 0;
 
     int            attr_mask_sav;
     int            end_of_list = FALSE;
@@ -435,12 +661,17 @@ int perform_migration( lmgr_t * lmgr, migr_param_t * p_migr_param,
     if ( p_migr_vol )
         *p_migr_vol = 0;
 
+    memset(feedback_before, 0, sizeof(feedback_before));
+    memset(feedback_after, 0, sizeof(feedback_after));
+    memset(status_tab_before, 0, sizeof(status_tab_before));
+    memset(status_tab_after, 0, sizeof(status_tab_after));
+
     rc = init_db_attr_mask( &attr_set );
     if (rc)
         return rc;
 
     /* sort by last modification time */
-    sort_type.attr_index = ATTR_INDEX_last_mod;
+    sort_type.attr_index = migr_config.lru_sort_attr;
     sort_type.order = SORT_ASC;
 
     rc = lmgr_simple_filter_init( &filter );
@@ -451,7 +682,7 @@ int perform_migration( lmgr_t * lmgr, migr_param_t * p_migr_param,
     /* do not retrieve entries with 'no_archive' tag = 1.
      * get entrie with no_archive == NULL
      */
-    fval.val_bool = TRUE;
+    fval.value.val_bool = TRUE;
     rc = lmgr_simple_filter_add( &filter, ATTR_INDEX_no_archive, NOTEQUAL,
                                  fval, FILTER_FLAG_ALLOW_NULL );
     if ( rc )
@@ -460,7 +691,7 @@ int perform_migration( lmgr_t * lmgr, migr_param_t * p_migr_param,
 
 #ifdef ATTR_INDEX_invalid
     /* don't retrieve invalid entries (allow entries with invalid == NULL) */
-    fval.val_int = TRUE;
+    fval.value.val_int = TRUE;
     rc = lmgr_simple_filter_add( &filter, ATTR_INDEX_invalid, NOTEQUAL, fval,
             FILTER_FLAG_ALLOW_NULL );
     if ( rc )
@@ -472,13 +703,13 @@ int perform_migration( lmgr_t * lmgr, migr_param_t * p_migr_param,
     {
         /* retrieve entries with status MODIFIED or NEW or NULL */
 
-        fval.val_int = STATUS_MODIFIED;
+        fval.value.val_int = STATUS_MODIFIED;
         rc = lmgr_simple_filter_add( &filter, ATTR_INDEX_status, EQUAL, fval,
                                      FILTER_FLAG_BEGIN );
         if ( rc )
             return rc;
 
-        fval.val_int = STATUS_NEW;
+        fval.value.val_int = STATUS_NEW;
         rc = lmgr_simple_filter_add( &filter, ATTR_INDEX_status, EQUAL, fval,
                                      FILTER_FLAG_OR | FILTER_FLAG_END );
         if ( rc )
@@ -488,7 +719,7 @@ int perform_migration( lmgr_t * lmgr, migr_param_t * p_migr_param,
     {
 #endif
         /* only retrieve entries with status MODIFIED */
-        fval.val_int = STATUS_MODIFIED;
+        fval.value.val_int = STATUS_MODIFIED;
         rc = lmgr_simple_filter_add( &filter, ATTR_INDEX_status, EQUAL, fval, 0 );
         if ( rc )
             return rc;
@@ -513,7 +744,7 @@ int perform_migration( lmgr_t * lmgr, migr_param_t * p_migr_param,
 
         /* We must retrieve files from this OST */
 
-        fval.val_uint = p_migr_param->param_u.ost_index;
+        fval.value.val_uint = p_migr_param->param_u.ost_index;
         rc = lmgr_simple_filter_add( &filter, ATTR_INDEX_stripe_items, EQUAL, fval, 0 );
         if ( rc )
             return rc;
@@ -525,7 +756,7 @@ int perform_migration( lmgr_t * lmgr, migr_param_t * p_migr_param,
 
         /* We must retrieve files for this user */
 
-        fval.val_str = p_migr_param->param_u.user_name;
+        fval.value.val_str = p_migr_param->param_u.user_name;
         rc = lmgr_simple_filter_add( &filter, ATTR_INDEX_owner, EQUAL, fval, 0 );
         if ( rc )
             return rc;
@@ -537,7 +768,7 @@ int perform_migration( lmgr_t * lmgr, migr_param_t * p_migr_param,
 
         /* We must retrieve files for this group */
 
-        fval.val_str = p_migr_param->param_u.group_name;
+        fval.value.val_str = p_migr_param->param_u.group_name;
         rc = lmgr_simple_filter_add( &filter, ATTR_INDEX_gr_name, EQUAL,
                                      fval, 0 );
         if ( rc )
@@ -549,11 +780,11 @@ int perform_migration( lmgr_t * lmgr, migr_param_t * p_migr_param,
                     p_migr_param->param_u.class_name );
 
         if (!strcasecmp( p_migr_param->param_u.class_name, "default"))
-            fval.val_str = CLASS_DEFAULT;
+            fval.value.val_str = CLASS_DEFAULT;
         else if ( !strcasecmp( p_migr_param->param_u.class_name, "ignored"))
-            fval.val_str = CLASS_IGNORED;
+            fval.value.val_str = CLASS_IGNORED;
         else
-            fval.val_str = p_migr_param->param_u.class_name;
+            fval.value.val_str = p_migr_param->param_u.class_name;
 
         rc = lmgr_simple_filter_add( &filter, ATTR_INDEX_archive_class, LIKE,
                                      fval, 0 );
@@ -585,7 +816,7 @@ int perform_migration( lmgr_t * lmgr, migr_param_t * p_migr_param,
         if ( policies.updt_policy.fileclass.policy == UPDT_NEVER )
         {
             /* filter: archive class != ignored */
-            fval.val_str = CLASS_IGNORED;
+            fval.value.val_str = CLASS_IGNORED;
             rc = lmgr_simple_filter_add( &filter, ATTR_INDEX_archive_class,
                                          NOTEQUAL, fval, FILTER_FLAG_ALLOW_NULL );
             if ( rc )
@@ -594,11 +825,11 @@ int perform_migration( lmgr_t * lmgr, migr_param_t * p_migr_param,
         else if ( policies.updt_policy.fileclass.policy == UPDT_PERIODIC )
         {
             /* filter: archive class != ignored OR update <= now - period */
-            fval.val_str = CLASS_IGNORED;
+            fval.value.val_str = CLASS_IGNORED;
             rc = lmgr_simple_filter_add( &filter, ATTR_INDEX_archive_class,
                                          NOTEQUAL, fval, FILTER_FLAG_ALLOW_NULL
                                                         | FILTER_FLAG_BEGIN );
-            fval.val_uint = time(NULL) - policies.updt_policy.fileclass.period_max;
+            fval.value.val_uint = time(NULL) - policies.updt_policy.fileclass.period_max;
             rc = lmgr_simple_filter_add( &filter, ATTR_INDEX_arch_cl_update,
                                          LESSTHAN, fval, FILTER_FLAG_ALLOW_NULL
                                                         | FILTER_FLAG_OR
@@ -626,23 +857,31 @@ int perform_migration( lmgr_t * lmgr, migr_param_t * p_migr_param,
 
     attr_mask_sav = attr_set.attr_mask;
 
-    last_request_time = time( NULL );
-
-    migr_count = 0;
-    migr_vol = 0;
+    migration_info.migr_count = 0;
+    migration_info.migr_vol = 0;
+    migration_info.skipped = 0;
+    migration_info.errors = 0;
+    migration_info.last_report = migration_info.migr_start = first_request_time
+        = time(NULL);
 
     /* loop on all migration passes */
     do
     {
+        /* check if progress must be reported */
+        report_progress(NULL, NULL, NULL, NULL);
 
         /* Retrieve stats before starting migr,
          * for computing a delta later.
          */
         RetrieveQueueStats( &migr_queue, NULL, NULL, NULL, NULL, NULL,
-                            status_tab, feedback_before );
+                            status_tab_before, feedback_before );
 
         submitted_vol = 0;
         nb_submitted = 0;
+
+        /* reset after's */
+        memset(feedback_after, 0, sizeof(feedback_after));
+        memset(status_tab_after, 0, sizeof(status_tab_after));
 
         /* List entries for migration */
         do
@@ -666,7 +905,7 @@ int perform_migration( lmgr_t * lmgr, migr_param_t * p_migr_param,
 
             if ( rc == DB_END_OF_LIST )
             {
-                total_returned += nb_returned; 
+                total_returned += nb_returned;
 
                 /* if limit = inifinite => END OF LIST */
                 if ( ( nb_returned == 0 )
@@ -680,7 +919,7 @@ int perform_migration( lmgr_t * lmgr, migr_param_t * p_migr_param,
                 }
 
                 /* no new useless request */
-                if ( heuristic_end_of_list( last_mod_time ) )
+                if ( heuristic_end_of_list( last_sort_time ) )
                 {
                     end_of_list = TRUE;
                     break;
@@ -690,22 +929,23 @@ int perform_migration( lmgr_t * lmgr, migr_param_t * p_migr_param,
                 ListMgr_CloseIterator( it );
 
                 /* we must wait that migr. queue is empty,
-                 * to avoid race conditions (by processing the same
-                 * entry twice */
-                wait_queue_empty( nb_submitted, feedback_before, status_tab,
-                                  feedback_after, FALSE );
+                 * to prevent from processing the same entry twice
+                 * (not safe until their md_update has not been updated).
+                 */
+                wait_queue_empty( nb_submitted, feedback_before, status_tab_before,
+                                  feedback_after, status_tab_after, FALSE );
 
                 /* perform a new request with next entries */
 
-                /* /!\ if there is already a filter on last_mod or md_update
+                /* /!\ if there is already a filter on <sort_attr> or md_update
                  * only replace it, do not add a new filter.
                  */
 
-                /* don't retrieve just-updated entries 
-                 * (update>=last_request_time),
+                /* don't retrieve entries updated after the migration started
+                 * (update>=first_request_time),
                  * allow entries with md_update == NULL.
                  */
-                fval.val_int = last_request_time;
+                fval.value.val_int = first_request_time;
                 rc = lmgr_simple_filter_add_or_replace(&filter,
                                                        ATTR_INDEX_md_update,
                                                        LESSTHAN_STRICT, fval,
@@ -714,9 +954,9 @@ int perform_migration( lmgr_t * lmgr, migr_param_t * p_migr_param,
                     return rc;
 
                 /* filter on modification time (allow NULL) */
-                fval.val_int = last_mod_time;
+                fval.value.val_int = last_sort_time;
                 rc = lmgr_simple_filter_add_or_replace(&filter,
-                                                       ATTR_INDEX_last_mod,
+                                                       migr_config.lru_sort_attr,
                                                        MORETHAN, fval,
                                                        FILTER_FLAG_ALLOW_NULL );
                 if ( rc )
@@ -724,9 +964,9 @@ int perform_migration( lmgr_t * lmgr, migr_param_t * p_migr_param,
 
                 DisplayLog( LVL_DEBUG, MIGR_TAG,
                             "Performing new request with a limit of %u entries"
-                            " and mod >= %d and md_update < %ld ",
-                            opt.list_count_max, last_mod_time,
-                            last_request_time );
+                            " and %s >= %d and md_update < %ld ",
+                            opt.list_count_max, sort_attr_name,
+                            last_sort_time, first_request_time );
 
                 nb_returned = 0;
                 it = ListMgr_Iterator( lmgr, &filter, &sort_type, &opt );
@@ -739,8 +979,6 @@ int perform_migration( lmgr_t * lmgr, migr_param_t * p_migr_param,
                                 "database. Migration cancelled." );
                     return -1;
                 }
-                last_request_time = time( NULL );
-
                 continue;
             }
             else if ( rc != 0 )
@@ -752,8 +990,9 @@ int perform_migration( lmgr_t * lmgr, migr_param_t * p_migr_param,
 
             nb_returned++;
 
-            if ( ATTR_MASK_TEST( &attr_set, last_mod ) )
-                last_mod_time = ATTR( &attr_set, last_mod );
+            rc = get_sort_attr(&attr_set);
+            if (rc != -1)
+                last_sort_time = rc;
 
             sz = ATTR( &attr_set, size );
 
@@ -769,39 +1008,44 @@ int perform_migration( lmgr_t * lmgr, migr_param_t * p_migr_param,
             /* periodically check if we have a chance to have more matching entries */
             if ( nb_submitted % 1000 == 0 )
             {
-                if ( heuristic_end_of_list( last_mod_time ) )
+                if ( heuristic_end_of_list( last_sort_time ) )
                 {
                     end_of_list = TRUE;
                     break;
                 }
             }
-
         }
-        while ( !check_migration_limit( nb_submitted + migr_count,
-                                        submitted_vol + migr_vol, FALSE ) );
+        while (!check_queue_limit(nb_submitted, submitted_vol, feedback_before, status_tab_before));
 
         /* Wait for end of migration pass */
-        wait_queue_empty( nb_submitted, feedback_before, status_tab,
-                          feedback_after, TRUE );
+        wait_queue_empty( nb_submitted, feedback_before, status_tab_before,
+                          feedback_after, status_tab_after, TRUE );
 
-        /* how much entries have been migrated ? */
-        migr_vol += feedback_after[MIGR_FDBK_VOL] - feedback_before[MIGR_FDBK_VOL];
-        migr_count += feedback_after[MIGR_FDBK_NBR] - feedback_before[MIGR_FDBK_NBR];
+        /* add stats for this pass */
+        migration_info.migr_vol += feedback_after[MIGR_FDBK_VOL] - feedback_before[MIGR_FDBK_VOL];
+        migration_info.migr_count += feedback_after[MIGR_FDBK_NBR] - feedback_before[MIGR_FDBK_NBR];
+        migration_info.skipped += skipped_count(status_tab_after) - skipped_count(status_tab_before);
+        migration_info.errors += error_count(status_tab_after) - error_count(status_tab_before);
 
         /* if getnext returned an error */
         if ( rc )
             break;
-
     }
-    while ( ( !end_of_list ) && !check_migration_limit( migr_count, migr_vol, TRUE ) );
+    while ((!end_of_list) && !check_migration_limit(migration_info.migr_count,
+                                                    migration_info.migr_vol,
+                                                    migration_info.errors, TRUE ));
 
     lmgr_simple_filter_free( &filter );
     ListMgr_CloseIterator( it );
 
     if ( p_nb_migr )
-        *p_nb_migr = migr_count;
+        *p_nb_migr = migration_info.migr_count;
     if ( p_migr_vol )
-        *p_migr_vol = migr_vol;
+        *p_migr_vol = migration_info.migr_vol;
+
+    /* restart from initial file when no migration could be done. */
+    if (first_eligible && migration_info.migr_count == 0)
+        first_eligible = 0;
 
     return 0;
 }
@@ -951,40 +1195,6 @@ static int check_entry( lmgr_t * lmgr, migr_item_t * p_item, attr_set_t * new_at
     /* entry is valid */
     return MIGR_OK;
 }
-#elif defined(_SHERPA) /* sherpa + fid support */
-
-static int check_entry( lmgr_t * lmgr, migr_item_t * p_item, attr_set_t * new_attr_set )
-{
-
-    if ( ATTR_MASK_TEST(&p_item->entry_attr, fullpath) )
-        DisplayLog( LVL_FULL, MIGR_TAG, "Considering entry %s", ATTR( &p_item->entry_attr, fullpath ) );
-    else
-        DisplayLog( LVL_FULL, MIGR_TAG, "Considering entry with fid="DFID, PFID(&p_item->entry_id) );
-
-    /* sherpa needs the full path to map with the reference */
-    if ( ATTR_MASK_TEST( &p_item->entry_attr, fullpath )
-         && !ATTR_MASK_TEST( new_attr_set, fullpath ) )
-    {
-        strcpy( ATTR( new_attr_set, fullpath ), ATTR( &p_item->entry_attr, fullpath ) );
-        ATTR_MASK_SET( new_attr_set, fullpath );
-    }
-
-    /* get info about this entry and check policies about the entry.
-     * don't check policies now, it will be done later */
-    switch( SherpaManageEntry( &p_item->entry_id, new_attr_set, FALSE) )
-    {
-        case do_skip:
-        case do_rm:
-            /* entry has been removed? */
-            return MIGR_ENTRY_MOVED;
-        case do_update:
-            /* OK, continue */
-            break; 
-    }
-    /* entry is valid */
-    return MIGR_OK;
-}
-
 #elif defined(_HSM_LITE) /* backup with fid support */
 
 static int check_entry( lmgr_t * lmgr, migr_item_t * p_item, attr_set_t * new_attr_set )
@@ -1113,7 +1323,7 @@ static int check_entry( lmgr_t * lmgr, migr_item_t * p_item, attr_set_t * new_at
 
     if ( rc == -ENOENT || rc == -ESTALE )
     {
-        DisplayLog( LVL_EVENT, MIGR_TAG, "Entry %s does not exist no more",
+        DisplayLog( LVL_EVENT, MIGR_TAG, "Entry %s does not exist anymore",
                     fspath );
         invalidate_entry( lmgr, &p_item->entry_id );
         return MIGR_ENTRY_MOVED;
@@ -1140,61 +1350,11 @@ static int check_entry( lmgr_t * lmgr, migr_item_t * p_item, attr_set_t * new_at
             return MIGR_ERROR;
 }
 
-#endif /* switch Lustre_HSM/SHERPA */
+#endif /* switch Lustre_HSM/HSM_LITE */
 
-#else  /* no fid support (SHERPA ONLY) */
-
-#ifndef _SHERPA
-#error "FID support must be activated for Lustre-HSM"
-#endif
-
-/**
- * Check that entry exists with the good path and its id is consistent.
- * @param fill entry MD if entry is valid
- */
-static int check_entry( lmgr_t * lmgr, migr_item_t * p_item,
-                        attr_set_t * new_attr_set )
-{
-    struct stat    entry_md;
-
-    /* 1) Check if fullpath is set */
-
-    if ( !ATTR_MASK_TEST( &p_item->entry_attr, fullpath ) )
-    {
-        DisplayLog( LVL_DEBUG, MIGR_TAG, "Warning: entry fullpath is not set. Tag it invalid." );
-        invalidate_entry( lmgr, &p_item->entry_id );
-
-        /* not enough metadata */
-        return MIGR_PARTIAL_MD;
-    }
-
-    DisplayLog( LVL_FULL, MIGR_TAG, "Considering entry %s", ATTR( &p_item->entry_attr, fullpath ) );
-
-    /* we must have at least its full path, if we are not using fids */
-    if ( ATTR_MASK_TEST( &p_item->entry_attr, fullpath )
-         && !ATTR_MASK_TEST( new_attr_set, fullpath ) )
-    {
-        strcpy( ATTR( new_attr_set, fullpath ), ATTR( &p_item->entry_attr, fullpath ) );
-        ATTR_MASK_SET( new_attr_set, fullpath );
-    }
-
-    /* get info about this entry and check policies about the entry. */
-    switch( SherpaManageEntry( &p_item->entry_id, new_attr_set, FALSE ) )
-    {
-        case do_skip:
-        case do_rm:
-            /* invalidate entry if it is not OK */
-            invalidate_entry( lmgr, &p_item->entry_id );
-            return MIGR_ENTRY_MOVED;
-        case do_update:
-            /* OK, continue */
-            break; 
-    }
-
-    /* entry is valid */
-    return MIGR_OK;
-}
-#endif /* no fid support / SHERPA */
+#else  /* no fid support (no mode support it for now) */
+#error "FID support must be activated for migration modes"
+#endif /* no fid support */
 
 
 /**
@@ -1215,16 +1375,20 @@ static int ManageEntry( lmgr_t * lmgr, migr_item_t * p_item, int no_queue )
     int update_fileclass = -1; /* not set */
 
 #ifdef _LUSTRE_HSM
-    unsigned int archive_num = 0;
+    unsigned int archive_id = 0;
 #endif
 
 /* acknowledging helper */
 #define Acknowledge( _q, _status, _fdbk1, _fdbk2 )  do {            \
+                               memset(feedback, 0, sizeof(feedback)); \
                                if (no_queue)                        \
                                  rc = (_status);                    \
                                else {                               \
-                                    feedback[MIGR_FDBK_NBR] = _fdbk1;  \
-                                    feedback[MIGR_FDBK_VOL] = _fdbk2;  \
+                                    feedback[MIGR_FDBK_NBR] = _fdbk1; \
+                                    if (_status == MIGR_OK)         \
+                                        feedback[MIGR_FDBK_VOL] = _fdbk2; \
+                                    else                            \
+                                        feedback[MIGR_FDBK_VOL_NOK] = _fdbk2; \
                                     Queue_Acknowledge( _q, _status, feedback, MIGR_FDBK_COUNT ); \
                                }                                       \
                             } while(0)
@@ -1233,7 +1397,7 @@ static int ManageEntry( lmgr_t * lmgr, migr_item_t * p_item, int no_queue )
     {
        /* migration aborted by a signal, doesn't submit new migrations */
        DisplayLog( LVL_FULL, MIGR_TAG, "Migration aborted: migration thread skipping migration requests" );
-       Acknowledge( &migr_queue, MIGR_ABORT, 0, 0 );
+       Acknowledge(&migr_queue, MIGR_ABORT, 0, ATTR(&p_item->entry_attr, size));
        rc = MIGR_ABORT;
        goto end;
     }
@@ -1243,11 +1407,19 @@ static int ManageEntry( lmgr_t * lmgr, migr_item_t * p_item, int no_queue )
                 ATTR( &p_item->entry_attr, fullpath ) );
 
     ATTR_MASK_INIT( &new_attr_set );
+#ifdef ATTR_INDEX_creation_time
+    /* set creation_time as it must not be set by check_entry */
+    if (ATTR_MASK_TEST(&p_item->entry_attr, creation_time))
+    {
+        ATTR_MASK_SET(&new_attr_set, creation_time);
+        ATTR(&new_attr_set, creation_time) = ATTR(&p_item->entry_attr, creation_time);
+    }
+#endif
 
     rc = check_entry( lmgr, p_item, &new_attr_set );
     if ( rc != MIGR_OK )
     {
-        Acknowledge( &migr_queue, rc, 0, 0 );
+        Acknowledge(&migr_queue, rc, 0, ATTR(&p_item->entry_attr, size));
         goto end;
     }
 
@@ -1274,7 +1446,7 @@ static int ManageEntry( lmgr_t * lmgr, migr_item_t * p_item, int no_queue )
         update_entry( lmgr, &p_item->entry_id, &new_attr_set );
 
         /* Notify that this entry is whitelisted */
-        Acknowledge( &migr_queue, MIGR_ENTRY_WHITELISTED, 0, 0 );
+        Acknowledge(&migr_queue, MIGR_ENTRY_WHITELISTED, 0, ATTR(&p_item->entry_attr, size));
 
         goto end;
     }
@@ -1283,7 +1455,7 @@ static int ManageEntry( lmgr_t * lmgr, migr_item_t * p_item, int no_queue )
     if ( !ATTR_MASK_TEST( &new_attr_set, status ) )
     {
         DisplayLog( LVL_MAJOR, MIGR_TAG, "Error: entry status should be set at this point");
-        Acknowledge( &migr_queue, MIGR_PARTIAL_MD, 0, 0 );
+        Acknowledge(&migr_queue, MIGR_PARTIAL_MD, 0, ATTR(&p_item->entry_attr, size));
         goto end;
     }
     else
@@ -1292,8 +1464,6 @@ static int ManageEntry( lmgr_t * lmgr, migr_item_t * p_item, int no_queue )
         if ( (ATTR( &new_attr_set, status ) != STATUS_MODIFIED)
              && ( !migr_config.backup_new_files
                   || ( ATTR( &new_attr_set, status ) != STATUS_NEW )) )
-#else /* sherpa */
-        if ( ATTR( &new_attr_set, status ) != STATUS_MODIFIED )
 #endif
         {
             /* status changed */
@@ -1306,7 +1476,7 @@ static int ManageEntry( lmgr_t * lmgr, migr_item_t * p_item, int no_queue )
             update_entry( lmgr, &p_item->entry_id, &new_attr_set );
 
             /* Notify that this entry is whitelisted */
-            Acknowledge( &migr_queue, MIGR_STATUS_CHGD, 0, 0 );
+            Acknowledge(&migr_queue, MIGR_STATUS_CHGD, 0, ATTR(&p_item->entry_attr, size));
             goto end;
         }
     }
@@ -1315,7 +1485,7 @@ static int ManageEntry( lmgr_t * lmgr, migr_item_t * p_item, int no_queue )
     update_fileclass = need_fileclass_update( &new_attr_set, MIGR_POLICY );
     if ( update_fileclass == -1 )
     {
-        Acknowledge( &migr_queue, MIGR_ERROR, 0, 0 );
+        Acknowledge(&migr_queue, MIGR_ERROR, 0, ATTR(&p_item->entry_attr, size));
         goto end;
     }
 
@@ -1344,29 +1514,16 @@ static int ManageEntry( lmgr_t * lmgr, migr_item_t * p_item, int no_queue )
 
         if ( match == POLICY_MATCH )
         {
-    #ifdef ATTR_INDEX_whitelisted
-            /* Entry is whitelisted */
-            ATTR_MASK_SET( &new_attr_set, whitelisted );
-            ATTR( &new_attr_set, whitelisted ) = TRUE;
-    #endif
-
+            DisplayLog(LVL_FULL, MIGR_TAG, "%s is whitelisted", ATTR(&p_item->entry_attr, fullpath));
             /* update DB and skip the entry */
             update_entry( lmgr, &p_item->entry_id, &new_attr_set );
 
             /* Notify that this entry is whitelisted */
-            Acknowledge( &migr_queue, MIGR_ENTRY_WHITELISTED, 0, 0 );
+            Acknowledge(&migr_queue, MIGR_ENTRY_WHITELISTED, 0, ATTR(&p_item->entry_attr, size));
 
             goto end;
         }
-        else if ( match == POLICY_NO_MATCH )
-        {
-    #ifdef ATTR_INDEX_whitelisted
-            /* set whitelisted field as false (for any further update op) */
-            ATTR_MASK_SET( &new_attr_set, whitelisted );
-            ATTR( &new_attr_set, whitelisted ) = FALSE;
-    #endif
-        }
-        else
+        else if ( match != POLICY_NO_MATCH )
         {
             /* Cannot determine if entry is whitelisted: skip it (do nothing in database) */
             DisplayLog( LVL_MAJOR, MIGR_TAG,
@@ -1374,7 +1531,7 @@ static int ManageEntry( lmgr_t * lmgr, migr_item_t * p_item, int no_queue )
                         ATTR( &p_item->entry_attr, fullpath ) );
 
             /* Notify error */
-            Acknowledge( &migr_queue, MIGR_PARTIAL_MD, 0, 0 );
+            Acknowledge(&migr_queue, MIGR_PARTIAL_MD, 0, ATTR(&p_item->entry_attr, size));
 
             goto end;
         }
@@ -1399,8 +1556,9 @@ static int ManageEntry( lmgr_t * lmgr, migr_item_t * p_item, int no_queue )
 
     if ( !policy_case )
     {
+        DisplayLog(LVL_FULL, MIGR_TAG, "%s doesn't match any policy case", ATTR(&p_item->entry_attr, fullpath));
         update_entry( lmgr, &p_item->entry_id, &new_attr_set );
-        Acknowledge( &migr_queue, MIGR_NO_POLICY, 0, 0 );
+        Acknowledge(&migr_queue, MIGR_NO_POLICY, 0, ATTR(&p_item->entry_attr, size));
         goto end;
     }
     else
@@ -1424,9 +1582,12 @@ static int ManageEntry( lmgr_t * lmgr, migr_item_t * p_item, int no_queue )
         switch ( EntryMatches( &p_item->entry_id, &new_attr_set, &policy_case->condition, migr_pol_mod ) )
         {
         case POLICY_NO_MATCH:
+            DisplayLog(LVL_FULL, MIGR_TAG, "%s doesn't match condition for policy '%s': dt=%lu",
+                       ATTR(&p_item->entry_attr, fullpath), policy_case->policy_id,
+                       time(NULL) - get_sort_attr(&new_attr_set));
             /* entry is not eligible now */
             update_entry( lmgr, &p_item->entry_id, &new_attr_set );
-            Acknowledge( &migr_queue, MIGR_ENTRY_WHITELISTED, 0, 0 );
+            Acknowledge(&migr_queue, MIGR_ENTRY_WHITELISTED, 0, ATTR(&p_item->entry_attr, size));
             goto end;
             break;
         case POLICY_MATCH:
@@ -1442,28 +1603,35 @@ static int ManageEntry( lmgr_t * lmgr, migr_item_t * p_item, int no_queue )
                         ATTR( &p_item->entry_attr, fullpath ), policy_case->policy_id );
 
             /* Notify error */
-            Acknowledge( &migr_queue, MIGR_PARTIAL_MD, 0, 0 );
+            Acknowledge(&migr_queue, MIGR_PARTIAL_MD, 0, ATTR(&p_item->entry_attr, size));
 
             goto end;
         }
     } /* end if don't ignore policies */
+
+    /* we found an eligible entry! */
+
+    /* it is the first? */
+    rc = get_sort_attr(&p_item->entry_attr);
+    if (rc != -1 && (!first_eligible || (rc < first_eligible)))
+        first_eligible = rc;
 
     /* build hints */
     hints = build_migration_hints( policy_case, p_fileset, &p_item->entry_id, &new_attr_set );
 
 #ifdef _LUSTRE_HSM
     /* what archive num is to be used ? */
-    if ( ( p_fileset != NULL ) && (p_fileset->archive_num != 0) )
-        archive_num =  p_fileset->archive_num;
-    /* policy archive_num overrides fileset archive_num */
-    if ( ( policy_case != NULL ) && ( policy_case->archive_num != 0) )
-        archive_num = policy_case->archive_num;
+    if ((p_fileset != NULL) && (p_fileset->archive_id != 0))
+        archive_id =  p_fileset->archive_id;
+    /* policy archive_id overrides fileset archive_id */
+    if ((policy_case != NULL) && (policy_case->archive_id != 0))
+        archive_id = policy_case->archive_id;
 #endif
 
     /* Perform migration operation! */
 
 #ifdef _LUSTRE_HSM
-    rc = MigrateEntry_ByFid( &p_item->entry_id, hints, archive_num );
+    rc = MigrateEntry_ByFid(&p_item->entry_id, hints, archive_id);
 
     if ( rc == 0 )
     {
@@ -1498,35 +1666,8 @@ static int ManageEntry( lmgr_t * lmgr, migr_item_t * p_item, int no_queue )
     rc = MigrateEntry( &p_item->entry_id, &new_attr_set, hints );
 
     /* status has been updated by MigrateEntry call, even on failure */
-
-#elif defined(_SHERPA)
-    if ( !ATTR_MASK_TEST( &new_attr_set, refpath) )
-    {
-        DisplayLog( LVL_MAJOR, MIGR_TAG,
-            "Warning: entry %s has no reference path: skipping it.",
-            ATTR( &p_item->entry_attr, fullpath ) );
-
-        Acknowledge( &migr_queue, MIGR_PARTIAL_MD, 0, 0 );
-        goto end;
-    }
-
-    /* set entry status = ARCHIVE_RUNNING */
-    ATTR_MASK_SET( &new_attr_set, status );
-    ATTR( &new_attr_set, status ) = STATUS_ARCHIVE_RUNNING;
-    update_entry( lmgr, &p_item->entry_id, &new_attr_set );
-
-    rc = MigrateEntry_ByPath( ATTR( &new_attr_set, refpath), hints );
-
-    if ( rc )
-        /* unknown status */
-        ATTR_MASK_UNSET( &new_attr_set, status );
-    else
-    {
-        ATTR_MASK_SET( &new_attr_set, status );
-        ATTR( &new_attr_set, status ) = STATUS_SYNCHRO;
-    }
-
 #endif
+
     if ( hints )
         free_migration_hints( hints );
 
@@ -1538,11 +1679,6 @@ static int ManageEntry( lmgr_t * lmgr, migr_item_t * p_item, int no_queue )
         /* copy is asynchronous */
         action_str = "starting archive";
         err_str = strerror(-rc);
-#elif defined(_SHERPA)
-        char buff[1024];
-        /* copy is synchronous */
-        action_str = "performing migration";
-        err_str =  sherpa_cache_message_r(rc, buff, 1024 );
 #elif defined(_HSM_LITE)
         if (backend.async_archive)
             action_str = "starting archive";
@@ -1558,26 +1694,21 @@ static int ManageEntry( lmgr_t * lmgr, migr_item_t * p_item, int no_queue )
 
         update_entry( lmgr, &p_item->entry_id, &new_attr_set );
 
-        Acknowledge( &migr_queue, MIGR_ERROR, 0, 0 );
+        Acknowledge(&migr_queue, MIGR_ERROR, 0, ATTR(&p_item->entry_attr, size));
     }
     else
     {
-        char           strmod[256];
-        char           strarchive[256];
+        char           strtime[256];
         char           strsize[256];
-        char           strstorage[1024]="";
-
-        int            is_copy = TRUE;
+        char           strstorage[24576]="";
         int            is_stor = TRUE;
+        time_t         t;
 
         const char * action_str;
 
 #ifdef _LUSTRE_HSM
         /* Entry migration has been successfully started */
         action_str = "Start archiving";
-#elif defined(_SHERPA)
-        /* For SHERPA, migration is synchronous */
-        action_str = "Archived";
 #elif defined(_HSM_LITE)
         if (backend.async_archive)
             action_str = "Start archiving";
@@ -1586,52 +1717,40 @@ static int ManageEntry( lmgr_t * lmgr, migr_item_t * p_item, int no_queue )
 #endif
 
         /* report messages */
-        FormatDurationFloat( strmod, 256, time( NULL ) - ATTR( &new_attr_set, last_mod ) );
 
-#ifdef ATTR_INDEX_last_archive
-        if ( ATTR_MASK_TEST( &p_item->entry_attr, last_archive )
-             && ATTR( &p_item->entry_attr, last_archive) != 0 )
-        {
-            FormatDurationFloat( strarchive, 256,
-                                 time( NULL ) - ATTR(  &p_item->entry_attr, last_archive ) );
-        }
+        /* don't take current last_archive that may have been just-updated:
+         * get the previous one */
+        if (migr_config.lru_sort_attr == ATTR_INDEX_last_archive)
+            t = get_sort_attr(&p_item->entry_attr);
         else
-#endif
-            is_copy = FALSE;
+            t = get_sort_attr(&new_attr_set);
 
-        FormatFileSize( strsize, 256, ATTR( &new_attr_set, size ) );
+        if (t > 0)
+            FormatDurationFloat(strtime, 256, time( NULL ) - t);
+        else
+            strcpy(strtime, "<none>");
+
+        FormatFileSize(strsize, 256, ATTR( &new_attr_set, size));
 
         if ( ATTR_MASK_TEST( &p_item->entry_attr, stripe_items ) )
-            FormatStripeList( strstorage, 1024, &ATTR( &p_item->entry_attr, stripe_items ) );
+            FormatStripeList( strstorage, sizeof(strstorage), &ATTR( &p_item->entry_attr, stripe_items ), 0);
         else
             is_stor = FALSE;
 
         DisplayLog( LVL_DEBUG, MIGR_TAG,
-                    "%s '%s' using policy '%s', last modified %s ago,"
-                    " last archived %s%s,  size=%s%s%s",
+                    "%s '%s' using policy '%s', %s %s%s, size=%s%s%s",
                     action_str, ATTR( &p_item->entry_attr, fullpath ),
-                    policy_case->policy_id, strmod,
-                    ( is_copy ? strarchive : "(none)" ), ( is_copy ? " ago" : "" ),
-                    strsize, ( is_stor ? "stored on" : "" ), ( is_stor ? strstorage : "" ) );
+                    policy_case->policy_id, sort_attr_name, strtime,
+                    ((t > 0) ? " ago" : ""),  strsize,
+                    ( is_stor ? "stored on" : "" ), ( is_stor ? strstorage : "" ) );
 
-#ifdef ATTR_INDEX_last_archive
-        DisplayReport( "%s '%s' using policy '%s', last mod %s ago | size=%"
-                       PRI_STSZ ", last_mod=%" PRI_TT ", last_archive=%" PRI_TT
-                       "%s%s", action_str, ATTR( &p_item->entry_attr, fullpath ),
-                       policy_case->policy_id, strmod, ATTR( &new_attr_set, size ),
-                       (time_t)ATTR( &new_attr_set, last_mod ),
-                       is_copy ? (time_t)ATTR( &p_item->entry_attr, last_archive ) : 0,
-                       ( is_stor ? ", storage_units=" : "" ), 
-                       ( is_stor ? strstorage : "" ) );
-#else
-   DisplayReport( "%s '%s' using policy '%s', last mod %s ago | size=%"
-                       PRI_SZ ", last_mod=%" PRI_TT "%s%s",
+        DisplayReport( "%s '%s' using policy '%s', %s %s%s | size=%"
+                       PRI_SZ ", %s=%" PRI_TT "%s%s",
                        action_str, ATTR( &p_item->entry_attr, fullpath ),
-                       policy_case->policy_id, strmod, ATTR( &new_attr_set, size ),
-                       (time_t)ATTR( &new_attr_set, last_mod ),
-                       ( is_stor ? ", storage_units=" : "" ),
+                       policy_case->policy_id, sort_attr_name, strtime,
+                       ((t > 0) ? " ago" : ""), ATTR( &new_attr_set, size ),
+                       sort_attr_name, t, ( is_stor ? ", storage_units=" : "" ),
                        ( is_stor ? strstorage : "" ) );
-#endif
 
         /* update info in database */
         update_entry( lmgr, &p_item->entry_id, &new_attr_set );
@@ -1831,7 +1950,7 @@ int  check_current_migrations( lmgr_t * lmgr, unsigned int *p_nb_reset,
      * is old enough (last_update <= now - timeout) or NULL*/
     if ( timeout > 0 )
     {
-        fval.val_int = time(NULL) - timeout;
+        fval.value.val_int = time(NULL) - timeout;
         rc = lmgr_simple_filter_add( &filter, ATTR_INDEX_md_update, LESSTHAN,
                 fval, FILTER_FLAG_ALLOW_NULL );
         if ( rc )
@@ -1839,7 +1958,7 @@ int  check_current_migrations( lmgr_t * lmgr, unsigned int *p_nb_reset,
     }
 
     /* filter on current status (also check values with NULL status) */
-    fval.val_int = STATUS_ARCHIVE_RUNNING;
+    fval.value.val_int = STATUS_ARCHIVE_RUNNING;
     rc = lmgr_simple_filter_add( &filter, ATTR_INDEX_status, EQUAL, fval,
                 FILTER_FLAG_ALLOW_NULL );
     if ( rc )
@@ -1847,7 +1966,7 @@ int  check_current_migrations( lmgr_t * lmgr, unsigned int *p_nb_reset,
 
 #ifdef ATTR_INDEX_invalid
     /* don't retrieve invalid entries (allow entries with invalid == NULL) */
-    fval.val_int = TRUE;
+    fval.value.val_int = TRUE;
     rc = lmgr_simple_filter_add( &filter, ATTR_INDEX_invalid, NOTEQUAL, fval,
             FILTER_FLAG_ALLOW_NULL );
     if ( rc )
@@ -1919,5 +2038,5 @@ int  check_current_migrations( lmgr_t * lmgr, unsigned int *p_nb_reset,
         return -1;
     }
 
-    return 0; 
+    return 0;
 }

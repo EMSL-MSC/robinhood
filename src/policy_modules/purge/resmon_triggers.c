@@ -99,7 +99,7 @@ static void update_trigger_status( unsigned int i, trigger_status_t state )
 /**
  * Function for checking that filesystem hasn't been unmounted
  */
-static int CheckFSDevice(  )
+static int CheckFSDevice( void )
 {
     struct stat    root_md;
 
@@ -452,7 +452,7 @@ static int check_periodic_trigger( unsigned trigger_index )
         DisplayLog( LVL_CRIT, RESMON_TAG,
                     "Purge aborted after releasing %Lu entries, %Lu blocks in %s.",
                     nbr_purged, blocks_purged, global_config.fs_path );
-                    
+
         snprintf(status_str, 1024, "Purge on %s aborted by admin (after releasing %Lu entries, %Lu blocks)",
                  global_config.fs_path, nbr_purged, blocks_purged);
         ListMgr_SetVar( &lmgr, LAST_PURGE_STATUS, status_str );
@@ -606,7 +606,7 @@ static int check_global_trigger( unsigned trigger_index )
                 DisplayLog( LVL_CRIT, RESMON_TAG,
                             "Purge aborted after releasing %Lu entries (%Lu blocks) in %s.",
                             spec, purged, global_config.fs_path );
-                            
+
                 snprintf(status_str, 1024, "Purge on %s aborted by admin (after releasing %Lu entries, %Lu blocks)",
                          global_config.fs_path, spec, purged);
                 ListMgr_SetVar( &lmgr, LAST_PURGE_STATUS, status_str );
@@ -669,7 +669,7 @@ static int check_global_trigger( unsigned trigger_index )
                 DisplayLog( LVL_CRIT, RESMON_TAG,
                             "Purge aborted after releasing %Lu blocks in %s.",
                             purged, global_config.fs_path );
-                            
+
                 snprintf(status_str, 1024, "Purge on %s aborted by admin (after releasing %Lu blocks)",
                          global_config.fs_path, purged);
                 ListMgr_SetVar( &lmgr, LAST_PURGE_STATUS, status_str );
@@ -1179,7 +1179,7 @@ static int check_usergroup_trigger( unsigned trigger_index )
         info[1].sort_flag = SORT_NONE;
         info[1].filter = TRUE;
         info[1].filter_compar = MORETHAN_STRICT;
-        info[1].filter_value.val_biguint = p_trigger->hw_count;
+        info[1].filter_value.value.val_biguint = p_trigger->hw_count;
     }
     else /* volume based trigger */
     {
@@ -1189,7 +1189,7 @@ static int check_usergroup_trigger( unsigned trigger_index )
         info[1].sort_flag = SORT_NONE;
         info[1].filter = TRUE;
         info[1].filter_compar = MORETHAN_STRICT;
-        info[1].filter_value.val_biguint = max_blk512;
+        info[1].filter_value.value.val_biguint = max_blk512;
     }
 
     /* filtre non-invalid entries */
@@ -1197,14 +1197,14 @@ static int check_usergroup_trigger( unsigned trigger_index )
 
 #ifdef ATTR_INDEX_status
     /* don't consider released files in quota */
-    fv.val_int = STATUS_RELEASED;
+    fv.value.val_int = STATUS_RELEASED;
     lmgr_simple_filter_add( &filter, ATTR_INDEX_status, NOTEQUAL, fv,
                             FILTER_FLAG_ALLOW_NULL);
 #endif
 
 #if 0
     /** @TODO if accounting is enabled, don't filter to take benefits of accounting table */
-    fv.val_bool = TRUE;
+    fv.value.val_bool = TRUE;
 #ifdef ATTR_INDEX_invalid
     lmgr_simple_filter_add( &filter, ATTR_INDEX_invalid, NOTEQUAL, fv, 0 );
 #endif
@@ -1220,23 +1220,23 @@ static int check_usergroup_trigger( unsigned trigger_index )
          */
         if ( p_trigger->list_size == 1 )
         {
-            fv.val_str = p_trigger->list[0];
+            fv.value.val_str = p_trigger->list[0];
             lmgr_simple_filter_add( &filter, what_index, LIKE, fv, 0 );
         }
         else
         {
             int i;
 
-            fv.val_str = p_trigger->list[0];
+            fv.value.val_str = p_trigger->list[0];
             lmgr_simple_filter_add( &filter, what_index, LIKE, fv,
                                     FILTER_FLAG_BEGIN );
             for ( i = 1; i < p_trigger->list_size-1; i++ )
             {
-                fv.val_str = p_trigger->list[i];
+                fv.value.val_str = p_trigger->list[i];
                 lmgr_simple_filter_add( &filter, what_index, LIKE, fv,
                                         FILTER_FLAG_OR );
             }
-            fv.val_str = p_trigger->list[i];
+            fv.value.val_str = p_trigger->list[i];
             lmgr_simple_filter_add( &filter, what_index, LIKE, fv,
                                     FILTER_FLAG_OR | FILTER_FLAG_END );
         }
@@ -1391,7 +1391,7 @@ static int check_usergroup_trigger( unsigned trigger_index )
                     DisplayLog( LVL_CRIT, RESMON_TAG,
                                 "Purge aborted after releasing %Lu entries (%Lu blocks) for %s %s.",
                                 nb_purged, blocks_purged, what, result[0].value_u.val_str );
-                                
+
                     snprintf(status_str, 1024, "Purge on %s %s aborted by admin (after releasing %Lu entries, %Lu blocks)",
                              what, result[0].value_u.val_str, nb_purged, blocks_purged);
                     ListMgr_SetVar( &lmgr, LAST_PURGE_STATUS, status_str );
@@ -1794,7 +1794,7 @@ static void   *force_fs_trigger_thr( void *arg )
             DisplayLog( LVL_CRIT, RESMON_TAG,
                         "Purge aborted after releasing %Lu blocks in %s.",
                         purged, global_config.fs_path );
-                        
+
             snprintf(status_str, 1024, "Purge on %s aborted by admin (after releasing %Lu blocks)",
                      global_config.fs_path, purged);
             ListMgr_SetVar( &lmgr, LAST_PURGE_STATUS, status_str );
@@ -1912,7 +1912,7 @@ static void * force_purge_class_thr( void *arg )
         DisplayLog( LVL_CRIT, RESMON_TAG,
                     "Purge aborted after releasing %Lu entries, %Lu blocks in %s.",
                     nbr_purged, blocks_purged, descr );
-                    
+
         snprintf(status_str, 1024, "Purge on %s aborted by admin (after releasing %Lu entries, %Lu blocks)",
                  descr, nbr_purged, blocks_purged );
         ListMgr_SetVar( &lmgr, LAST_PURGE_STATUS, status_str );
@@ -2111,7 +2111,7 @@ out:
 /* ------------ Exported functions ------------ */
 
 /** Recompute trigger check interval as the GCD of all triggers */
-void ResMon_UpdateCheckInterval(  )
+void ResMon_UpdateCheckInterval( void )
 {
     unsigned int   i;
 
@@ -2162,12 +2162,18 @@ int Start_ResourceMonitor( resource_monitor_config_t * p_config, resmon_opt_t op
             return ENOENT;
         }
     }
+    if (NO_POLICY(&policies.purge_policies) && !(module_args.flags & FLAG_IGNORE_POL))
+    {
+        DisplayLog(LVL_CRIT, RESMON_TAG,
+            "No purge policy defined in configuration file... Disabling purge.");
+        return ENOENT;
+    }
 
     /* intervals must only be computed for daemon mode */
     if ( options.mode == RESMON_DAEMON )
         ResMon_UpdateCheckInterval(  );
     else
-       trigger_check_interval = 1; 
+       trigger_check_interval = 1;
 
     /* alloc and initialize trigger status array (except for FORCE_PURGE modes) */
     if ( ( module_args.mode != RESMON_PURGE_OST )
@@ -2244,7 +2250,7 @@ int Stop_ResourceMonitor()
 
 static int volatile waiting = 0;
 
-int Wait_ResourceMonitor()
+int Wait_ResourceMonitor( void )
 {
     void          *returned;
     int rc = 0;
@@ -2277,7 +2283,7 @@ int Wait_ResourceMonitor()
 }
 
 
-void Dump_ResourceMonitor_Stats(  )
+void Dump_ResourceMonitor_Stats( void )
 {
     unsigned int   status_tab[PURGE_ST_COUNT];
     unsigned long long feedback_tab[PURGE_FDBK_COUNT];

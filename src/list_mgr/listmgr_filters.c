@@ -71,16 +71,75 @@ static int convert_regexp( const char * in_string, char * db_string )
         strcpy( p_wild+1, p_end+1);
         *p_wild = '_';
     }
-    
+
 
    while ( (p_wild = strchr(db_string,'*')) != NULL )
         *p_wild = '%';
-    
+
     while ( (p_wild = strchr(db_string,'?')) != NULL )
         *p_wild = '_';
 
 
     return 0;
+}
+
+static int lmgr_simple_filter_dup_buffers(lmgr_filter_t * p_filter, unsigned int index)
+{
+    filter_comparator_t comparator = p_filter->filter_simple.filter_compar[index];
+    filter_value_t *p_value = &p_filter->filter_simple.filter_value[index];
+    int flag = p_filter->filter_simple.filter_flags[index];
+
+    /* TODO support lists of strings (with both FILTER_FLAG_ALLOC_STR and FILTER_FLAG_ALLOC_LIST */
+
+    if ( (comparator == LIKE) || (comparator == UNLIKE) )
+    {
+        int rc;
+        char * newstr = MemAlloc( strlen(p_value->value.val_str)+1 );
+
+        rc = convert_regexp( p_value->value.val_str, newstr );
+        if ( rc )
+            return rc;
+
+        /* free the previous string */
+        if ( flag & FILTER_FLAG_ALLOC_STR )
+            MemFree( (char*)p_value->value.val_str );
+
+        /* mark the new string as releasable */
+        p_filter->filter_simple.filter_flags[index] |= FILTER_FLAG_ALLOC_STR;
+        p_filter->filter_simple.filter_value[index].value.val_str = newstr;
+    }
+    else if ((comparator == IN) || (comparator == NOTIN) )
+    {
+        /* allocate and copy the list */
+        db_type_u *values = (db_type_u *)MemAlloc(p_value->list.count * sizeof(db_type_u));
+        memcpy(values, p_value->list.values, p_value->list.count * sizeof(db_type_u));
+
+        /* free the previous list */
+        if ( flag & FILTER_FLAG_ALLOC_LIST )
+            MemFree( (char*)p_value->list.values );
+
+        p_filter->filter_simple.filter_flags[index] |= FILTER_FLAG_ALLOC_LIST;
+        p_filter->filter_simple.filter_value[index].list.values = values;
+    }
+
+    return 0;
+}
+
+static void lmgr_simple_filter_free_buffers(lmgr_filter_t * p_filter, unsigned int index)
+{
+    /* TODO support lists of strings (with both FILTER_FLAG_ALLOC_STR and FILTER_FLAG_ALLOC_LIST */
+
+    /* check if previous value must be released */
+    if ( ( p_filter->filter_simple.filter_flags[index] & FILTER_FLAG_ALLOC_STR )
+         && ( p_filter->filter_simple.filter_value[index].value.val_str != NULL ) )
+    {
+        MemFree( (char*)p_filter->filter_simple.filter_value[index].value.val_str );
+    }
+    else if (( p_filter->filter_simple.filter_flags[index] & FILTER_FLAG_ALLOC_LIST)
+            && ( p_filter->filter_simple.filter_value[index].list.values != NULL ))
+    {
+        MemFree( (char*)p_filter->filter_simple.filter_value[index].list.values );
+    }
 }
 
 
@@ -89,6 +148,7 @@ int lmgr_simple_filter_add( lmgr_filter_t * p_filter, unsigned int attr_index,
                             filter_comparator_t comparator, filter_value_t value,
                             int flag )
 {
+    int rc;
 
     if ( p_filter->filter_type != FILTER_SIMPLE )
         return DB_INVALID_ARG;
@@ -123,27 +183,30 @@ int lmgr_simple_filter_add( lmgr_filter_t * p_filter, unsigned int attr_index,
     p_filter->filter_simple.filter_compar[p_filter->filter_simple.filter_count] = comparator;
     p_filter->filter_simple.filter_value[p_filter->filter_simple.filter_count] = value;
 
-    
-    if ( (comparator == LIKE) || (comparator == UNLIKE) )
-    {
-        int rc;
-        char * newstr = MemAlloc( strlen(value.val_str)+1 ); 
-
-        rc = convert_regexp( value.val_str, newstr );
-        if ( rc )
-            return rc;
-
-        /* free the previous string */
-        if ( flag & FILTER_FLAG_ALLOC_STR )
-            MemFree( (char*)value.val_str );
-        
-        /* mark the new string as releasable */
-        p_filter->filter_simple.filter_flags[p_filter->filter_simple.filter_count] |= FILTER_FLAG_ALLOC_STR;
-        p_filter->filter_simple.filter_value[p_filter->filter_simple.filter_count].val_str = newstr;
-    }
+    /* duplicate and copy buffers if needed */
+    rc = lmgr_simple_filter_dup_buffers(p_filter, p_filter->filter_simple.filter_count);
+    if (rc)
+        return rc;
 
     p_filter->filter_simple.filter_count++;
 
+    return 0;
+}
+
+/* check if the given attribute is part of a filter */
+int lmgr_filter_check_field(const lmgr_filter_t *p_filter, unsigned int attr_index)
+{
+    unsigned int i;
+
+    if (p_filter->filter_type != FILTER_SIMPLE)
+        return DB_INVALID_ARG;
+
+    /* first check if there is already a filter on this argument */
+    for (i = 0; i < p_filter->filter_simple.filter_count; i++)
+    {
+        if (p_filter->filter_simple.filter_index[i] == attr_index)
+            return 1;
+    }
     return 0;
 }
 
@@ -152,7 +215,8 @@ int lmgr_simple_filter_add_or_replace( lmgr_filter_t * p_filter,
                                        filter_comparator_t comparator, filter_value_t value,
                                        int flag )
 {
-    unsigned int   i;
+    unsigned int  i;
+    int rc;
 
     if ( p_filter->filter_type != FILTER_SIMPLE )
         return DB_INVALID_ARG;
@@ -164,34 +228,16 @@ int lmgr_simple_filter_add_or_replace( lmgr_filter_t * p_filter,
         {
 
             /* check if previous value must be released */
-            if ( ( p_filter->filter_simple.filter_flags[i] & FILTER_FLAG_ALLOC_STR )
-                 && ( p_filter->filter_simple.filter_value[i].val_str != NULL ) )
-            {
-                MemFree( (char*)p_filter->filter_simple.filter_value[i].val_str );
-            }
+            lmgr_simple_filter_free_buffers(p_filter, i);
 
             p_filter->filter_simple.filter_flags[i] = flag;
             p_filter->filter_simple.filter_compar[i] = comparator;
             p_filter->filter_simple.filter_value[i] = value;
 
-            if ( (comparator == LIKE) || (comparator == UNLIKE) )
-            {
-                int rc;
-                char * newstr = MemAlloc( strlen(value.val_str)+1 );
-
-                rc = convert_regexp( value.val_str, newstr );
-                if ( rc )
-                    return rc;
-
-
-                /* free the previous string */
-                if ( flag & FILTER_FLAG_ALLOC_STR )
-                    MemFree( (char*)value.val_str );
-                
-                /* mark the new string as releasable */
-                p_filter->filter_simple.filter_flags[i] |= FILTER_FLAG_ALLOC_STR;
-                p_filter->filter_simple.filter_value[i].val_str = newstr;
-            }
+            /* duplicate and copy buffers if needed */
+            rc = lmgr_simple_filter_dup_buffers(p_filter, i);
+            if (rc)
+                return rc;
 
             return 0;
         }
@@ -199,7 +245,6 @@ int lmgr_simple_filter_add_or_replace( lmgr_filter_t * p_filter,
 
     /* not found: add it */
     return lmgr_simple_filter_add( p_filter, attr_index, comparator, value, flag );
-
 }
 
 int lmgr_simple_filter_add_if_not_exist( lmgr_filter_t * p_filter,
@@ -235,13 +280,7 @@ int lmgr_simple_filter_free( lmgr_filter_t * p_filter )
 
     /* free the values that must be released */
     for ( i = 0; i < p_filter->filter_simple.filter_count; i++ )
-    {
-        if ( ( p_filter->filter_simple.filter_flags[i] & FILTER_FLAG_ALLOC_STR )
-             && ( p_filter->filter_simple.filter_value[i].val_str != NULL ) )
-        {
-            MemFree( (char*)p_filter->filter_simple.filter_value[i].val_str );
-        }
-    }
+        lmgr_simple_filter_free_buffers(p_filter, i);
 
     if ( p_filter->filter_simple.filter_flags )
         MemFree( p_filter->filter_simple.filter_flags );
@@ -277,15 +316,15 @@ static int is_simple_AND_expr( bool_node_t * boolexpr )
                          && is_simple_AND_expr(  boolexpr->content_u.bool_expr.expr2 ) );
             else
                 return FALSE;
-                
+
         case NODE_CONDITION:
             /* If attribute is in DB, it can be filtered
              * If attribute is not in DB, we ignore it and get all entries (~ AND TRUE)
-             */ 
+             */
             return TRUE;
 
         default:
-            DisplayLog( LVL_CRIT, LISTMGR_TAG, "Invalid boolean expression in %s()", __FUNCTION__ );            
+            DisplayLog( LVL_CRIT, LISTMGR_TAG, "Invalid boolean expression in %s()", __FUNCTION__ );
             return FALSE;
     }
 
@@ -314,7 +353,7 @@ static int append_simple_AND_expr( bool_node_t * boolexpr, lmgr_filter_t * filte
             if ( boolexpr->content_u.bool_expr.expr1->node_type != NODE_CONDITION )
                 /* do nothing (equivalent to 'AND TRUE') */
                 return 0;
-        
+
             /* get info about condition */
             rc = CriteriaToFilter( boolexpr->content_u.bool_expr.expr1->content_u.condition,
                                    &index, &comp, &val, &must_free );
@@ -327,6 +366,8 @@ static int append_simple_AND_expr( bool_node_t * boolexpr, lmgr_filter_t * filte
             if (must_free)
                 flag |= FILTER_FLAG_ALLOC_STR;
 
+            /* TODO support FILTER_FLAG_ALLOC_LIST */
+
             /* add condition to filter */
             DisplayLog( LVL_FULL, LISTMGR_TAG, "Appending filter on \"%s\"", field_infos[index].field_name );
             return lmgr_simple_filter_add_if_not_exist( filter, index, comp, val, flag );
@@ -334,7 +375,7 @@ static int append_simple_AND_expr( bool_node_t * boolexpr, lmgr_filter_t * filte
          case NODE_CONDITION:
             /* If attribute is in DB, it can be filtered
              * If attribute is not in DB, we ignore it and get all entries (~ AND TRUE)
-             */ 
+             */
             /* get info about condition */
             rc = CriteriaToFilter( boolexpr->content_u.condition,
                                    &index, &comp, &val, &must_free );
@@ -347,12 +388,13 @@ static int append_simple_AND_expr( bool_node_t * boolexpr, lmgr_filter_t * filte
             if (must_free)
                 flag |= FILTER_FLAG_ALLOC_STR;
 
+            /* TODO support FILTER_FLAG_ALLOC_LIST */
+
             /* add condition to filter */
             DisplayLog( LVL_FULL, LISTMGR_TAG, "Appending filter on \"%s\"", field_infos[index].field_name );
             return lmgr_simple_filter_add_if_not_exist( filter, index, comp, val, flag );
 
             return TRUE;
-           
 
         case NODE_BINARY_EXPR:
             if ( boolexpr->content_u.bool_expr.bool_op == BOOL_AND )
@@ -371,7 +413,6 @@ static int append_simple_AND_expr( bool_node_t * boolexpr, lmgr_filter_t * filte
                         boolexpr->node_type, __FUNCTION__ );
             return DB_INVALID_ARG;
     }
-
 }
 
 /** Convert simple expressions to ListMgr filter (append filter) */
@@ -408,5 +449,5 @@ int lmgr_check_filter_fields( lmgr_filter_t * p_filter, unsigned int attr_mask )
     }
 
     return DB_SUCCESS;
- 
+
 }

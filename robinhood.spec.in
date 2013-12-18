@@ -1,7 +1,7 @@
 ##
 # rpm macros for old systems < el5
 # (defined if bcond_with does not already exist)
-# 
+#
 %if %{?bcond_with:0}%{!?bcond_with:1}
 %define nil                    %{!?nil}
 %define defined()      %{expand:%%{?%{1}:1}%%{!?%{1}:0}}
@@ -15,12 +15,12 @@
 #####################################
 # define 'with' conditions
 %bcond_with lustre
-%bcond_with hsm
+%bcond_with lhsm
 %bcond_with mysql
 %bcond_with sqlite
-%bcond_with sherpa
 %bcond_with backup
 %bcond_with shook
+%bcond_with recovtools
 
 # macro for defining dependencies
 
@@ -31,9 +31,8 @@ Requires: %{lpackage} >= %{lversion}         \
 BuildRequires: %{lpackage} >= %{lversion}    \
 %endif \
 %endif \
-%if %{with mysql}                    \
-Requires: mysql >= %{dbversion}      \
-BuildRequires: mysql-devel >= 4.1    \
+%if %{with mysql}                            \
+BuildRequires: /usr/include/mysql/mysql.h    \
 %endif \
 %{nil}
 
@@ -43,7 +42,7 @@ BuildRequires: mysql-devel >= 4.1    \
 ###### end of macro definitions #####
 
 Name: @PACKAGE@
-Version: @VERSION@ 
+Version: @VERSION@
 
 Vendor: CEA, HPC department <http://www-hpc.cea.fr>
 Prefix: %{_prefix}
@@ -64,7 +63,7 @@ Release: @RELEASE@%{?config_dependant}%{?db_dependant}%{?dist}
 
 
 Summary: Robinhood - Policy engine and accounting tool for large filesystems
-License: CeCILL 
+License: CeCILL-C
 Group: Applications/System
 Url: http://robinhood.sourceforge.net
 Source0: @PACKAGE@-%{version}.tar.gz
@@ -72,17 +71,17 @@ BuildRequires: /usr/bin/Mail, libattr-devel, mysql-devel
 BuildRoot: %{_tmppath}/%{name}-%{version}-%{release}-root-%(%{__id_u} -n)
 
 %description
-Robinhood is a tool for monitoring and purging file systems. It is designed to 
+Robinhood is a tool for monitoring and purging file systems. It is designed to
 process all its tasks in parallel, so it is particulary adapted for managing
 large file systems with millions of entries and petabytes of data.
 
 Generated using options: @ac_configure_args@
 
+
 %package adm
 Summary: admin/config helper for Robinhood PolicyEngine
 Group: Applications/System
 Release: @RELEASE@.noarch
-%pkg_dependencies
 
 %description adm
 This RPM provides admin/config helper for Robinhood PolicyEngine (command rbh-config)
@@ -98,13 +97,23 @@ Requires: php, php-mysql, php-xml, php-gd, php-pdo
 Web interface to vizualize filesystems stats.
 This uses robinhood database to display misc. user and group stats.
 
+%if %{with recovtools}
+%package recov-tools
+Summary: Tools for MDS recovery.
+Group: Applications/System
+
+%description recov-tools
+Tools for MDS recovery.
+%endif
+
+
 #summary, description and dependencies of each purpose
-%if %{with hsm}
+%if %{with lhsm}
 
 %define configure_purpose LUSTRE_HSM
-%define purpose hsm
-%define purpose_svc robinhood-hsm
-%define purpose_bin rbh-hsm
+%define purpose lhsm
+%define purpose_svc robinhood-lhsm
+%define purpose_bin rbh-lhsm
 
 %package %{purpose}
 Summary: PolicyEngine for Lustre-HSM binding
@@ -116,29 +125,6 @@ Requires: %{name}-adm >= %{version}
 Monitor Lustre usage and trigger file migration and purges.
 
 Generated using options: @ac_configure_args@
-%else
-%if %{with sherpa}
-
-%define configure_purpose SHERPA
-%define purpose sherpa
-%define purpose_svc robinhood-sherpa
-%define purpose_bin rbh-sherpa
-
-%package %{purpose}
-Summary: PolicyEngine for SHERPA cache manager
-Group: Applications/System
-BuildRequires: sherpa-server >= 4.1-150
-BuildRequires: sherpa-client >= 4.1
-Requires: sherpa-server >= 4.1-150
-Requires: sherpa-client >= 4.1
-%pkg_dependencies
-Requires: %{name}-adm >= %{version}
-
-%description %{purpose}
-PolicyEngine for SHERPA cache manager
-
-Generated using options: @ac_configure_args@
-
 %else
 # backup mode
 %if %{with backup}
@@ -172,8 +158,8 @@ Summary: PolicyEngine for simple HSM binding
 Group: Applications/System
 %pkg_dependencies
 Requires: %{name}-adm >= %{version}
-BuildRequires: shook-server >= 1.3.0
-Requires: shook-server >= 1.3.0
+BuildRequires: shook-server >= 1.3.5
+Requires: shook-server >= 1.3.5
 
 %description %{purpose}
 Backup modified files to an external backend
@@ -181,6 +167,21 @@ and automatically trigger data restore using
 shook library.
 
 Generated using options: @ac_configure_args@
+
+%package %{purpose}-annex
+Summary: Annex tools for simple HSM binding
+Group: Applications/System
+%pkg_dependencies
+BuildRequires: shook-server >= 1.3.5
+Requires: shook-server >= 1.3.5
+
+%description %{purpose}-annex
+Annex tools for simple HSM binding.
+Can run on different nodes than robinhood
+daemon.
+
+Generated using options: @ac_configure_args@
+
 %else
 
 # TMP FS MGR
@@ -206,17 +207,14 @@ Generated using options: @ac_configure_args@
 %endif
 %endif
 %endif
-%endif
 
 %prep
 %setup -q -n @PACKAGE@-%{version}
 
 %build
 ./configure @ac_configure_args@ %{?configure_flags:configure_flags} \
-        --sysconfdir=%{_sysconfdir} \
         --mandir=%{_mandir} \
-        --libdir=%{_libdir} \
-        --prefix=%{_prefix}
+        --libdir=%{_libdir}
 make
 
 %install
@@ -271,6 +269,18 @@ fi
 %files adm
 %{_sbindir}/rbh-config
 
+%if %{with recovtools}
+%files recov-tools
+%{_sbindir}/*lovea
+%{_sbindir}/gen_lov_objid
+%{_sbindir}/ost_fids_remap
+%endif
+
+%if %{with shook}
+%files %{purpose}-annex
+%{_sbindir}/%{purpose_bin}-rebind
+%endif
+
 %files webgui
 
 # set apache permissions
@@ -280,18 +290,33 @@ fi
 %files %{purpose}
 %defattr(-,root,root,-)
 #%doc README
-#%doc COPYING 
+#%doc COPYING
 #%doc ChangeLog
 
 # everythink in sbin, except rbh-config which is in adm
-%{_sbindir}/%{purpose_bin}*
+%if %{with shook}
+%exclude %{_sbindir}/%{purpose_bin}-rebind
+%{_sbindir}/%{purpose_bin}-import
+%{_sbindir}/%{purpose_bin}-recov
+%{_sbindir}/%{purpose_bin}-undo-rm
+%endif
+
+%if %{with backup}
+%{_sbindir}/%{purpose_bin}-import
+%{_sbindir}/%{purpose_bin}-recov
+%{_sbindir}/%{purpose_bin}-rebind
+%{_sbindir}/%{purpose_bin}-undo-rm
+%endif
+
+%{_sbindir}/%{purpose_bin}
 %{_sbindir}/*-report
+%{_sbindir}/*-diff
 %{_bindir}/*-du
 %{_bindir}/*-find
+
 %if %{with backup}
 %{_sbindir}/rbhext_*
 %endif
-
 %if %{with shook}
 %{_sbindir}/rbhext_*
 %endif
@@ -311,6 +336,146 @@ fi
 %{_initrddir}/%{purpose_svc}
 
 %changelog
+
+* Wed Nov 27 2013 Thomas Leibovici <thomas.leibovici@cea.fr> 2.5.0
+Summary:
+- filesystem disaster recovery features
+- new namespace management (new DB schema to properly handle hardlinks, renames...)
+- scanning and changelog processing optimizations
+- database optimizations (requests batching)
+- many other changes, improvements and code cleaning...
+
+Details:
+- rbh-diff:
+    * new command to detect differences between the filesystem and the information
+      in robinhood database.
+    * option "--apply=fs" for disaster recovery purpose: restore the filesystem
+      metadata from robinhood DB.
+    * makes it possible to rebuild a Lustre MDT from scratch, or from a LVM snapshot
+      (see "Robinhood Lustre disaster recovery guide" for more details).
+- database:
+    * new namespace implementation in database with new NAMES table (Cray contribution)
+        - fixes/improves hardlink support
+        - fixes/improves Lustre ChangeLog hardlink/rename/unlink support
+        - saves DB storage space
+    * database request batching: significantly increase database ingest rate.
+      No longer needs innodb_flush_log_at_tx_commit != 1 to speed up DB operations.
+    * additional information in DB that can help for disaster recovery:
+      symlink info, access rights, stripe object indexes, stripe order, nlink...
+    * set default commit behavior to transaction (prevent from DB inconsistencies)
+    * optimized multi-table requests
+    * optimization: minimized attribute set in DB update operations
+      (don't update attributes that didn't change)
+    * Fix: deal with mysql case insensitivity for string matching
+    * triggers and stored procedures versioning mechanism
+    * prevent from overflows for large INSERT requests, wide stripes...
+    * prevent from DB deadlocks
+- scanning:
+    * --partial-scan option is deprecated and replaced by an optional argument to --scan (e.g. --scan=/fs/subdir).
+    * better management of partial scans:
+        - better detection of removed entries vs. entries moved from a directory to another.
+        - partial scans can be used for initial DB population (even if the DB is initially empty).
+    * garbage collection of removed entries in DB is a long operation when terminating a scan (and even more
+      when terminating a partial scan). Added --no-gc option to skip it (recommanded for partial scans).
+    * automatically enabling --no-gc if the DB is initially empty (eg. for initial scan).
+    * optimization: use *at() functions (openat, fstatat) and readdir by chunk (using getdents) instead of POSIX lstat() and readdir_r().
+    * optimization: use NOATIME flag to access entries as much as possible
+    * optimizations of get_stripe and get_fid operations.
+    * new --diff option for robinhood --scan and --readlog: output detected changes in a diff-like format.
+- Lustre changelogs:
+    * changelog batching (Cray contribution): to speed up changelog processing,
+      robinhood retains changelog records in memory a short time,
+      to aggregate similar/redundant Changelog records on the same entry before
+      updating its database.
+    * support multiple changelog readers (for DNE) as multiple threads (default)
+      or as multiple processes, possibly on different hosts, by giving a MDT index
+      to --readlog option.
+    * resilience to filesystem umount/mount.
+- rbh-report:
+    * new option --entry-info to get all the stored information about an entry
+    * option --dump-ost can now list multiple OSTs and support ranges notation (e.g. 3,5-8,12-23).
+    * --dump-ost output indicates if a file has data on a given OST (could be striped on the OST but have no data on it).
+- rbh-find:
+    * new option -crtime to filter entries on creation time.
+    * output ordering closer to find output
+    * added missing info in 'rbh-find -ls' output (nlink, mode, symlink info...)
+- robinhood-backup:
+    * by default, use a built-in copy function to avoid the cost of forking copy commands.
+    * rbh-backup-rebind: tool to rebind an entry in the backend if its fid changed in the filesystem
+      for any reason (file copied to a new one to change its stripe, etc...)
+    * rbh-backup-recov new features and options:
+        --list (list information about entries to be recovered)
+        --ost <ost_set> to only recover entries for a given set of OSTs (support range notation):
+            the basic use-case is OST disaster recovery.
+        --since <time> to only recover entries modified since a given date:
+            the basic use case is after restoring an OST snapshot.
+    * symlinks archiving to backend made optional (new parameter 'archive_symlinks')
+      as they can now be restored using robinhood database information.
+- configuration:
+    * can specify environment variables in config file (e.g. fs_path = $ROOT_DIR ;)
+    * prevent from using a wrong config file (Cray contribution):
+        - only check files in /etc/robinhood.d/<purpose>, no longer in the current directory
+        - fails if to many config files are available.
+
+* Mon Jul 22 2013 Thomas Leibovici <thomas.leibovici@cea.fr> 2.4.3
+- [lustre] support of Lustre 2.4
+    - DNE not fully supported yet: if running multiple MDS,
+      run 1 instance of changelog reader per MDT.
+    - Detect file layout changes (new changelog record CL_LAYOUT).
+- [lustre] added statistics about changelog processing speed.
+- [policies] new parameter 'recheck_ignored_classes' to allow/avoid
+    rematching entries from ignored classes in migration and purge policies.
+- [web ui] security patch to prevent from SQL injection.
+- [lustre] fix stack overflow when handling files with wide stripes.
+- [DB] better handling of ER_QUERY_INTERRUPTED MySQL error.
+- [DB] fixed DB connection leaks.
+- Backup & HSM modes:
+   - [doc] added config tutorial for backup mode
+   - [fix] fix segfault in import command when uid/gid can't be resolved.
+   - [rbh-report] fix bad display of total volume with -u or -g.
+- Migration policy features and optimizations:
+   - [feature] new parameter 'lru_sort_attr' to select LRU sort criteria for policy application.
+        Previously based on last modification time, it can now be one of:
+        creation, last_archive, last_mod, last_access.
+   - [feature] special meaning for condition 'last_archive == 0':
+        matches entries that have never been archived.
+   - [feature] suspend migration if copy error rate exceed a threshold.
+        This is controled by 'suspend_error_pct' and 'suspend_error_min' parameters.
+   - [stats] migration stats while migration is running: added skipped and error counters.
+   - [optim] avoid rechecking ignored entries at each pass
+   - [optim] smoother feeding of migration workers queue
+- Code & environment:
+   - [build] can specify a path to alternative lustre source tree in ./configure
+   - [tests] allow specifying an alternative path to lfs command
+
+* Mon Mar 11 2013 Thomas Leibovici <thomas.leibovici@cea.fr> 2.4.2
+- [general] immediate exit on ctrl+C: don't process all queued operations, just finish current.
+- [general] LSB compliance if daemon is already started.
+- [DB] validation with MariaDB (replacement for MySQL in Fedora19).
+- [config] can set default config file using RBH_CFG_DEFAULT environment variable.
+- [config] more precise message if no config file is found.
+- [rbh-find] added -not/-! option to rbh-find.
+- [lustre] fix for 16 chars pool names.
+- [bugfix] fixed memleak in rbh-find.
+- [bugfix] fixed segfault if checking scan deadline occured exactly when scan ended.
+- [logs] display bandwidth and rate stats during migration run.
+- [logs] fix: DB get operations were counted twice in stats.
+- [cosmetic] removed "connection failed" warning for one shot commands.
+- [cosmetic] fix typos in logs.
+- [devel] port to automake 1.12 (since Fedora18).
+- [shook] port to shook 1.3.5
+
+* Mon Jan 28 2013 Thomas Leibovici <thomas.leibovici@cea.fr> 2.4.1
+- [lustre] better file size change detection using CLOSE events
+  from MDT ChangeLog (requires Lustre 2.2 or +)
+- [scan] optimization: using fstatat and getdents
+- [rbh-find] added -atime/-amin options
+- [logs] add'l information in logs (DB operations, HSM_rm details)
+- [logs] log to stderr if opening of the log file fails
+- [fix] scan blocked if final DB operation failed
+- [fix] avoid DB lock exhaustion for huge requests
+- [backup] manage cross device rename in backend
+- [backup] rebind an entry in backend after fid change (e.g. restripe)
 
 * Wed Oct 31 2012 Thomas Leibovici <thomas.leibovici@cea.fr> 2.4.0
 - [feature] rbh-du and rbh-find: "du" and "find" clones querying robinhood's database
@@ -335,7 +500,7 @@ fi
 - [lustre] support for new Changelog record struct (lu-1331)
 - [fix] max_rm_count=0 resulted in no rm (instead of unlimited)
 - [fix] segfault in realpath() on Ubuntu
-- [fix] unsigned arythmetic issue with MySQL 5.5
+- [fix] unsigned arithmetic issue with MySQL 5.5
 
 * Thu Jul 05 2012 Thomas Leibovici <thomas.leibovici@cea.fr> 2.3.4
 - Faster and safer shutdown on SIGINT/SIGTERM
@@ -465,7 +630,7 @@ fi
 - [feature] special wildcard '**' in 'path ' or 'tree' conditions matches any count of directory levels
 - [feature] quota-like purge triggers fully implemented (on group or user)
 - [feature] triggers on used inode count in filesystem
-- [feature] '--check-triggers' option to check triggers without purging files 
+- [feature] '--check-triggers' option to check triggers without purging files
 - [feature] notification can be sent when a high watermark is reached (for triggers)
 - [feature] rbh-config helper now supports batch commands
 - [feature] Lustre 2.0 ready
@@ -536,7 +701,7 @@ in Lustre yet).
 - Display warning for unknown parameters in config file
 - Cosmetic fixes in config parsing
 - Clean shutdown on SIGTERM or SIGINT
-- Reloading dynamic parameters on SIGHUP (including numerical values in policy definition) 
+- Reloading dynamic parameters on SIGHUP (including numerical values in policy definition)
 
 * Mon Mar 2 2009 Thomas Leibovici <thomas.leibovici@cea.fr> 2.0.0-beta1
 - Reporting tool

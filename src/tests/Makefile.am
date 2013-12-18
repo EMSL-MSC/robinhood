@@ -1,7 +1,7 @@
 AM_CFLAGS= $(CC_OPT) $(DB_CFLAGS) $(PURPOSE_CFLAGS)
 AM_LDFLAGS= -lpthread
 
-check_PROGRAMS=test_hash_func test_uidgidcache test_list_mgr test_entry_proc test_info_collector test_resource_monitor
+check_PROGRAMS=create_nostripe test_forcestripe test_hash_func test_uidgidcache test_list_mgr test_entry_proc test_info_collector test_resource_monitor
 
 all_libs=	../logs/liblogs.la \
 	        ../cfg_parsing/libconfigparsing.la \
@@ -19,11 +19,6 @@ if TMP_FS_MGR
 all_libs += ../policy_modules/purge/libresmonitor.la
 all_libs += ../policy_modules/rmdir/librmdir.la
 endif
-if SHERPA
-all_libs += ../policy_modules/purge/libresmonitor.la
-all_libs += ../policy_modules/rmdir/librmdir.la
-all_libs += ../policy_modules/migration/libmigration.la
-endif
 if LUSTRE_HSM
 all_libs += ../policy_modules/purge/libresmonitor.la
 all_libs += ../policy_modules/migration/libmigration.la
@@ -39,6 +34,7 @@ all_libs += ../list_mgr/liblistmgr.la
 all_libs += ../common/libcommontools.la
 
 
+test_forcestripe_LDADD=$(all_libs)  $(DB_LDFLAGS) $(PURPOSE_LDFLAGS) $(FS_LDFLAGS)
 
 test_list_mgr_LDADD=$(all_libs)  $(DB_LDFLAGS) $(PURPOSE_LDFLAGS) $(FS_LDFLAGS)
 

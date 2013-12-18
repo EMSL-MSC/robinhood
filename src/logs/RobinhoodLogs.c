@@ -62,7 +62,7 @@
 
 static int     log_initialized = FALSE;
 
-static log_config_t log_config = {
+log_config_t log_config = {
     .debug_level = LVL_EVENT, /* used for non-initialized logging */
     .syslog_facility = LOG_LOCAL1,
     .syslog_priority = LOG_INFO
@@ -141,7 +141,7 @@ static unsigned int next_index = 1;
 
 
 /* init check */
-static inline void log_init_check(  )
+static inline void log_init_check( void )
 {
     if ( !log_initialized )
     {
@@ -160,7 +160,7 @@ static void init_keys( void )
 
 
 /* returns thread index */
-static unsigned int GetThreadIndex(  )
+static unsigned int GetThreadIndex( void )
 {
 
 #if HAVE_PTHREAD_GETSEQUENCE_NP
@@ -219,8 +219,12 @@ static int init_log_descr( const char * logname, log_stream_t * p_log )
         p_log->log_type = RBH_LOG_REGFILE;
         p_log->f_log = fopen( logname, "a" );
 
-        if ( p_log->f_log == NULL )
-            return -1;
+        if ( p_log->f_log == NULL ) {
+            fprintf(stderr, "Error opening log file %s: %s. Logging to stderr instead.\n", logname, strerror(errno));
+            p_log->log_type = RBH_LOG_STDIO;
+            p_log->f_log  = stderr;
+            return 0; /* do not propagate error as there is a workaround */
+        }
 
         if ( fstat( fileno( p_log->f_log ), &filestat ) != -1 )
             p_log->f_ino = filestat.st_ino;
@@ -348,7 +352,7 @@ static void flush_log_descr( log_stream_t * p_log )
 
 
 /* Flush logs (for example, at the end of a purge pass or after dumping stats) */
-void FlushLogs(  )
+void FlushLogs( void )
 {
     log_init_check(  );
 
@@ -392,7 +396,7 @@ static void test_log_descr( const char * logname, log_stream_t * p_log )
 
 /* check if log file have been renamed */
 
-static void test_file_names(  )
+static void test_file_names( void )
 {
     log_init_check(  );
 
@@ -435,7 +439,7 @@ int str2debuglevel( char *str )
     return -1;
 }
 
-void display_line_log( log_stream_t * p_log, const char * tag,
+static void display_line_log( log_stream_t * p_log, const char * tag,
                        const char *format, va_list arglist )
 {
     char           line_log[MAX_LINE_LEN];
@@ -540,7 +544,7 @@ static void display_line_log_( log_stream_t * p_log, const char * tag,
  *  If logs are not initialized, write to stderr.
  */
 
-void DisplayLog( int debug_level, const char *tag, const char *format, ... )
+void DisplayLogFn( int debug_level, const char *tag, const char *format, ... )
 {
     time_t         now = time( NULL );
     va_list        args;
@@ -908,7 +912,7 @@ void RaiseAlert( const char *title, const char *format, ... )
 }                               /* DisplayAlert */
 
 /* Wait for next stat deadline */
-void WaitStatsInterval(  )
+void WaitStatsInterval( void )
 {
     rh_sleep( log_config.stats_interval );
 }
@@ -1192,7 +1196,7 @@ int WriteLogConfigTemplate( FILE * output )
     print_line( output, 1, "stats_interval = 20min ;" );
     fprintf( output, "\n" );
     print_line( output, 1, "# Alert batching (to send a digest instead of 1 alert per file)" );
-    print_line( output, 1, "# 0: unlimited batch size, 1: no batching (1 alert per file)," ); 
+    print_line( output, 1, "# 0: unlimited batch size, 1: no batching (1 alert per file)," );
     print_line( output, 1, "# N>1: batch N alerts per digest" );
     print_line( output, 1, "batch_alert_max = 5000 ;" );
     print_line( output, 1, "# Give the detail of entry attributes for each alert?" );

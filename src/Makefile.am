@@ -8,7 +8,7 @@ if HSM_LITE
 SUBDIRS+=backend_ext
 endif
 
-SUBDIRS += robinhood tests
+SUBDIRS += robinhood tools tests
 
 indent:
 	for d in $(SUBDIRS); do 	\

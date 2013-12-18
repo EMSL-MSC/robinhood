@@ -12,7 +12,7 @@
  * accept its terms.
  */
 /**
- * Misc tools for managing entry processor pipeline 
+ * Misc tools for managing entry processor pipeline
  */
 
 #ifdef HAVE_CONFIG_H
@@ -20,6 +20,7 @@
 #endif
 
 #include "entry_proc_tools.h"
+#include "entry_proc_hash.h"
 #include "Memory.h"
 #include "RobinhoodLogs.h"
 #include "RobinhoodConfig.h"
@@ -32,116 +33,45 @@
 entry_proc_config_t entry_proc_conf;
 int                 pipeline_flags = 0;
 
-#define ID_HASH_SIZE 7919
-
-typedef struct id_constraint_item__
-{
-    /* operation associated to this id */
-    entry_proc_op_t *op_ptr;
-
-    /* for chained list */
-    struct id_constraint_item__ *p_next;
-
-} id_constraint_item_t;
-
-typedef struct id_constraint_slot__
-{
-    pthread_mutex_t lock;
-    id_constraint_item_t *id_list_first;
-    id_constraint_item_t *id_list_last;
-    unsigned int   count;
-} id_constraint_slot_t;
-
 /* hash table for storing references to ids */
-static id_constraint_slot_t id_hash[ID_HASH_SIZE];
-
-/**
- * @TODO use better hash functions (see http://burtleburtle.net/bob/c/lookup3.c)
- */
-static inline unsigned int hash_id( entry_id_t * p_id, unsigned int modulo )
-{
-#ifdef FID_PK
-    unsigned int   val = 1;
-    char          *buffer;
-    unsigned int   index;
-
-    buffer = ( char * ) &( p_id->f_seq );
-
-    for ( index = 0; index < sizeof( p_id->f_seq ); index++ )
-        val = ( val << 5 ) - val + ( unsigned int ) ( buffer[index] );
-
-    buffer = ( char * ) &( p_id->f_oid );
-
-    for ( index = 0; index < sizeof( p_id->f_oid ); index++ )
-        val = ( val << 5 ) - val + ( unsigned int ) ( buffer[index] );
-
-    return val % modulo;
-
-#else
-    unsigned long long lval;
-    /* polynom of prime numbers */
-    lval = 1873 * p_id->fs_key + 3511 * p_id->inode + 10267;
-
-    lval = lval % modulo;
-
-    return lval;
-
-#endif
-}
-
+#define ID_HASH_SIZE 7919
+static struct id_hash *id_constraint_hash;
 
 /** initialize id constraint manager */
-int id_constraint_init(  )
+int id_constraint_init( void )
 {
-    unsigned int   i;
-    for ( i = 0; i < ID_HASH_SIZE; i++ )
-    {
-        pthread_mutex_init( &id_hash[i].lock, NULL );
-        id_hash[i].id_list_first = NULL;
-        id_hash[i].id_list_last = NULL;
-        id_hash[i].count = 0;
-    }
-    return 0;
+    id_constraint_hash = id_hash_init(ID_HASH_SIZE, TRUE);
+    return id_constraint_hash == NULL;     /* TODO: this is not checked */
 }
 
 /**
  * This is called to register the operation (with the ordering of pipeline)
+ * Normal operation is to register at the tail.
  * @return ID_OK if the entry can be processed.
  *         ID_MISSING if the ID is not set in p_op structure
  *         ID_ALREADY if the op_structure has already been registered
  */
-int id_constraint_register( entry_proc_op_t * p_op )
+int id_constraint_register( entry_proc_op_t * p_op, int at_head )
 {
-    unsigned int   hash_index;
-    id_constraint_item_t *p_new;
+    struct id_hash_slot *slot;
 
     if ( !p_op->entry_id_is_set )
         return ID_MISSING;
 
     /* compute id hash value */
-    hash_index = hash_id( &p_op->entry_id, ID_HASH_SIZE );
+    slot = get_hash_slot(id_constraint_hash, &p_op->entry_id);
 
-    P( id_hash[hash_index].lock );
+    P( slot->lock );
 
-    /* no constraint violation detected, register the entry */
-    p_new = ( id_constraint_item_t * ) MemAlloc( sizeof( id_constraint_item_t ) );
-
-    p_new->op_ptr = p_op;
-
-    /* always insert in queue */
-    p_new->p_next = NULL;
-
-    if ( id_hash[hash_index].id_list_last )
-        id_hash[hash_index].id_list_last->p_next = p_new;
+    if (at_head)
+        rh_list_add(&p_op->hash_list, &slot->list);
     else
-        id_hash[hash_index].id_list_first = p_new;
+        rh_list_add_tail(&p_op->hash_list, &slot->list);
 
-    id_hash[hash_index].id_list_last = p_new;
-    id_hash[hash_index].count++;
-
+    slot->count++;
     p_op->id_is_referenced = TRUE;
 
-    V( id_hash[hash_index].lock );
+    V( slot->lock );
     return ID_OK;
 
 }
@@ -150,25 +80,24 @@ int id_constraint_register( entry_proc_op_t * p_op )
 /**
  * Get the first operation for a given id.
  * @return an operation to be processed when it is possible.
- *         NULL else. 
- *        
+ *         NULL else.
  */
 entry_proc_op_t *id_constraint_get_first_op( entry_id_t * p_id )
 {
-    unsigned int   hash_index;
-    id_constraint_item_t *p_curr;
     entry_proc_op_t *p_op = NULL;
+    entry_proc_op_t *op;
+    struct id_hash_slot *slot;
 
     /* compute id hash value */
-    hash_index = hash_id( p_id, ID_HASH_SIZE );
+    slot = get_hash_slot(id_constraint_hash, p_id);
 
-    P( id_hash[hash_index].lock );
+    P( slot->lock );
 
-    for ( p_curr = id_hash[hash_index].id_list_first; p_curr != NULL; p_curr = p_curr->p_next )
+    rh_list_for_each_entry( op, &slot->list, hash_list )
     {
-        if ( entry_id_equal( p_id, &p_curr->op_ptr->entry_id ) )
+        if ( entry_id_equal( p_id, &op->entry_id ) )
         {
-            p_op = p_curr->op_ptr;
+            p_op = op;
             break;
         }
     }
@@ -181,11 +110,11 @@ entry_proc_op_t *id_constraint_get_first_op( entry_id_t * p_id )
 
         printf( "no registered operation on "DFID"?\n", PFID(p_id));
         printf( "etat de la file %u:\n", hash_index );
-        for ( p_curr = id_hash[hash_index].id_list_first; p_curr != NULL; p_curr = p_curr->p_next )
+        for ( p_curr = slot->id_list_first; p_curr != NULL; p_curr = p_curr->p_next )
             printf( DFID"\n", PFID(&p_curr->op_ptr->entry_id) );
     }
 #endif
-    V( id_hash[hash_index].lock );
+    V( slot->lock );
     return p_op;
 
 }
@@ -196,9 +125,7 @@ entry_proc_op_t *id_constraint_get_first_op( entry_id_t * p_id )
  */
 int id_constraint_unregister( entry_proc_op_t * p_op )
 {
-    unsigned int   hash_index;
-    id_constraint_item_t *p_curr;
-    id_constraint_item_t *p_prev;
+    struct id_hash_slot *slot;
 
     if ( !p_op->entry_id_is_set )
         return ID_MISSING;
@@ -206,99 +133,24 @@ int id_constraint_unregister( entry_proc_op_t * p_op )
     if ( !p_op->id_is_referenced )
         return ID_NOT_EXISTS;
 
-    /* compute id hash value */
-    hash_index = hash_id( &p_op->entry_id, ID_HASH_SIZE );
+    slot = get_hash_slot(id_constraint_hash, &p_op->entry_id);
 
-    /* check if the entry id exists and is a stage >= pipeline_stage */
-    P( id_hash[hash_index].lock );
+    /* Remove the entry */
+    P( slot->lock );
 
-    for ( p_curr = id_hash[hash_index].id_list_first, p_prev = NULL;
-          p_curr != NULL; p_prev = p_curr, p_curr = p_curr->p_next )
-    {
-        if ( p_curr->op_ptr == p_op )
-        {
-            /* found */
-            if ( p_prev == NULL )
-                id_hash[hash_index].id_list_first = p_curr->p_next;
-            else
-                p_prev->p_next = p_curr->p_next;
+    rh_list_del(&p_op->hash_list);
+    p_op->id_is_referenced = FALSE;
+    slot->count--;
 
-            /* was it the last ? */
-            if ( id_hash[hash_index].id_list_last == p_curr )
-                id_hash[hash_index].id_list_last = p_prev;
+    V( slot->lock );
 
-            p_curr->op_ptr->id_is_referenced = FALSE;
-
-            id_hash[hash_index].count--;
-
-            V( id_hash[hash_index].lock );
-
-            /* free the slot */
-            MemFree( p_curr );
-
-            return ID_OK;
-        }
-    }
-
-    V( id_hash[hash_index].lock );
-#ifdef _HAVE_FID
-    DisplayLog( LVL_MAJOR, ENTRYPROC_TAG,
-                "id_constraint_unregister: op not found (list %u): id [%llu, %u] record %u",
-                hash_index, p_op->entry_id.f_seq, p_op->entry_id.f_oid, p_op->entry_id.f_ver );
-#else
-    DisplayLog( LVL_MAJOR, ENTRYPROC_TAG,
-                "id_constraint_unregister: op not found (list %u): id [dev %llu, ino %llu]",
-                hash_index, ( unsigned long long ) p_op->entry_id.fs_key,
-                ( unsigned long long ) p_op->entry_id.inode );
-#endif
-    return ID_NOT_EXISTS;
-
+    return ID_OK;
 }
 
 
-void id_constraint_dump(  )
+void id_constraint_dump( void )
 {
-    unsigned int   i, total, min, max;
-    double         avg;
-
-    total = 0;
-    min = id_hash[0].count;
-    max = id_hash[0].count;
-
-    for ( i = 0; i < ID_HASH_SIZE; i++ )
-    {
-        total += id_hash[i].count;
-
-        if ( id_hash[i].count < min )
-            min = id_hash[i].count;
-        if ( id_hash[i].count > max )
-            max = id_hash[i].count;
-    }
-
-    avg = ( double ) total / ( 0.0 + ID_HASH_SIZE );
-    DisplayLog( LVL_MAJOR, "STATS",
-                "Id constraints count: %u (Hash list min: %u, max: %u, avg: %.1f)", total, min, max,
-                avg );
-
-#ifdef _DEBUG_HASH
-    /* more than 50% of difference between hash lists ! Dump all values. */
-    if ( ( max - min ) > ( ( max + 1 ) / 2 ) )
-    {
-        unsigned int   nb_min = 0;
-        unsigned int   nb_max = 0;
-
-        for ( i = 0; i < ID_HASH_SIZE; i++ )
-        {
-            if ( id_hash[i].count == min )
-                nb_min++;
-            else if ( id_hash[i].count == max )
-                nb_max++;
-        }
-        DisplayLog( LVL_MAJOR, "DebugHash", "nb slots with min/max count: %u/%u (total=%u)", nb_min,
-                    nb_max, ID_HASH_SIZE );
-    }
-#endif
-
+    id_hash_dump(id_constraint_hash, "Id constraints count");
 }
 
 /* ------------ Config management functions --------------- */
@@ -312,8 +164,14 @@ int SetDefault_EntryProc_Config( void *module_config, char *msg_out )
     msg_out[0] = '\0';
 
     conf->nb_thread = 8;
-    conf->max_pending_operations = 10000;
-    conf->match_classes = TRUE;
+    conf->max_pending_operations = 5000;
+    conf->max_batch_size = 500;
+    conf->match_file_classes = TRUE;
+#ifdef HAVE_RMDIR_POLICY
+    conf->match_dir_classes = TRUE;
+#else
+    conf->match_dir_classes = FALSE;
+#endif
 #ifdef ATTR_INDEX_creation_time
     conf->detect_fake_mtime = FALSE;
 #endif
@@ -322,6 +180,8 @@ int SetDefault_EntryProc_Config( void *module_config, char *msg_out )
     conf->alert_count = 0;
     conf->alert_attr_mask = 0;
 
+    conf->diff_mask = 0;
+
     return 0;
 }
 
@@ -329,7 +189,8 @@ int Write_EntryProc_ConfigDefault( FILE * output )
 {
     print_begin_block( output, 0, ENTRYPROC_CONFIG_BLOCK, NULL );
     print_line( output, 1, "nb_threads             :  8" );
-    print_line( output, 1, "max_pending_operations :  10000" );
+    print_line( output, 1, "max_pending_operations :  5000" );
+    print_line(output, 1, "max_batch_size         :  500");
     print_line( output, 1, "match_classes          :  TRUE" );
 #ifdef ATTR_INDEX_creation_time
     print_line( output, 1, "detect_fake_mtime      :  FALSE" );
@@ -339,6 +200,10 @@ int Write_EntryProc_ConfigDefault( FILE * output )
     return 0;
 }
 
+
+
+
+
 #define critical_err_check(_ptr_, _blkname_) do { if (!_ptr_) {\
                                         sprintf( msg_out, "Internal error reading %s block in config file", _blkname_); \
                                         return EFAULT; \
@@ -346,32 +211,79 @@ int Write_EntryProc_ConfigDefault( FILE * output )
                                 } while (0)
 
 
+/** set expected values for the std pipeline
+ * \return the number of variables added to array
+ */
+static int std_pipeline_arg_names(char **list, char *buffer)
+{
+    int i, c;
+    char *curr_buf = buffer;
+    unsigned int w;
+    c = 0;
+    for (i = 0; i < std_pipeline_descr.stage_count; i++)
+    {
+        w = sprintf(curr_buf, "%s_threads_max", std_pipeline[i].stage_name);
+        list[i] = curr_buf;
+        curr_buf += w + 1; /* written bytes + final null char */
+        c++;
+    }
+    return c;
+}
+
+
+static int load_pipeline_config(const pipeline_descr_t * descr, pipeline_stage_t * p,
+                                config_item_t  entryproc_block, char *msg_out)
+{
+    int i, rc, tmpval;
+
+    for (i = 0; i < descr->stage_count; i++)
+    {
+        char           varname[256];
+
+        snprintf( varname, 256, "%s_threads_max", p[i].stage_name );
+
+        rc = GetIntParam( entryproc_block, ENTRYPROC_CONFIG_BLOCK, varname,
+                          INT_PARAM_POSITIVE, &tmpval, NULL, NULL, msg_out );
+
+        if ( ( rc != 0 ) && ( rc != ENOENT ) )
+            return rc;
+        else if ( ( rc != ENOENT ) && ( tmpval > 0 ) )  /* 0: keep default */
+        {
+            if ( p[i].stage_flags & STAGE_FLAG_MAX_THREADS )
+                p[i].max_thread_count =
+                    MIN2( p[i].max_thread_count, tmpval );
+            else if ( p[i].stage_flags & STAGE_FLAG_PARALLEL )
+            {
+                /* the stage is not parallel anymore, it has a limited number of threads */
+                p[i].stage_flags &= ~STAGE_FLAG_PARALLEL;
+                p[i].stage_flags |= STAGE_FLAG_MAX_THREADS;
+                p[i].max_thread_count = tmpval;
+            }
+            else if ( ( p[i].stage_flags & STAGE_FLAG_SEQUENTIAL )
+                      && ( tmpval != 1 ) )
+            {
+                sprintf( msg_out, "%s is sequential. Cannot use %u threads at this stage.",
+                         p[i].stage_name, tmpval );
+                return EINVAL;
+            }
+        }
+    }
+    return 0;
+}
+
 int Read_EntryProc_Config( config_file_t config, void *module_config,
                            char *msg_out, int for_reload )
 {
     int            rc, blc_index, i;
     int            tmpval;
     entry_proc_config_t *conf = ( entry_proc_config_t * ) module_config;
+    unsigned int next_idx = 0;
 
-#ifdef ATTR_INDEX_creation_time
-    #define EPC_SHIFT   5
-#else
-    #define EPC_SHIFT   4
-#endif
-
-    char           pipeline_names[PIPELINE_STAGE_COUNT][256];
-    char          *entry_proc_allowed[PIPELINE_STAGE_COUNT + EPC_SHIFT + 1];
-
-
-    entry_proc_allowed[0] = "nb_threads";
-    entry_proc_allowed[1] = "max_pending_operations";
-    entry_proc_allowed[2] = "match_classes";
-    entry_proc_allowed[3] = ALERT_BLOCK;
-#ifdef ATTR_INDEX_creation_time
-    entry_proc_allowed[4] = "detect_fake_mtime";
-#endif
-
-    entry_proc_allowed[PIPELINE_STAGE_COUNT + EPC_SHIFT] = NULL;        /* PIPELINE_STAGE_COUNT+4 = last slot */
+    /* buffer to store arg names */
+    char           *pipeline_names = NULL;
+    /* max size is max pipeline steps (<10) + other args (<6) */
+#define MAX_ENTRYPROC_ARGS 16
+    char           *entry_proc_allowed[MAX_ENTRYPROC_ARGS];
 
     /* get EntryProcessor block */
 
@@ -399,9 +311,15 @@ int Read_EntryProc_Config( config_file_t config, void *module_config,
         return rc;
 
     rc = GetIntParam( entryproc_block, ENTRYPROC_CONFIG_BLOCK, "max_pending_operations",
-                      INT_PARAM_POSITIVE,
+                      INT_PARAM_POSITIVE | INT_PARAM_NOT_NULL,
                       ( int * ) &conf->max_pending_operations, NULL, NULL, msg_out );
     if ( ( rc != 0 ) && ( rc != ENOENT ) )
+        return rc;
+
+    rc = GetIntParam(entryproc_block, ENTRYPROC_CONFIG_BLOCK, "max_batch_size",
+                     INT_PARAM_POSITIVE | INT_PARAM_NOT_NULL,
+                     (int *)&conf->max_batch_size, NULL, NULL, msg_out);
+    if ((rc != 0) && (rc != ENOENT))
         return rc;
 
     rc = GetBoolParam( entryproc_block, ENTRYPROC_CONFIG_BLOCK, "match_classes",
@@ -409,7 +327,11 @@ int Read_EntryProc_Config( config_file_t config, void *module_config,
     if ( ( rc != 0 ) && ( rc != ENOENT ) )
         return rc;
     else if (rc == 0)
-        conf->match_classes = tmpval;
+#ifdef HAVE_RMDIR_POLICY
+        conf->match_file_classes = conf->match_dir_classes = tmpval;
+#else
+        conf->match_file_classes = tmpval;
+#endif
 
 #ifdef ATTR_INDEX_creation_time
     rc = GetBoolParam( entryproc_block, ENTRYPROC_CONFIG_BLOCK, "detect_fake_mtime",
@@ -421,43 +343,13 @@ int Read_EntryProc_Config( config_file_t config, void *module_config,
 #endif
 
 
-    /* look for '<stage>_thread_max' parameters */
-    for ( i = 0; i < PIPELINE_STAGE_COUNT; i++ )
-    {
-        char           varname[256];
+    /* look for '<stage>_thread_max' parameters (for all pipelines) */
+    rc = load_pipeline_config(&std_pipeline_descr, std_pipeline, entryproc_block, msg_out);
+    if (rc)
+        return rc;
 
-        snprintf( varname, 256, "%s_threads_max", entry_proc_pipeline[i].stage_name );
+    // TODO load_pipeline_config(&diff_pipeline_descr, &diff_pipeline);
 
-        strncpy( pipeline_names[i], varname, 256 );
-        entry_proc_allowed[i + EPC_SHIFT] = pipeline_names[i];
-
-        rc = GetIntParam( entryproc_block, ENTRYPROC_CONFIG_BLOCK, varname,
-                          INT_PARAM_POSITIVE, &tmpval, NULL, NULL, msg_out );
-
-        if ( ( rc != 0 ) && ( rc != ENOENT ) )
-            return rc;
-        else if ( ( rc != ENOENT ) && ( tmpval > 0 ) )  /* 0: keep default */
-        {
-            if ( entry_proc_pipeline[i].stage_flags & STAGE_FLAG_MAX_THREADS )
-                entry_proc_pipeline[i].max_thread_count =
-                    MIN2( entry_proc_pipeline[i].max_thread_count, tmpval );
-            else if ( entry_proc_pipeline[i].stage_flags & STAGE_FLAG_PARALLEL )
-            {
-                /* the stqge is no more parallel, it has a limited number of threads */
-                entry_proc_pipeline[i].stage_flags &= ~STAGE_FLAG_PARALLEL;
-                entry_proc_pipeline[i].stage_flags |= STAGE_FLAG_MAX_THREADS;
-                entry_proc_pipeline[i].max_thread_count = tmpval;
-            }
-            else if ( ( entry_proc_pipeline[i].stage_flags & STAGE_FLAG_SEQUENTIAL )
-                      && ( tmpval != 1 ) )
-            {
-                sprintf( msg_out, "%s is sequential. Cannot use %u threads at this stage.",
-                         entry_proc_pipeline[i].stage_name, tmpval );
-                return EINVAL;
-            }
-        }
-
-    }
 
     /* Find and parse "Alert" blocks */
     for ( blc_index = 0; blc_index < rh_config_GetNbItems( entryproc_block ); blc_index++ )
@@ -505,8 +397,35 @@ int Read_EntryProc_Config( config_file_t config, void *module_config,
         }
     }                           /* Loop on subblocks */
 
+
+    /* prepare the list of allowed variables to display a warning for others */
+    for (i = 0; i < MAX_ENTRYPROC_ARGS; i++)
+        entry_proc_allowed[i] = NULL;
+
+    entry_proc_allowed[0] = "nb_threads";
+    entry_proc_allowed[1] = "max_pending_operations";
+    entry_proc_allowed[2] = "max_batch_size";
+    entry_proc_allowed[3] = "match_classes";
+    entry_proc_allowed[4] = ALERT_BLOCK;
+#ifdef ATTR_INDEX_creation_time
+    entry_proc_allowed[5] = "detect_fake_mtime";
+    next_idx = 6;
+#else
+    next_idx = 5;
+#endif
+
+    pipeline_names = malloc(16*256); /* max 16 strings of 256 (oversized) */
+    if (!pipeline_names)
+        return ENOMEM;
+
+    /* fill arg list with pipeline step names */
+    next_idx += std_pipeline_arg_names(entry_proc_allowed + next_idx, pipeline_names);
+    //TODO
+    //next_idx += diff_pipeline_arg_names(entry_proc_allowed + next_idx, pipeline_names + XXX?);
+
     CheckUnknownParameters( entryproc_block, ENTRYPROC_CONFIG_BLOCK,
                             ( const char ** ) entry_proc_allowed );
+    free(pipeline_names);
 
     return 0;
 }
@@ -583,13 +502,32 @@ int Reload_EntryProc_Config( void *module_config )
                     ENTRYPROC_CONFIG_BLOCK
                     "::max_pending_operations changed in config file, but cannot be modified dynamically" );
 
-    if ( conf->match_classes != entry_proc_conf.match_classes )
+    if (conf->max_batch_size != entry_proc_conf.max_batch_size)
+    {
+        DisplayLog(LVL_MAJOR, "EntryProc_Config",
+                   ENTRYPROC_CONFIG_BLOCK"::max_batch_size updated: '%u'->'%u'",
+                   entry_proc_conf.max_batch_size, conf->max_batch_size);
+        entry_proc_conf.max_batch_size = conf->max_batch_size;
+    }
+
+    if ( conf->match_file_classes != entry_proc_conf.match_file_classes)
     {
         DisplayLog( LVL_MAJOR, "EntryProc_Config",
-                    ENTRYPROC_CONFIG_BLOCK"::match_classes updated: '%s'->'%s'",
-                    bool2str(entry_proc_conf.match_classes), bool2str(conf->match_classes) );
-        entry_proc_conf.match_classes = conf->match_classes;
+                    ENTRYPROC_CONFIG_BLOCK"::match_classes (files) updated: '%s'->'%s'",
+                    bool2str(entry_proc_conf.match_file_classes), bool2str(conf->match_file_classes) );
+        entry_proc_conf.match_file_classes = conf->match_file_classes;
     }
+
+#ifdef HAVE_RMDIR_POLICY
+    if ( conf->match_dir_classes != entry_proc_conf.match_dir_classes)
+    {
+        DisplayLog( LVL_MAJOR, "EntryProc_Config",
+                    ENTRYPROC_CONFIG_BLOCK"::match_classes (dirs) updated: '%s'->'%s'",
+                    bool2str(entry_proc_conf.match_dir_classes), bool2str(conf->match_dir_classes) );
+        entry_proc_conf.match_dir_classes = conf->match_dir_classes;
+    }
+#endif
+
 
 #ifdef ATTR_INDEX_creation_time
     if ( conf->detect_fake_mtime != entry_proc_conf.detect_fake_mtime )
@@ -608,11 +546,18 @@ int Reload_EntryProc_Config( void *module_config )
 
     free_alert( conf->alert_list, conf->alert_count );
 
-    if ( entry_proc_conf.match_classes && !is_class_defined() )
+    if (entry_proc_conf.match_file_classes && !is_file_class_defined())
     {
-        DisplayLog( LVL_EVENT, "EntryProc_Config" , "No class defined in policies, disabling class matching." );
-        entry_proc_conf.match_classes = FALSE;
+        DisplayLog( LVL_EVENT, "EntryProc_Config" , "No class defined in policies, disabling file class matching." );
+        entry_proc_conf.match_file_classes = FALSE;
     }
+#ifdef HAVE_RMDIR_POLICY
+    if (entry_proc_conf.match_dir_classes && !is_dir_class_defined())
+    {
+        DisplayLog( LVL_EVENT, "EntryProc_Config" , "No class defined in policies, disabling dir class matching." );
+        entry_proc_conf.match_dir_classes = FALSE;
+    }
+#endif
 
     return 0;
 }
@@ -645,22 +590,25 @@ int Write_EntryProc_ConfigTemplate( FILE * output )
     print_line( output, 1, "# If the number of pending operations exceeds this limit, " );
     print_line( output, 1, "# info collectors are suspended until this count decreases" );
 #ifdef _SQLITE
-    print_line( output, 1, "max_pending_operations = 1000 ;" );
+    print_line( output, 1, "max_pending_operations = 500 ;" );
 #else
-    print_line( output, 1, "max_pending_operations = 10000 ;" );
+    print_line( output, 1, "max_pending_operations = 5000 ;" );
 #endif
-    fprintf( output, "\n" );
+    fprintf(output, "\n");
+    print_line(output, 1, "# max batched DB operations (1=no batching)");
+    print_line(output, 1, "max_batch_size = 500;");
+    fprintf(output, "\n");
 
     print_line( output, 1,
                 "# Optionnaly specify a maximum thread count for each stage of the pipeline:" );
     print_line( output, 1, "# <stagename>_threads_max = <n> (0: use default)" );
-    for ( i = 0; i < PIPELINE_STAGE_COUNT; i++ )
+    for ( i = 0; i < std_pipeline_descr.stage_count; i++ )
     {
-        if ( entry_proc_pipeline[i].stage_flags & STAGE_FLAG_PARALLEL )
-            print_line( output, 1, "# %s_threads_max\t= 8 ;", entry_proc_pipeline[i].stage_name );
-        else if ( entry_proc_pipeline[i].stage_flags & STAGE_FLAG_MAX_THREADS )
-            print_line( output, 1, "%s_threads_max\t= %u ;", entry_proc_pipeline[i].stage_name,
-                        entry_proc_pipeline[i].max_thread_count );
+        if ( std_pipeline[i].stage_flags & STAGE_FLAG_PARALLEL )
+            print_line( output, 1, "# %s_threads_max\t= 8 ;", std_pipeline[i].stage_name );
+        else if ( std_pipeline[i].stage_flags & STAGE_FLAG_MAX_THREADS )
+            print_line( output, 1, "%s_threads_max\t= %u ;", std_pipeline[i].stage_name,
+                        std_pipeline[i].max_thread_count );
     }
     fprintf( output, "\n" );
 

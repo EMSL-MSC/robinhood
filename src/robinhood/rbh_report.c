@@ -104,6 +104,9 @@ static struct option option_tab[] = {
     {"fsinfo", no_argument, NULL, 'i'},
     {"fs-info", no_argument, NULL, 'i'},
 
+    {"entry-info", required_argument, NULL, 'e'},
+    {"entryinfo", required_argument, NULL, 'e'},
+
     {"userinfo", optional_argument, NULL, 'u'},
     {"user-info", optional_argument, NULL, 'u'},
 
@@ -112,10 +115,8 @@ static struct option option_tab[] = {
 
     {"classinfo", optional_argument, NULL, OPT_CLASS_INFO},
     {"class-info", optional_argument, NULL, OPT_CLASS_INFO},
-#ifdef ATTR_INDEX_dircount
     {"topdirs", optional_argument, NULL, 'd'},
     {"top-dirs", optional_argument, NULL, 'd'},
-#endif
     {"topsize", optional_argument, NULL, 's'},
     {"top-size", optional_argument, NULL, 's'},
     {"toppurge", optional_argument, NULL, 'p'},
@@ -180,7 +181,7 @@ static struct option option_tab[] = {
 
 };
 
-#define SHORT_OPT_STRING    "aiDu:g:d:s:p:rU:P:C:Rf:cql:hVFS"
+#define SHORT_OPT_STRING    "aiDe:u:g:d:s:p:rU:P:C:Rf:cql:hVFS"
 
 static const char *help_string =
     _B "Usage:" B_ " %s [options]\n"
@@ -193,14 +194,15 @@ static const char *help_string =
     "    " _B "--class-info" B_ " [=" _U "fileclass" U_ "]\n"
     "        Display Fileclasses summary. Use optional parameter " _U "fileclass" U_ "\n"
     "        for retrieving stats about matching fileclasses.\n"
+    "    " _B "--entry-info"B_ " "_U "path"U_"|"_U"id"U_", "
+           _B "-e" B_ " "_U "path"U_"|"_U"id"U_"\n"
+    "        Display all information about entry.\n"
     "    " _B "--user-info" B_ " [=" _U "user" U_ "], " _B "-u" B_ " " _U "user" U_ "\n"
     "        Display user statistics. Use optional parameter " _U "user" U_ " for retrieving stats about a single user.\n"
     "    " _B "--group-info" B_ " [=" _U "group" U_ "], " _B "-g" B_ " " _U "group" U_ "\n"
     "        Display group statistics. Use optional parameter " _U "group" U_ " for retrieving stats about a single group.\n"
-#ifdef ATTR_INDEX_dircount
     "    " _B "--top-dirs" B_ " [=" _U "count" U_ "], " _B "-d" B_ " " _U "count" U_ "\n"
     "        Display largest directories. Optional argument indicates the number of directories to be returned (default: 20).\n"
-#endif
     "    " _B "--top-size" B_ " [=" _U "count" U_ "], " _B "-s" B_ " " _U "count" U_ "\n"
     "        Display largest files. Optional argument indicates the number of files to be returned (default: 20).\n"
     "    " _B "--top-purge" B_ " [=" _U "count" U_ "], " _B "-p" B_ " " _U "count" U_ "\n"
@@ -222,8 +224,8 @@ static const char *help_string =
     "    "  _B "--dump-group" B_ " " _U "group" U_ "\n"
     "        Dump all entries for the given group.\n"
 #ifdef _LUSTRE
-    "    "  _B "--dump-ost" B_ " " _U "ost_index" U_ "\n"
-    "        Dump all entries on the given OST.\n"
+    "    "  _B "--dump-ost" B_ " " _U "ost_index" U_ "|" _U "ost_set" U_"\n"
+    "        Dump all entries on the given OST or set of OSTs (e.g. 3,5-8).\n"
 #endif
 #ifdef ATTR_INDEX_status
     "    "  _B "--dump-status" B_ " " _U "status" U_ "\n"
@@ -231,7 +233,7 @@ static const char *help_string =
 #endif
     "\n"
     _B "Filter options:" B_ "\n"
-    "The following filters can be speficied for reports:\n"
+    "The following filters can be specified for reports:\n"
     "    " _B "-P" B_ " " _U "path" U_ ", " _B "--filter-path" B_ " " _U "path" U_ "\n"
     "        Display the report only for objects in the given path.\n"
     "    " _B "-C" B_ " " _U "class" U_ ", " _B "--filter-class" B_ " " _U "class" U_ "\n"
@@ -322,8 +324,6 @@ static inline void display_version( char *bin_name )
     printf( "    Lustre-HSM Policy Engine\n" );
 #elif defined(_TMP_FS_MGR)
     printf( "    Temporary filesystem manager\n" );
-#elif defined(_SHERPA)
-    printf( "    SHERPA cache zapper\n" );
 #elif defined(_HSM_LITE)
     printf( "    Basic HSM binding\n" );
 #else
@@ -584,7 +584,7 @@ static int parse_size_range(const char * str, profile_field_descr_t * p_profile)
  *  Read variable from DB and allocate value.
  *  @param value must be of size 1024.
  **/
-int ListMgr_GetVar_helper( lmgr_t * p_mgr, const char *varname, char *value )
+static int ListMgr_GetVar_helper( lmgr_t * p_mgr, const char *varname, char *value )
 {
     int rc;
     rc = ListMgr_GetVar( &lmgr, varname, value);
@@ -607,7 +607,7 @@ int ListMgr_GetVar_helper( lmgr_t * p_mgr, const char *varname, char *value )
 /**
  * Manage fid2path resolution
  */
-int TryId2path( lmgr_t * p_mgr, const entry_id_t * p_id,  char * path )
+static int TryId2path( lmgr_t * p_mgr, const entry_id_t * p_id,  char * path )
 {
     static int is_init = 0;
     static int is_resolvable = 0;
@@ -681,7 +681,7 @@ static const char * ResolvName(const entry_id_t * p_id, attr_set_t * attrs,
 }
 
 
-void report_activity( int flags )
+static void report_activity( int flags )
 {
     char           value[1024];
     time_t         timestamp;
@@ -905,7 +905,7 @@ void report_activity( int flags )
 
 #ifdef HAVE_CHANGELOGS
     /* changelog stats */
-    rc = ListMgr_GetVar( &lmgr, CL_LAST_READ_ID, value );
+    rc = ListMgr_GetVar( &lmgr, CL_LAST_READ_REC_ID, value );
     if ( rc == DB_SUCCESS )
     {
         int i;
@@ -919,12 +919,20 @@ void report_activity( int flags )
             printf( "        Last read record id:      %s\n", value );
         }
 
+        if ( ListMgr_GetVar( &lmgr, CL_LAST_READ_REC_TIME, value ) == DB_SUCCESS )
+        {
+            if ( CSV(flags) )
+                printf( "changelog_last_record_time, %s\n", value );
+            else
+                printf( "        Last read record time:    %s\n", value );
+        }
+
         if ( ListMgr_GetVar( &lmgr, CL_LAST_READ_TIME, value ) == DB_SUCCESS )
         {
             if ( CSV(flags) )
-                printf( "changelog_last_time, %s\n", value );
+                printf( "changelog_cl_recv_time, %s\n", value );
             else
-                printf( "        Last record read time:    %s\n", value );
+                printf( "        Last receive time:        %s\n", value );
         }
 
         if ( ListMgr_GetVar( &lmgr, CL_LAST_COMMITTED, value ) == DB_SUCCESS )
@@ -1176,26 +1184,26 @@ static int mk_global_filters( lmgr_filter_t * filter, int do_display, int * init
         if ( path_filter[len-1] != '/' )
         {
             /* ( fullpath LIKE 'path' OR fullpath LIKE 'path/%' ) */
-            fv.val_str = path_filter;
+            fv.value.val_str = path_filter;
             lmgr_simple_filter_add( filter, ATTR_INDEX_fullpath, LIKE, fv,
                                     FILTER_FLAG_BEGIN );
 
             snprintf( path_regexp, RBH_PATH_MAX, "%s/*", path_filter );
-            fv.val_str = path_regexp;
+            fv.value.val_str = path_regexp;
             lmgr_simple_filter_add( filter, ATTR_INDEX_fullpath, LIKE, fv,
-                                    FILTER_FLAG_OR | FILTER_FLAG_END ); 
+                                    FILTER_FLAG_OR | FILTER_FLAG_END );
         }
         else /* ends with slash */
         {
             snprintf( path_regexp, RBH_PATH_MAX, "%s*", path_filter );
             /* directory or directory/% */
 
-            fv.val_str = path_regexp;
+            fv.value.val_str = path_regexp;
             lmgr_simple_filter_add( filter, ATTR_INDEX_fullpath, LIKE, fv,
                                     FILTER_FLAG_BEGIN );
             /* remove last slash */
             path_filter[len-1] = '\0';
-            fv.val_str = path_filter;
+            fv.value.val_str = path_filter;
             lmgr_simple_filter_add( filter, ATTR_INDEX_fullpath, LIKE, fv,
                                     FILTER_FLAG_OR | FILTER_FLAG_END );
         }
@@ -1212,7 +1220,7 @@ static int mk_global_filters( lmgr_filter_t * filter, int do_display, int * init
         if ( do_display )
             printf("filter class: %s\n", class_format(class_filter) );
 
-        fv.val_str = class_filter;
+        fv.value.val_str = class_filter;
 
 #ifndef ATTR_INDEX_archive_class
         /* single test */
@@ -1237,31 +1245,52 @@ static inline const char * attrindex2name(unsigned int index)
     switch(index)
     {
         case ATTR_INDEX_fullpath: return "path";
+        case ATTR_INDEX_name: return "name";
+        case ATTR_INDEX_depth: return "depth";
         case ATTR_INDEX_avgsize: return "avgsize";
-#ifdef ATTR_INDEX_dircount
         case ATTR_INDEX_dircount: return "dircount";
-#endif
 #ifdef ATTR_INDEX_status
         case ATTR_INDEX_status: return "status";
 #endif
-#ifdef ATTR_INDEX_type
         case ATTR_INDEX_type: return "type";
-#endif
+        case ATTR_INDEX_mode: return "mode";
+        case ATTR_INDEX_nlink: return "nlink";
+        case ATTR_INDEX_parent_id: return "parent_id";
         case ATTR_INDEX_owner: return "user";
         case ATTR_INDEX_gr_name: return "group";
         case ATTR_INDEX_blocks: return "spc_used";
         case ATTR_INDEX_size: return "size";
         case ATTR_INDEX_last_access: return "last_access";
         case ATTR_INDEX_last_mod: return "last_mod";
+        case ATTR_INDEX_creation_time: return "creation";
+        case ATTR_INDEX_link: return "link";
 
+        case ATTR_INDEX_md_update: return "md updt";
+        case ATTR_INDEX_path_update: return "path updt";
 #ifdef ATTR_INDEX_archive_class
         case ATTR_INDEX_archive_class: return "migr. class";
+        case ATTR_INDEX_arch_cl_update: return "migr. class updt";
 #endif
 #ifdef ATTR_INDEX_release_class
         case ATTR_INDEX_release_class: return "purge class";
+        case ATTR_INDEX_rel_cl_update: return "purge class updt";
 #endif
+#ifdef ATTR_INDEX_invalid
+        case ATTR_INDEX_invalid: return "invalid";
+#endif
+#ifdef ATTR_INDEX_last_archive
+        case ATTR_INDEX_last_archive: return "last_archive";
+#endif
+#ifdef ATTR_INDEX_last_restore
+        case ATTR_INDEX_last_restore: return "last_restore";
+#endif
+#ifdef ATTR_INDEX_backend_path
+        case ATTR_INDEX_backend_path: return "backend_path";
+#endif
+
+
         case ATTR_INDEX_stripe_info: return "stripe_cnt, stripe_size,      pool";
-        case ATTR_INDEX_stripe_items: return "ost_idx";
+        case ATTR_INDEX_stripe_items: return "stripes";
     }
     return "?";
 }
@@ -1273,39 +1302,59 @@ static inline unsigned int attrindex2len(unsigned int index, int csv)
 {
     switch(index)
     {
-        case 0: return 10; /* count */
-#ifdef ATTR_INDEX_dircount
+        case -1: return 10; /* count */
+        case ATTR_INDEX_parent_id: return 20;
+        case ATTR_INDEX_name: return 10;
+        case ATTR_INDEX_depth: return 3;
         case ATTR_INDEX_dircount: return 8;
-#endif
 #ifdef  ATTR_INDEX_status
         case ATTR_INDEX_status: return 10;
 #endif
-#ifdef ATTR_INDEX_type
         case ATTR_INDEX_type: return 8;
-#endif
+        case ATTR_INDEX_mode:
+            return (csv ? 4 : 6);
+
+        case ATTR_INDEX_nlink:
+            return 5;
         case ATTR_INDEX_fullpath: return 40;
         case ATTR_INDEX_owner: return 10;
         case ATTR_INDEX_gr_name: return 10;
 
         case ATTR_INDEX_last_access: return 20;
         case ATTR_INDEX_last_mod: return 20;
+        case ATTR_INDEX_creation_time: return 20;
 
+        case ATTR_INDEX_md_update: return 20;
+        case ATTR_INDEX_path_update: return 20;
 #ifdef ATTR_INDEX_archive_class
         case ATTR_INDEX_archive_class: return 20;
+        case ATTR_INDEX_arch_cl_update: return 20;
 #endif
 #ifdef ATTR_INDEX_release_class
         case ATTR_INDEX_release_class: return 20;
+        case ATTR_INDEX_rel_cl_update: return 20;
+#endif
+#ifdef ATTR_INDEX_invalid
+        case ATTR_INDEX_invalid: return 3; /* yes/no */
+#endif
+#ifdef ATTR_INDEX_last_archive
+        case ATTR_INDEX_last_archive: return 20;
+#endif
+#ifdef ATTR_INDEX_last_restore
+        case ATTR_INDEX_last_restore: return 20;
+#endif
+#ifdef ATTR_INDEX_backend_path
+        case ATTR_INDEX_backend_path: return 40;
 #endif
 
+        case ATTR_INDEX_link: return 20;
         case ATTR_INDEX_blocks:
         case ATTR_INDEX_avgsize:
         case ATTR_INDEX_size:
-            if (csv)
-                return 15; /* up to 999To */
-            else
-                return 10; /* 1024.21 GB */
+            /* 15 digits for 999To, 10 chars for 1024.21 GB */
+            return (csv ? 15 : 10);
         case ATTR_INDEX_stripe_info: return strlen(attrindex2name(ATTR_INDEX_stripe_info));
-        case ATTR_INDEX_stripe_items: return 10;
+        case ATTR_INDEX_stripe_items: return 30;
     }
     return 1;
 }
@@ -1361,7 +1410,7 @@ static void print_attr_list_custom(int rank_field, int * attr_list, int attr_cou
                 else
                 {
                     printf("%*s", PROF_CNT_LEN, size_range[i].title);
-                    coma = 1; 
+                    coma = 1;
                 }
             }
             if (p_profile->range_ratio_len > 0)
@@ -1372,7 +1421,7 @@ static void print_attr_list_custom(int rank_field, int * attr_list, int attr_cou
                 if (p_profile->range_ratio_start + p_profile->range_ratio_len == SZ_PROFIL_COUNT)
                     sprintf(tmp, "ratio(%s..inf)", print_brief_sz( SZ_MIN_BY_INDEX(p_profile->range_ratio_start), tmp1));
                 else
-                    sprintf(tmp, "ratio(%s..%s-)", 
+                    sprintf(tmp, "ratio(%s..%s-)",
                             print_brief_sz( SZ_MIN_BY_INDEX(p_profile->range_ratio_start), tmp1),
                             print_brief_sz( SZ_MIN_BY_INDEX(p_profile->range_ratio_start + p_profile->range_ratio_len), tmp2));
 
@@ -1398,10 +1447,16 @@ static inline void print_attr_list(int rank_field, int * attr_list, int attr_cou
 
 
 static const char * attr2str(attr_set_t * attrs, const entry_id_t * id,
-                int attr_index, int csv, int resolv_id, char * out)
+                             int attr_index, int csv, int resolv_id,
+                             char * out, const size_t out_sz)
 {
     time_t tt;
     struct tm stm;
+
+    if  (attr_index != ATTR_INDEX_fullpath /* specific case */
+         && (attrs->attr_mask & (1 << attr_index)) == 0)
+        return "";
+
     switch(attr_index)
     {
         case ATTR_INDEX_fullpath:
@@ -1417,18 +1472,42 @@ static const char * attr2str(attr_set_t * attrs, const entry_id_t * id,
             else
                 FormatFileSize(out, 128, ATTR(attrs, avgsize));
             return out;
-#ifdef ATTR_INDEX_dircount
-        case ATTR_INDEX_dircount: 
+        case ATTR_INDEX_dircount:
             sprintf(out, "%u", ATTR(attrs, dircount));
             return out;
-#endif
 #ifdef ATTR_INDEX_status
         case ATTR_INDEX_status: return db_status2str(ATTR(attrs, status), csv);
 #endif
-#ifdef ATTR_INDEX_type
+        case ATTR_INDEX_parent_id:
+            sprintf(out, DFID, PFID(&ATTR(attrs, parent_id)));
+            return out;
+
+        case ATTR_INDEX_link:
+             return ATTR(attrs, link);
+
         case ATTR_INDEX_type:
              return ATTR(attrs, type);
-#endif
+        case ATTR_INDEX_nlink:
+             sprintf(out, "%u", ATTR(attrs, nlink));
+             return out;
+
+        case ATTR_INDEX_depth:
+             sprintf(out, "%u", ATTR(attrs, depth));
+             return out;
+
+        case ATTR_INDEX_name:
+             return ATTR(attrs, name);
+
+        case ATTR_INDEX_mode:
+            if (csv)
+                sprintf(out, "%#03o", ATTR(attrs, mode));
+            else
+            {
+                memset(out, 0, out_sz);
+                mode_string(ATTR(attrs, mode), out);
+            }
+            return out;
+
         case ATTR_INDEX_owner: return ATTR(attrs, owner);
         case ATTR_INDEX_gr_name: return ATTR(attrs, gr_name);
         case ATTR_INDEX_blocks:
@@ -1455,14 +1534,58 @@ static const char * attr2str(attr_set_t * attrs, const entry_id_t * id,
             strftime(out, 128, "%Y/%m/%d %T", localtime_r(&tt, &stm));
             return out;
 
+        case ATTR_INDEX_creation_time:
+            tt = ATTR(attrs, creation_time);
+            strftime(out, 128, "%Y/%m/%d %T", localtime_r(&tt, &stm));
+            return out;
+
+        case ATTR_INDEX_md_update:
+            tt = ATTR(attrs, md_update);
+            strftime(out, 128, "%Y/%m/%d %T", localtime_r(&tt, &stm));
+            return out;
+
+        case ATTR_INDEX_path_update:
+            tt = ATTR(attrs, path_update);
+            strftime(out, 128, "%Y/%m/%d %T", localtime_r(&tt, &stm));
+            return out;
+
 #ifdef ATTR_INDEX_archive_class
         case ATTR_INDEX_archive_class:
             return migr_class(attrs);
+        case ATTR_INDEX_arch_cl_update:
+            tt = ATTR(attrs, arch_cl_update);
+            strftime(out, 128, "%Y/%m/%d %T", localtime_r(&tt, &stm));
+            return out;
 #endif
 #ifdef ATTR_INDEX_release_class
         case ATTR_INDEX_release_class:
             return release_class(attrs);
+        case ATTR_INDEX_rel_cl_update:
+            tt = ATTR(attrs, rel_cl_update);
+            strftime(out, 128, "%Y/%m/%d %T", localtime_r(&tt, &stm));
+            return out;
 #endif
+#ifdef ATTR_INDEX_invalid
+        case ATTR_INDEX_invalid: return (ATTR(attrs, invalid) ? "yes" : "no");
+#endif
+#ifdef ATTR_INDEX_last_archive
+        case ATTR_INDEX_last_archive:
+            tt = ATTR(attrs, last_archive);
+            strftime(out, 128, "%Y/%m/%d %T", localtime_r(&tt, &stm));
+            return out;
+#endif
+#ifdef ATTR_INDEX_last_restore
+        case ATTR_INDEX_last_restore:
+            tt = ATTR(attrs, last_restore);
+            strftime(out, 128, "%Y/%m/%d %T", localtime_r(&tt, &stm));
+            return out;
+#endif
+#ifdef ATTR_INDEX_backend_path
+        case ATTR_INDEX_backend_path:
+            return ATTR(attrs, backend_path);
+#endif
+
+#ifdef _LUSTRE
         case ATTR_INDEX_stripe_info:
             if (csv)
                 sprintf(out, "%10u, %11"PRIu64", %9s",
@@ -1479,8 +1602,9 @@ static const char * attr2str(attr_set_t * attrs, const entry_id_t * id,
             return out;
 
         case ATTR_INDEX_stripe_items:
-            FormatStripeList(out, 1024, &ATTR( attrs, stripe_items ));
+            FormatStripeList(out, out_sz, &ATTR( attrs, stripe_items ), csv);
             return out;
+#endif
     }
     return "?";
 }
@@ -1491,7 +1615,7 @@ static void print_attr_values_custom(int rank, int * attr_list, int attr_count,
                               const char * custom, int custom_len)
 {
     int i, coma = 0;
-    char str[1024];
+    char str[24576];
     if (rank)
     {
         printf("%4d", rank);
@@ -1501,11 +1625,11 @@ static void print_attr_values_custom(int rank, int * attr_list, int attr_count,
     {
         if (coma)
             printf(", %*s", attrindex2len(attr_list[i], csv),
-                   attr2str(attrs, id, attr_list[i], csv, resolv_id, str));
+                   attr2str(attrs, id, attr_list[i], csv, resolv_id, str, sizeof(str)));
         else
         {
             printf("%*s", attrindex2len(attr_list[i], csv),
-                   attr2str(attrs, id, attr_list[i], csv, resolv_id, str));
+                   attr2str(attrs, id, attr_list[i], csv, resolv_id, str, sizeof(str)));
             coma = 1;
         }
     }
@@ -1534,7 +1658,7 @@ static inline const char * attrdesc2name(const report_field_descr_t * desc)
 {
     switch(desc->attr_index)
     {
-        case 0:
+        case -1:
             if (desc->report_type == REPORT_COUNT)
                 return "count";
             break;
@@ -1562,7 +1686,7 @@ static inline const char * result_val2str(const report_field_descr_t * desc,
     out[0] = '\0';
     switch(desc->attr_index)
     {
-        case 0: /* count */
+        case -1: /* count */
             sprintf(out, "%Lu", val->value_u.val_biguint);
             break;
 #ifdef  ATTR_INDEX_status
@@ -1570,9 +1694,7 @@ static inline const char * result_val2str(const report_field_descr_t * desc,
             sprintf(out, db_status2str(val->value_u.val_uint,csv));
             break;
 #endif
-#ifdef ATTR_INDEX_type
         case ATTR_INDEX_type:
-#endif
         case ATTR_INDEX_owner:
         case ATTR_INDEX_gr_name:
             strcpy(out, val->value_u.val_str);
@@ -1605,7 +1727,7 @@ static inline const char * result_val2str(const report_field_descr_t * desc,
 
 
 /**
- * Generic fucntion to display a report
+ * Generic function to display a report
  */
 static void display_report( const report_field_descr_t * descr, unsigned int field_count,
                             const db_value_t * result, unsigned int result_count,
@@ -1640,7 +1762,7 @@ static void display_report( const report_field_descr_t * descr, unsigned int fie
                     if (prof_descr->range_ratio_start + prof_descr->range_ratio_len == SZ_PROFIL_COUNT)
                         sprintf(tmp, "ratio(%s..inf)", print_brief_sz( SZ_MIN_BY_INDEX(prof_descr->range_ratio_start), tmp1));
                     else
-                        sprintf(tmp, "ratio(%s..%s)", 
+                        sprintf(tmp, "ratio(%s..%s)",
                                 print_brief_sz( SZ_MIN_BY_INDEX(prof_descr->range_ratio_start), tmp1),
                                 print_brief_sz( SZ_MIN_BY_INDEX(prof_descr->range_ratio_start + prof_descr->range_ratio_len) -1, tmp2));
 
@@ -1692,7 +1814,7 @@ static void display_report( const report_field_descr_t * descr, unsigned int fie
 
 
 
-void dump_entries( type_dump type, int int_arg, char * str_arg, int flags )
+static void dump_entries( type_dump type, int int_arg, char * str_arg, value_list_t * ost_list, int flags )
 {
     /* get basic information */
     int            mask_sav, rc;
@@ -1701,11 +1823,14 @@ void dump_entries( type_dump type, int int_arg, char * str_arg, int flags )
     struct lmgr_iterator_t *it;
     attr_set_t     attrs;
     entry_id_t     id;
+    int custom_len = 0;
 
     unsigned long long total_size, total_count;
     total_size = total_count = 0;
 
-    int list[] = {
+    /* list of attributes to be use for all dumps
+     * except ost dump */
+    static int list_std[] = {
                    ATTR_INDEX_type,
 #ifdef ATTR_INDEX_status
                    ATTR_INDEX_status,
@@ -1719,8 +1844,32 @@ void dump_entries( type_dump type, int int_arg, char * str_arg, int flags )
 #ifdef ATTR_INDEX_release_class
                    ATTR_INDEX_release_class,
 #endif
-                   ATTR_INDEX_fullpath };
-    int list_cnt = sizeof(list)/sizeof(int);
+                   ATTR_INDEX_fullpath
+                };
+    /* list of attributes to be used for OST dumps */
+    static int list_stripe[] = {
+                   ATTR_INDEX_type,
+#ifdef ATTR_INDEX_status
+                   ATTR_INDEX_status,
+#endif
+                   ATTR_INDEX_size,
+                   ATTR_INDEX_fullpath,
+                   ATTR_INDEX_stripe_info,
+                   ATTR_INDEX_stripe_items
+    };
+    int * list = NULL;
+    int list_cnt = 0;
+
+    if (type != DUMP_OST)
+    {
+        list = list_std;
+        list_cnt = sizeof(list_std)/sizeof(int);
+    }
+    else
+    {
+        list = list_stripe;
+        list_cnt = sizeof(list_stripe)/sizeof(int);
+    }
 
     lmgr_simple_filter_init( &filter );
 
@@ -1734,20 +1883,28 @@ void dump_entries( type_dump type, int int_arg, char * str_arg, int flags )
             /* no filter */
             break;
         case DUMP_USR:
-            fv.val_str = str_arg;
+            fv.value.val_str = str_arg;
             lmgr_simple_filter_add( &filter, ATTR_INDEX_owner, LIKE, fv, 0 );
             break;
         case DUMP_GROUP:
-            fv.val_str = str_arg;
+            fv.value.val_str = str_arg;
             lmgr_simple_filter_add( &filter, ATTR_INDEX_gr_name, LIKE, fv, 0 );
             break;
         case DUMP_OST:
-            fv.val_int = int_arg;
-            lmgr_simple_filter_add( &filter, ATTR_INDEX_stripe_items, EQUAL, fv, 0 );
+            if (ost_list->count == 1)
+            {
+                fv.value.val_uint = ost_list->values[0].val_uint;
+                lmgr_simple_filter_add( &filter, ATTR_INDEX_stripe_items, EQUAL, fv, 0 );
+            }
+            else
+            {
+                fv.list = *ost_list;
+                lmgr_simple_filter_add( &filter, ATTR_INDEX_stripe_items, IN, fv, 0 );
+            }
             break;
 #ifdef ATTR_INDEX_status
        case DUMP_STATUS:
-                fv.val_int = int_arg;
+                fv.value.val_int = int_arg;
                 if ( MATCH_NULL_STATUS( flags ) )
                     lmgr_simple_filter_add( &filter, ATTR_INDEX_status, EQUAL,
                                             fv, FILTER_FLAG_ALLOW_NULL );
@@ -1772,20 +1929,76 @@ void dump_entries( type_dump type, int int_arg, char * str_arg, int flags )
     if ( it == NULL )
     {
         DisplayLog( LVL_CRIT, REPORT_TAG,
-                    "ERROR: Could not retrieve top file size from database." );
+                    "ERROR: Could not dump entries from database." );
         return;
     }
 
     if (!(NOHEADER(flags)))
-        print_attr_list(0, list, list_cnt, NULL, CSV(flags));
+    {
+        if (type != DUMP_OST)
+            print_attr_list(0, list, list_cnt, NULL, CSV(flags));
+        else
+        {
+            char tmp[128];
+            if (ost_list->count == 1)
+                sprintf(tmp, "data_on_ost%u", ost_list->values[0].val_uint);
+            else
+                sprintf(tmp, "data_on_ost[%s]", str_arg);
+
+            custom_len = strlen(tmp);
+            /* if dump_ost is specified: add specific field
+             * to indicate if file really has data on the given OST
+             */
+            print_attr_list_custom(0, list, list_cnt, NULL, CSV(flags), tmp,
+                                   custom_len);
+        }
+    }
 
     while ( ( rc = ListMgr_GetNext( it, &id, &attrs ) ) == DB_SUCCESS )
     {
         total_count ++ ;
         total_size += ATTR( &attrs, size );
 
-        print_attr_values(0, list, list_cnt, &attrs, &id,
-                          CSV(flags), FALSE);
+        if (type != DUMP_OST)
+            print_attr_values(0, list, list_cnt, &attrs, &id,
+                              CSV(flags), FALSE);
+#ifdef _LUSTRE
+        else
+        {
+            const char * has_data;
+#if defined(ATTR_INDEX_status) && defined(HAVE_PURGE_POLICY)
+            /* no data if the file is released */
+            if (ATTR_MASK_TEST(&attrs, status) && ATTR(&attrs, status) == STATUS_RELEASED)
+                has_data = "no";
+            else
+#endif
+
+            if (!ATTR_MASK_TEST(&attrs, size) || !ATTR_MASK_TEST(&attrs, stripe_info)
+                || !ATTR_MASK_TEST(&attrs, stripe_items))
+                has_data = "?";
+            else
+            {
+                int i;
+                has_data = "no";
+                for (i = 0; i < ost_list->count; i++)
+                {
+                    if (DataOnOST(ATTR(&attrs, size), ost_list->values[i].val_uint,
+                         &ATTR(&attrs,stripe_info), &ATTR(&attrs,stripe_items)))
+                    {
+                        has_data = "yes";
+                        break;
+                    }
+                }
+            }
+
+            /* if dump_ost is specified: add specific field
+             * to indicate if file really has data on the given OST.
+             */
+            print_attr_values_custom(0, list, list_cnt, &attrs, &id,
+                              CSV(flags), FALSE, has_data, custom_len);
+        }
+#endif
+
 
         ListMgr_FreeAttrs( &attrs );
 
@@ -1805,7 +2018,7 @@ void dump_entries( type_dump type, int int_arg, char * str_arg, int flags )
     }
 }
 
-void report_fs_info( int flags )
+static void report_fs_info( int flags )
 {
     unsigned int   result_count;
     struct lmgr_report_t *it;
@@ -1813,10 +2026,6 @@ void report_fs_info( int flags )
 
     lmgr_filter_t  filter;
     int is_filter = FALSE;
-
-#ifdef _SHERPA
-    filter_value_t fv;
-#endif
 
 #ifdef  ATTR_INDEX_status
 #define FSINFOCOUNT 7
@@ -1836,14 +2045,14 @@ void report_fs_info( int flags )
      */
     report_field_descr_t fs_info[FSINFOCOUNT] = {
 #ifdef  ATTR_INDEX_status
-        {ATTR_INDEX_status, REPORT_GROUP_BY, SORT_ASC, FALSE, 0, {NULL}},
+        {ATTR_INDEX_status, REPORT_GROUP_BY, SORT_ASC, FALSE, 0, FV_NULL},
 #endif
-        {ATTR_INDEX_type, REPORT_GROUP_BY, SORT_ASC, FALSE, 0, {NULL}},
-        {0, REPORT_COUNT, SORT_NONE, FALSE, 0, {NULL}},
-        {ATTR_INDEX_size, REPORT_SUM, SORT_NONE, FALSE, 0, {NULL}}, /* XXX ifdef STATUS ? */
-        {ATTR_INDEX_size, REPORT_MIN, SORT_NONE, FALSE, 0, {NULL}},
-        {ATTR_INDEX_size, REPORT_MAX, SORT_NONE, FALSE, 0, {NULL}},
-        {ATTR_INDEX_size, REPORT_AVG, SORT_NONE, FALSE, 0, {NULL}},
+        {ATTR_INDEX_type, REPORT_GROUP_BY, SORT_ASC, FALSE, 0, FV_NULL},
+        {-1, REPORT_COUNT, SORT_NONE, FALSE, 0, FV_NULL},
+        {ATTR_INDEX_size, REPORT_SUM, SORT_NONE, FALSE, 0, FV_NULL}, /* XXX ifdef STATUS ? */
+        {ATTR_INDEX_size, REPORT_MIN, SORT_NONE, FALSE, 0, FV_NULL},
+        {ATTR_INDEX_size, REPORT_MAX, SORT_NONE, FALSE, 0, FV_NULL},
+        {ATTR_INDEX_size, REPORT_AVG, SORT_NONE, FALSE, 0, FV_NULL},
     };
 
     unsigned long long total_size, total_count;
@@ -1858,7 +2067,7 @@ void report_fs_info( int flags )
     if (count_min) {
         fs_info[1+_SHIFT].filter = TRUE;
         fs_info[1+_SHIFT].filter_compar = MORETHAN;
-        fs_info[1+_SHIFT].filter_value.val_biguint = count_min;
+        fs_info[1+_SHIFT].filter_value.value.val_biguint = count_min;
     }
 
     /* no limit */
@@ -1875,15 +2084,6 @@ void report_fs_info( int flags )
 
     /* append global filters */
     mk_global_filters( &filter, !NOHEADER(flags), &is_filter );
-
-#ifdef _SHERPA
-    /* only select file status  */
-    if ( !is_filter )
-        lmgr_simple_filter_init( &filter );
-    fv.val_str = STR_TYPE_FILE;
-    lmgr_simple_filter_add( &filter, ATTR_INDEX_type, EQUAL, fv, 0 );
-    is_filter = TRUE;
-#endif
 
     if ( is_filter )
         it = ListMgr_Report( &lmgr, fs_info, FSINFOCOUNT,
@@ -1935,8 +2135,63 @@ void report_fs_info( int flags )
     }
 }
 
+static int report_entry(const char *entry, int flags)
+{
+    int is_id = TRUE;
+    int rc;
+    entry_id_t id;
+    attr_set_t attrs;
+
+    /* try it as a fid */
+    if (sscanf(entry, SFID, RFID(&id)) != FID_SCAN_CNT)
+    {
+        is_id = FALSE;
+        /* try it as a path */
+        if ((rc = Path2Id(entry, &id)) != 0)
+        {
+            fprintf(stderr, "Couldn't get id for %s: %s\n,", entry, strerror(-rc));
+            return rc;
+        }
+    }
+
+    /* try to get all attrs */
+    attrs.attr_mask = ~0;
+
+    if (CSV(flags))
+        printf("id, "DFID"\n", PFID(&id));
+    else
+        printf("%-15s: \t"DFID"\n", "id", PFID(&id));
+
+    if (ListMgr_Get(&lmgr, &id, &attrs) == DB_SUCCESS)
+    {
+        int mask, i;
+        char str[RBH_PATH_MAX];
+
+        for (i = 0, mask = 1; i < ATTR_COUNT; i++, mask <<= 1)
+        {
+            if (mask & attrs.attr_mask)
+            {
+                if (attrindex2len(i, CSV(flags)) != 1) /* for '?' */
+                {
+                    if (!CSV(flags))
+                        printf("%-15s: \t%s\n", attrindex2name(i),
+                               attr2str(&attrs, &id, i, CSV(flags), FALSE,
+                               str, sizeof(str)));
+                    else
+                        printf("%s, %s\n", attrindex2name(i),
+                               attr2str(&attrs, &id, i, CSV(flags), FALSE,
+                               str, sizeof(str)));
+                }
+            }
+        }
+        return 0;
+    }
+    else
+        return -1;
+}
+
 static inline void set_report_rec_nofilter( report_field_descr_t* ent,
-                                   unsigned int   attr_index,
+                                   int   attr_index,
                                    report_type_t  report_type,
                                    sort_order_t   sort_flag )
 {
@@ -1947,7 +2202,7 @@ static inline void set_report_rec_nofilter( report_field_descr_t* ent,
     ent->filter_compar = 0;
 }
 
-void report_usergroup_info( char *name, int flags )
+static void report_usergroup_info( char *name, int flags )
 {
     unsigned int   result_count;
     struct lmgr_report_t *it;
@@ -1963,7 +2218,7 @@ void report_usergroup_info( char *name, int flags )
     lmgr_iter_opt_t opt;
     int display_header = TRUE;
 
-#define USERINFOCOUNT_MAX 8
+#define USERINFOCOUNT_MAX 9
 
     db_value_t     result[USERINFOCOUNT_MAX];
     profile_u   prof;
@@ -2009,22 +2264,28 @@ void report_usergroup_info( char *name, int flags )
         field_count++;
     }
 
-#ifdef ATTR_INDEX_type
     set_report_rec_nofilter(&user_info[field_count], ATTR_INDEX_type,
                             REPORT_GROUP_BY, REVERSE(flags)?SORT_DESC:SORT_ASC );
     field_count++;
     shift++;
-#endif
 
-    set_report_rec_nofilter(&user_info[field_count], 0, REPORT_COUNT, SORT_NONE );
+    set_report_rec_nofilter(&user_info[field_count], -1, REPORT_COUNT, SORT_NONE );
     if (count_min) {
         user_info[field_count].filter = TRUE;
         user_info[field_count].filter_compar = MORETHAN;
-        user_info[field_count].filter_value.val_biguint = count_min;
+        user_info[field_count].filter_value.value.val_biguint = count_min;
     }
 
     field_count++;
+#if defined(HAVE_SHOOK) || defined(_LUSTRE_HSM)
+    /* for 'release'-capable systems, count sum(size) instead of sum(blocks) that might be zero */
+    set_report_rec_nofilter(&user_info[field_count], ATTR_INDEX_size, REPORT_SUM, SORT_NONE );
+    field_count++;
+    /* split by file status */
+    set_report_rec_nofilter(&user_info[field_count], ATTR_INDEX_status, REPORT_GROUP_BY, SORT_NONE);
+#else
     set_report_rec_nofilter(&user_info[field_count], ATTR_INDEX_blocks, REPORT_SUM, SORT_NONE );
+#endif
     field_count++;
     set_report_rec_nofilter(&user_info[field_count], ATTR_INDEX_size, REPORT_MIN, SORT_NONE );
     field_count++;
@@ -2048,12 +2309,12 @@ void report_usergroup_info( char *name, int flags )
         lmgr_simple_filter_init( &filter );
         is_filter = TRUE;
 
-        fv.val_str = name;
+        fv.value.val_str = name;
 
         if ( WILDCARDS_IN( name ) )
-            lmgr_simple_filter_add( &filter, (ISGROUP(flags)?ATTR_INDEX_gr_name:ATTR_INDEX_owner), LIKE, fv, 0 ); 
+            lmgr_simple_filter_add( &filter, (ISGROUP(flags)?ATTR_INDEX_gr_name:ATTR_INDEX_owner), LIKE, fv, 0 );
         else
-            lmgr_simple_filter_add( &filter, (ISGROUP(flags)?ATTR_INDEX_gr_name:ATTR_INDEX_owner), EQUAL, fv, 0 ); 
+            lmgr_simple_filter_add( &filter, (ISGROUP(flags)?ATTR_INDEX_gr_name:ATTR_INDEX_owner), EQUAL, fv, 0 );
     }
 
     /* append global filters */
@@ -2084,7 +2345,13 @@ void report_usergroup_info( char *name, int flags )
         display_header = 0; /* just display it once */
 
         total_count += result[1+shift].value_u.val_biguint;
+#if defined(HAVE_SHOOK) || defined(_LUSTRE_HSM)
+        /* this is a sum(size) => keep it as is */
+        total_size += result[2+shift].value_u.val_biguint;
+#else
+        /* this is a block count => multiply by 512 to get the space in bytes */
         total_size += (result[2+shift].value_u.val_biguint * DEV_BSIZE);
+#endif
     }
 
     ListMgr_CloseReport( it );
@@ -2100,8 +2367,7 @@ void report_usergroup_info( char *name, int flags )
 
 }
 
-#ifdef ATTR_INDEX_dircount
-void report_topdirs( unsigned int count, int flags )
+static void report_topdirs( unsigned int count, int flags )
 {
     /* To be retrieved for dirs:
      * fullpath, owner, dircount, last_mod
@@ -2128,12 +2394,12 @@ void report_topdirs( unsigned int count, int flags )
     lmgr_simple_filter_init( &filter );
 
     /* This filter is implicit when sorting dirs by count */
-//    fv.val_str = STR_TYPE_DIR;
+//    fv.value.val_str = STR_TYPE_DIR;
 //    lmgr_simple_filter_add( &filter, ATTR_INDEX_type, EQUAL, fv, 0 );
 
     if (count_min) {
         /* @TODO Not supported by ListMgr yet */
-        fv.val_biguint = count_min;
+        fv.value.val_biguint = count_min;
         lmgr_simple_filter_add( &filter, ATTR_INDEX_dircount, MORETHAN, fv, 0 );
     }
 
@@ -2192,9 +2458,8 @@ void report_topdirs( unsigned int count, int flags )
     }
     ListMgr_CloseIterator( it );
 }
-#endif
 
-void report_topsize( unsigned int count, int flags )
+static void report_topsize( unsigned int count, int flags )
 {
     /* To be retrieved for files
      * fullpath, owner, size, stripe_info, last_access, last_mod
@@ -2230,7 +2495,7 @@ void report_topsize( unsigned int count, int flags )
     int list_cnt = sizeof(list)/sizeof(int);
 
     /* select only files */
-    fv.val_str = STR_TYPE_FILE;
+    fv.value.val_str = STR_TYPE_FILE;
     lmgr_simple_filter_init( &filter );
     lmgr_simple_filter_add( &filter, ATTR_INDEX_type, EQUAL, fv, 0 );
 
@@ -2280,7 +2545,7 @@ void report_topsize( unsigned int count, int flags )
 }
 
 
-void report_toppurge( unsigned int count, int flags )
+static void report_toppurge( unsigned int count, int flags )
 {
     /* To be retrieved: non whitelisted, non directories, non invalid
      * fullpath, type, last_access, last_mod, size, stripe_info
@@ -2310,29 +2575,32 @@ void report_toppurge( unsigned int count, int flags )
     lmgr_simple_filter_init( &filter );
 
     /* select only non directories */
-    fv.val_str = STR_TYPE_DIR;
+    fv.value.val_str = STR_TYPE_DIR;
     lmgr_simple_filter_add( &filter, ATTR_INDEX_type, NOTEQUAL, fv, 0 );
 
     /* append global filters */
     mk_global_filters( &filter, !NOHEADER(flags), NULL );
 
     /* select only non whitelisted */
-#ifdef ATTR_INDEX_whitelisted
-    fv.val_bool = TRUE;
-    lmgr_simple_filter_add( &filter, ATTR_INDEX_whitelisted, NOTEQUAL, fv, 0);
-#elif defined(ATTR_INDEX_no_release)
-    fv.val_bool = TRUE;
-    lmgr_simple_filter_add( &filter, ATTR_INDEX_no_release, NOTEQUAL, fv, 0);
+#ifdef ATTR_INDEX_release_class
+    fv.value.val_str = CLASS_IGNORED;
+    lmgr_simple_filter_add( &filter, ATTR_INDEX_release_class, NOTEQUAL, fv,
+                            FILTER_FLAG_ALLOW_NULL);
+#endif
+#if defined(ATTR_INDEX_no_release)
+    fv.value.val_bool = TRUE;
+    lmgr_simple_filter_add( &filter, ATTR_INDEX_no_release, NOTEQUAL, fv,
+                            FILTER_FLAG_ALLOW_NULL);
 #endif
 
 #ifdef ATTR_INDEX_status
-    fv.val_int = STATUS_SYNCHRO;
+    fv.value.val_int = STATUS_SYNCHRO;
     lmgr_simple_filter_add( &filter, ATTR_INDEX_status, EQUAL, fv, 0);
 #endif
 
 #ifdef ATTR_INDEX_invalid
     /* select only non invalid */
-    fv.val_bool = TRUE;
+    fv.value.val_bool = TRUE;
     lmgr_simple_filter_add( &filter, ATTR_INDEX_invalid, NOTEQUAL, fv, 0);
 #endif
 
@@ -2380,7 +2648,7 @@ void report_toppurge( unsigned int count, int flags )
 }
 
 #ifdef HAVE_RMDIR_POLICY
-void report_toprmdir( unsigned int count, int flags )
+static void report_toprmdir( unsigned int count, int flags )
 {
     /* To be retrieved for dirs:
      * fullpath, owner, last_mod
@@ -2411,19 +2679,20 @@ void report_toprmdir( unsigned int count, int flags )
     lmgr_simple_filter_init( &filter );
 
     /* select only directories */
-    fv.val_str = STR_TYPE_DIR;
+    fv.value.val_str = STR_TYPE_DIR;
     lmgr_simple_filter_add( &filter, ATTR_INDEX_type, EQUAL, fv, 0 );
 
-    /* select only non whitelisted */
-    fv.val_bool = TRUE;
-    lmgr_simple_filter_add( &filter, ATTR_INDEX_whitelisted, NOTEQUAL, fv, FILTER_FLAG_ALLOW_NULL);
+    /* select only non ignored */
+    fv.value.val_str = CLASS_IGNORED;
+    lmgr_simple_filter_add( &filter, ATTR_INDEX_release_class, NOTEQUAL, fv,
+                            FILTER_FLAG_ALLOW_NULL);
 
     /* select only non invalid */
-    fv.val_bool = TRUE;
+    fv.value.val_bool = TRUE;
     lmgr_simple_filter_add( &filter, ATTR_INDEX_invalid, NOTEQUAL, fv, FILTER_FLAG_ALLOW_NULL);
 
     /* only consider empty directories */
-    fv.val_uint = 0;
+    fv.value.val_uint = 0;
     rc = lmgr_simple_filter_add( &filter, ATTR_INDEX_dircount, EQUAL, fv, 0);
 
     mk_global_filters( &filter, !NOHEADER(flags), NULL );
@@ -2499,7 +2768,7 @@ void report_toprmdir( unsigned int count, int flags )
 }
 #endif
 
-void report_topuser( unsigned int count, int flags )
+static void report_topuser( unsigned int count, int flags )
 {
     unsigned int   result_count;
     struct lmgr_report_t *it;
@@ -2522,12 +2791,17 @@ void report_topuser( unsigned int count, int flags )
      * - MIN/MAX/AVG size
      */
     report_field_descr_t user_info[TOPUSERCOUNT] = {
-        {ATTR_INDEX_owner, REPORT_GROUP_BY, SORT_NONE, FALSE, 0, {NULL}},
-        {ATTR_INDEX_blocks, REPORT_SUM, SORT_DESC, FALSE, 0, {NULL}},
-        {0, REPORT_COUNT, SORT_NONE, FALSE, 0, {NULL}},
-        {ATTR_INDEX_size, REPORT_MIN, SORT_NONE, FALSE, 0, {NULL}},
-        {ATTR_INDEX_size, REPORT_MAX, SORT_NONE, FALSE, 0, {NULL}},
-        {ATTR_INDEX_size, REPORT_AVG, SORT_NONE, FALSE, 0, {NULL}},
+        {ATTR_INDEX_owner, REPORT_GROUP_BY, SORT_NONE, FALSE, 0, FV_NULL},
+#if defined(HAVE_SHOOK) || defined(_LUSTRE_HSM)
+        /* display the total size in HSM (not only the disk level) */
+        {ATTR_INDEX_size, REPORT_SUM, SORT_DESC, FALSE, 0, FV_NULL},
+#else
+        {ATTR_INDEX_blocks, REPORT_SUM, SORT_DESC, FALSE, 0, FV_NULL},
+#endif
+        {-1, REPORT_COUNT, SORT_NONE, FALSE, 0, FV_NULL},
+        {ATTR_INDEX_size, REPORT_MIN, SORT_NONE, FALSE, 0, FV_NULL},
+        {ATTR_INDEX_size, REPORT_MAX, SORT_NONE, FALSE, 0, FV_NULL},
+        {ATTR_INDEX_size, REPORT_AVG, SORT_NONE, FALSE, 0, FV_NULL},
     };
 
     if (REVERSE(flags))
@@ -2546,7 +2820,7 @@ void report_topuser( unsigned int count, int flags )
     if (count_min) {
         user_info[2].filter = TRUE;
         user_info[2].filter_compar = MORETHAN;
-        user_info[2].filter_value.val_biguint = count_min;
+        user_info[2].filter_value.value.val_biguint = count_min;
     }
 
     /* select only the top users */
@@ -2564,7 +2838,7 @@ void report_topuser( unsigned int count, int flags )
     /* select only files */
     lmgr_simple_filter_init( &filter );
 
-    fv.val_str = STR_TYPE_FILE;
+    fv.value.val_str = STR_TYPE_FILE;
     lmgr_simple_filter_add( &filter, ATTR_INDEX_type, EQUAL, fv, 0 );
     is_filter = TRUE;
 
@@ -2601,7 +2875,7 @@ void report_topuser( unsigned int count, int flags )
 }
 
 #ifdef HAVE_RM_POLICY
-void report_deferred_rm( int flags )
+static void report_deferred_rm( int flags )
 {
     int            rc, index;
     struct lmgr_rm_list_t * list;
@@ -2734,20 +3008,20 @@ static void report_class_info( int flags )
      * - MIN/MAX/AVG file size
      */
     report_field_descr_t class_info[CLASSINFO_FIELDS] = {
-        {0 /* archive or release class */, REPORT_GROUP_BY, SORT_ASC, FALSE, 0, {NULL}},
+        {0 /* archive or release class */, REPORT_GROUP_BY, SORT_ASC, FALSE, 0, FV_NULL},
 #ifdef ATTR_INDEX_status
-        {ATTR_INDEX_status, REPORT_GROUP_BY, SORT_ASC, FALSE, 0, {NULL}},
+        {ATTR_INDEX_status, REPORT_GROUP_BY, SORT_ASC, FALSE, 0, FV_NULL},
 #endif
-        {0, REPORT_COUNT, SORT_NONE, FALSE, 0, {NULL}},
-        {ATTR_INDEX_blocks, REPORT_SUM, SORT_NONE, FALSE, 0, {NULL}},
-        {ATTR_INDEX_size, REPORT_SUM, SORT_NONE, FALSE, 0, {NULL}},
-        {ATTR_INDEX_size, REPORT_MIN, SORT_NONE, FALSE, 0, {NULL}},
-        {ATTR_INDEX_size, REPORT_MAX, SORT_NONE, FALSE, 0, {NULL}},
-        {ATTR_INDEX_size, REPORT_AVG, SORT_NONE, FALSE, 0, {NULL}},
+        {-1, REPORT_COUNT, SORT_NONE, FALSE, 0, FV_NULL},
+        {ATTR_INDEX_blocks, REPORT_SUM, SORT_NONE, FALSE, 0, FV_NULL},
+        {ATTR_INDEX_size, REPORT_SUM, SORT_NONE, FALSE, 0, FV_NULL},
+        {ATTR_INDEX_size, REPORT_MIN, SORT_NONE, FALSE, 0, FV_NULL},
+        {ATTR_INDEX_size, REPORT_MAX, SORT_NONE, FALSE, 0, FV_NULL},
+        {ATTR_INDEX_size, REPORT_AVG, SORT_NONE, FALSE, 0, FV_NULL},
     };
 
     /* don't select dirs for policies */
-    fv.val_str = STR_TYPE_DIR;
+    fv.value.val_str = STR_TYPE_DIR;
     lmgr_simple_filter_init( &filter );
     lmgr_simple_filter_add( &filter, ATTR_INDEX_type, NOTEQUAL, fv, 0 );
 
@@ -2762,13 +3036,13 @@ static void report_class_info( int flags )
     /* display archive class */
     class_info[0].attr_index = ATTR_INDEX_archive_class;
 
-    fv.val_uint = STATUS_NEW;
+    fv.value.val_uint = STATUS_NEW;
     lmgr_simple_filter_add( &filter, ATTR_INDEX_status, EQUAL, fv, FILTER_FLAG_BEGIN | FILTER_FLAG_ALLOW_NULL );
-    fv.val_uint = STATUS_UNKNOWN;
+    fv.value.val_uint = STATUS_UNKNOWN;
     lmgr_simple_filter_add( &filter, ATTR_INDEX_status, EQUAL, fv, FILTER_FLAG_OR );
-    fv.val_uint = STATUS_MODIFIED;
+    fv.value.val_uint = STATUS_MODIFIED;
     lmgr_simple_filter_add( &filter, ATTR_INDEX_status, EQUAL, fv, FILTER_FLAG_OR );
-    fv.val_uint = STATUS_ARCHIVE_RUNNING;
+    fv.value.val_uint = STATUS_ARCHIVE_RUNNING;
     lmgr_simple_filter_add( &filter, ATTR_INDEX_status, EQUAL, fv, FILTER_FLAG_OR | FILTER_FLAG_END );
 
     it = ListMgr_Report( &lmgr, class_info, CLASSINFO_FIELDS,
@@ -2803,20 +3077,20 @@ static void report_class_info( int flags )
     lmgr_simple_filter_free( &filter );
     lmgr_simple_filter_init( &filter );
 
-    fv.val_str = STR_TYPE_DIR;
+    fv.value.val_str = STR_TYPE_DIR;
     lmgr_simple_filter_add( &filter, ATTR_INDEX_type, NOTEQUAL, fv, 0 );
 
     /* display release class */
     printf("\n");
     class_info[0].attr_index = ATTR_INDEX_release_class;
 
-    fv.val_uint = STATUS_SYNCHRO;
+    fv.value.val_uint = STATUS_SYNCHRO;
     lmgr_simple_filter_add( &filter, ATTR_INDEX_status, EQUAL, fv, FILTER_FLAG_BEGIN );
-    fv.val_uint = STATUS_RELEASE_PENDING;
+    fv.value.val_uint = STATUS_RELEASE_PENDING;
     lmgr_simple_filter_add( &filter, ATTR_INDEX_status, EQUAL, fv, FILTER_FLAG_OR );
-    fv.val_uint = STATUS_RESTORE_RUNNING;
+    fv.value.val_uint = STATUS_RESTORE_RUNNING;
     lmgr_simple_filter_add( &filter, ATTR_INDEX_status, EQUAL, fv, FILTER_FLAG_OR );
-    fv.val_uint = STATUS_RELEASED;
+    fv.value.val_uint = STATUS_RELEASED;
     lmgr_simple_filter_add( &filter, ATTR_INDEX_status, EQUAL, fv, FILTER_FLAG_OR | FILTER_FLAG_END );
 
     mk_global_filters( &filter, !NOHEADER(flags), NULL );
@@ -2902,7 +3176,8 @@ static void report_class_info( int flags )
     }
 }
 
-void maintenance_get( int flags )
+#ifdef HAVE_MIGR_POLICY
+static void maintenance_get( int flags )
 {
     char           value[1024];
     time_t         timestamp;
@@ -2944,7 +3219,7 @@ void maintenance_get( int flags )
     }
 }
 
-void maintenance_set( int flags, time_t when )
+static void maintenance_set( int flags, time_t when )
 {
     char           value[1024];
     int            rc;
@@ -2975,6 +3250,7 @@ void maintenance_set( int flags, time_t when )
                     "ERROR setting variable " NEXT_MAINT_VAR " in database" );
     }
 }
+#endif
 
 #define MAX_OPT_LEN 1024
 
@@ -2994,6 +3270,9 @@ int main( int argc, char **argv )
     int            activity = FALSE;
     int            fs_info = FALSE;
 
+    int            entry_info = FALSE;
+    char           entry_path[RBH_PATH_MAX] = "";
+
     int            user_info = FALSE;
     char           user_name[256] = "";
 
@@ -3002,9 +3281,7 @@ int main( int argc, char **argv )
 
     int            class_info = FALSE;
 
-#ifdef ATTR_INDEX_dircount
     int            topdirs = 0;
-#endif
     int            topsize = 0;
     int            toppurge = 0;
     int            toprmdir = 0;
@@ -3015,12 +3292,13 @@ int main( int argc, char **argv )
 
     int            dump_all = FALSE;
     int            dump_user = FALSE;
-    char           dump_user_name[256]; 
+    char           dump_user_name[256];
     int            dump_group = FALSE;
-    char           dump_group_name[256]; 
+    char           dump_group_name[256];
 #ifdef _LUSTRE
     int            dump_ost = FALSE;
-    int            dump_ost_index = -1;
+    value_list_t   dump_ost_set = { 0, NULL };
+    char           ost_set_str[256] = "";
 #endif
 #ifdef ATTR_INDEX_status
     int            dump_status = FALSE;
@@ -3039,6 +3317,7 @@ int main( int argc, char **argv )
     char           err_msg[4096];
     robinhood_config_t config;
     int chgd = 0;
+    char badcfg[RBH_PATH_MAX];
 
     /* parse command line options */
     while ( ( c = getopt_long( argc, argv, SHORT_OPT_STRING, option_tab, &option_index ) ) != -1 )
@@ -3104,6 +3383,11 @@ int main( int argc, char **argv )
             fs_info = TRUE;
             break;
 
+        case 'e':
+            entry_info = TRUE;
+            strncpy(entry_path, optarg, RBH_PATH_MAX);
+            break;
+
         case 'u':
             user_info = TRUE;
             if ( optarg )
@@ -3128,7 +3412,7 @@ int main( int argc, char **argv )
                 exit(1);
             }
             strncpy( dump_user_name, optarg, 256 );
-            break; 
+            break;
 
         case OPT_DUMP_GROUP:
             dump_group = TRUE;
@@ -3138,25 +3422,27 @@ int main( int argc, char **argv )
                 exit(1);
             }
             strncpy( dump_group_name, optarg, 256 );
-            break; 
+            break;
 
 #ifdef _LUSTRE
         case OPT_DUMP_OST:
             dump_ost = TRUE;
             if ( !optarg )
             {
-                fprintf(stderr, "Missing mandatory argument <ost_index> for --dump-ost\n");
+                fprintf(stderr, "Missing mandatory argument <ost_index|ost_set> for --dump-ost\n");
                 exit(1);
             }
-            dump_ost_index = str2int( optarg );
-            if (dump_ost_index == -1)
+            /* parse it as a set */
+            if (lmgr_range2list(optarg, DB_UINT, &dump_ost_set))
             {
-                    fprintf( stderr,
-                             "Invalid value '%s' for --dump-ost option: integer expected\n",
-                             optarg );
-                    exit( 1 );
+                fprintf( stderr,
+                         "Invalid value '%s' for --dump-ost option: integer or set expected (e.g. 2 or 3,5-8,10-12).\n",
+                         optarg );
+                exit( 1 );
             }
-            break; 
+            /* copy arg to display it */
+            strncpy(ost_set_str, optarg, sizeof(ost_set_str));
+            break;
 #endif
 
 #ifdef ATTR_INDEX_status
@@ -3183,7 +3469,6 @@ int main( int argc, char **argv )
             break;
 #endif
 
-#ifdef ATTR_INDEX_dircount
         case 'd':
             if ( optarg )
             {
@@ -3199,7 +3484,6 @@ int main( int argc, char **argv )
             else
                 topdirs = DEFAULT_TOP_SIZE;
             break;
-#endif
 
         case 's':
             if ( optarg )
@@ -3375,10 +3659,8 @@ int main( int argc, char **argv )
 
     if ( !activity && !fs_info && !user_info && !group_info
          && !topsize && !toppurge && !topuser && !dump_all
-         && !dump_user && !dump_group && !class_info
-#ifdef ATTR_INDEX_dircount
+         && !dump_user && !dump_group && !class_info && !entry_info
          && !topdirs
-#endif
 #ifdef ATTR_INDEX_status
          && !dump_status
 #endif
@@ -3401,9 +3683,9 @@ int main( int argc, char **argv )
     }
 
     /* get default config file, if not specified */
-    if ( SearchConfig( config_file, config_file, &chgd ) != 0 )
+    if ( SearchConfig( config_file, config_file, &chgd, badcfg ) != 0 )
     {
-        fprintf(stderr, "No config file found in '/etc/robinhood.d/"PURPOSE_EXT"', ...\n" );
+        fprintf(stderr, "No config file (or too many) found matching %s\n", badcfg);
         exit(2);
     }
     else if (chgd)
@@ -3474,6 +3756,9 @@ int main( int argc, char **argv )
     if ( fs_info )
         report_fs_info( flags );
 
+    if (entry_info)
+        report_entry(entry_path, flags);
+
     if ( user_info )
         report_usergroup_info( ( EMPTY_STRING( user_name ) ? NULL : user_name ),
                                flags );
@@ -3485,10 +3770,8 @@ int main( int argc, char **argv )
     if ( class_info )
         report_class_info(flags);
 
-#ifdef ATTR_INDEX_dircount
     if ( topdirs )
         report_topdirs( topdirs, flags );
-#endif
 
     if ( topsize )
         report_topsize( topsize, flags );
@@ -3510,22 +3793,26 @@ int main( int argc, char **argv )
 #endif
 
     if ( dump_all )
-        dump_entries( DUMP_ALL, 0, NULL, flags );
+        dump_entries( DUMP_ALL, 0, NULL, NULL, flags );
 
     if ( dump_user )
-        dump_entries( DUMP_USR, 0, dump_user_name, flags );
+        dump_entries( DUMP_USR, 0, dump_user_name, NULL, flags );
 
     if ( dump_group )
-        dump_entries( DUMP_GROUP, 0, dump_group_name, flags );
+        dump_entries( DUMP_GROUP, 0, dump_group_name, NULL, flags );
 
 #ifdef _LUSTRE
-    if ( dump_ost )
-        dump_entries( DUMP_OST, dump_ost_index, NULL, flags );
+    if ( dump_ost ) {
+        dump_entries( DUMP_OST, 0, ost_set_str, &dump_ost_set, flags );
+        /* free the list */
+        if (dump_ost_set.values)
+            MemFree(dump_ost_set.values);
+    }
 #endif
 
 #ifdef ATTR_INDEX_status
     if ( dump_status )
-        dump_entries( DUMP_STATUS, status_to_dump, NULL, flags );
+        dump_entries( DUMP_STATUS, status_to_dump, NULL, NULL, flags );
 #endif
 
 #ifdef HAVE_MIGR_POLICY

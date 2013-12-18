@@ -117,8 +117,6 @@ static inline void display_version( char *bin_name )
     printf( "    Lustre-HSM Policy Engine\n" );
 #elif defined(_TMP_FS_MGR)
     printf( "    Temporary filesystem manager\n" );
-#elif defined(_SHERPA)
-    printf( "    SHERPA cache zapper\n" );
 #elif defined(_HSM_LITE)
     printf( "    Backup filesystem to external storage\n" );
 #else
@@ -183,7 +181,7 @@ static inline int import_helper(const char       *backend_path,
     strcpy(tmp, backend_path);
     name = basename(tmp);
 
-    /* clean import path if it already as fid in it */
+    /* clean import path if it already has fid in it */
     if ((second = strrchr(name, '_')) && (second != name)
         && (*(first = second - 1) == '_')
         && (sscanf(second+1, SFID"%s", RFID(&old_id), dummy) >= 3))
@@ -194,7 +192,7 @@ static inline int import_helper(const char       *backend_path,
             /* clean fid in target path */
             tgt_path[strlen(tgt_path)-strlen(first)] = '\0';
         } else {
-            DisplayLog(LVL_MAJOR, LOGTAG, "'%s' has garbage ('%s') after fid ("DFID_NOBRACE")", 
+            DisplayLog(LVL_MAJOR, LOGTAG, "'%s' has garbage ('%s') after fid ("DFID_NOBRACE")",
                        name, dummy, PFID(&old_id));
             memset(&old_id, 0, sizeof(old_id));
         }
@@ -203,7 +201,9 @@ static inline int import_helper(const char       *backend_path,
 
     printf("Importing '%s' as '%s'...\n", backend_path, tgt_path);
 
-    ATTR_MASK_INIT( &attrs );
+    ATTR_MASK_INIT(&attrs);
+    ATTR_MASK_INIT(&src_attrs);
+    ATTR_MASK_INIT(&new_attrs);
 
     ATTR_MASK_SET( &attrs, backendpath );
     strcpy( ATTR( &attrs, backendpath), backend_path );
@@ -214,15 +214,34 @@ static inline int import_helper(const char       *backend_path,
     /* merge with source MD (but don't override) */
     if (src_md)
     {
+        /* if the entry is a symlink, get its content */
+        if (S_ISLNK(src_md->st_mode))
+        {
+            const size_t bufflen = sizeof(ATTR(&attrs, link));
+            rc = readlink(backend_path, ATTR(&attrs, link), bufflen);
+            if (rc >= 0)
+            {
+                if (rc >= bufflen)
+                    ATTR(&attrs, link)[bufflen-1] = '\0';
+                else
+                    ATTR(&attrs, link)[rc] = '\0';
+
+                ATTR_MASK_SET(&attrs, link);
+            }
+        }
+
         PosixStat2EntryAttr(src_md, &src_attrs, TRUE);
         ListMgr_MergeAttrSets( &attrs, &src_attrs, FALSE);
     }
 
     /* create file in Lustre */
     st = rbhext_recover( &old_id, &attrs, &new_id, &new_attrs, src_md );
-    if ( (st == RS_OK) || (st == RS_DELTA) )
+    if ( (st == RS_FILE_OK) || (st == RS_FILE_DELTA) || (st == RS_FILE_EMPTY) || (st == RS_NON_FILE) )
     {
         printf("\tSuccess\n");
+
+        /* don't insert readonly attrs */
+        new_attrs.attr_mask &= ~readonly_attr_set;
 
         /* insert or update it in the db */
         rc = ListMgr_Insert( &lmgr, &new_id, &new_attrs, TRUE );
@@ -404,7 +423,8 @@ int main( int argc, char **argv )
     int            rc;
     char           err_msg[4096];
     robinhood_config_t config;
-    int chgd = 0;
+    int     chgd = 0;
+    char    badcfg[RBH_PATH_MAX];
 
     struct sigaction act_sigterm;
 
@@ -454,9 +474,9 @@ int main( int argc, char **argv )
     }
 
     /* get default config file, if not specified */
-    if ( SearchConfig( config_file, config_file, &chgd ) != 0 )
+    if ( SearchConfig( config_file, config_file, &chgd, badcfg ) != 0 )
     {
-        fprintf(stderr, "No config file found in '/etc/robinhood.d/"PURPOSE_EXT"', ...\n" );
+        fprintf(stderr, "No config file (or too many) found matching %s\n", badcfg );
         exit(2);
     }
     else if (chgd)

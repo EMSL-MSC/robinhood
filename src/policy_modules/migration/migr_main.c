@@ -66,7 +66,7 @@ static migr_state_t migr_state = MS_OFF;
 /**
  * Function for checking that filesystem hasn't been unmounted
  */
-static int CheckFSDevice(  )
+static int CheckFSDevice( void )
 {
     struct stat    root_md;
 
@@ -150,7 +150,7 @@ static int check_maintenance_mode(policy_modifier_t * p_mod)
 }
 
 
-static int start_migration_pass(  )
+static int start_migration_pass( void )
 {
     int            rc;
     char           tmpstr[128];
@@ -160,6 +160,7 @@ static int start_migration_pass(  )
     unsigned int   nb_files = 0;
     unsigned long long vol = 0;
     const char * action_str;
+    time_t start_time;
 
     /* check if filesystem is still mounted */
     if ( !CheckFSDevice(  ) )
@@ -212,12 +213,11 @@ static int start_migration_pass(  )
     ListMgr_SetVar( &lmgr, LAST_MIGR_STATUS, "running" );
     ListMgr_SetVar( &lmgr, LAST_MIGR_INFO, tmpstr );
 
+    start_time = time(NULL);
     rc = perform_migration( &lmgr, &param, &nb_files, &vol );
 
 #ifdef _LUSTRE_HSM
     action_str = "started";
-#elif defined(_SHERPA)
-    action_str = "done";
 #elif defined(_HSM_LITE)
     if ( backend.async_archive )
         action_str = "started";
@@ -227,11 +227,16 @@ static int start_migration_pass(  )
 
     if ( rc == 0 )
     {
+        char buf[128];
+        unsigned int spent = time(NULL) - start_time;
+        if (spent == 0) spent = 1;
+
         FormatFileSize( tmpstr, 128, vol );
+        FormatFileSize( buf, 128, vol/spent );
 
         DisplayLog( LVL_MAJOR, MIGR_TAG,
-                    "Migration summary: %u file migrations %s (total volume: %s)",
-                    nb_files, action_str, tmpstr );
+                    "Migration summary: %u file migrations %s (%.2f/sec); total volume: %s (%s/sec)",
+                    nb_files, action_str, (float)nb_files/(float)spent, tmpstr, buf );
 
         snprintf( varstr, 512, "nbr migration %s: %u, total volume: %s",
                   action_str, nb_files, tmpstr );
@@ -351,7 +356,7 @@ int Start_Migration( migration_config_t * p_config, migr_opt_t options )
     migr_config = *p_config;
     module_args = options;
 
-    if ( NO_POLICY( &policies.migr_policies ) && 
+    if ( NO_POLICY( &policies.migr_policies ) &&
         !(module_args.flags & FLAG_IGNORE_POL) )
     {
         DisplayLog( LVL_CRIT, MIGR_TAG,
@@ -394,15 +399,12 @@ int Start_Migration( migration_config_t * p_config, migr_opt_t options )
  */
 int MigrateSingle( migration_config_t * p_config, const char * file, int flags )
 {
-    int            rc;
-
     fsdev = get_fsdev();
 
     /* store configuration */
     migr_config = *p_config;
 
     return migrate_one_file( file, flags );
-
 }
 
 int Stop_Migration()

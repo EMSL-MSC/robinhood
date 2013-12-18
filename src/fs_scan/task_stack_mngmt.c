@@ -12,7 +12,7 @@
  * accept its terms.
  */
 /**
- * Module for managing FS scan tasks as a stack 
+ * Module for managing FS scan tasks as a stack
  * with priorities on entry depth.
  */
 
@@ -23,9 +23,7 @@
 #include "fs_scan.h"
 #include "task_stack_mngmt.h"
 #include "RobinhoodLogs.h"
-
-#define P( _mutex_ )  pthread_mutex_lock( &(_mutex_) )
-#define V( _mutex_ )  pthread_mutex_unlock( &(_mutex_) )
+#include "RobinhoodMisc.h"
 
 /* Initialize a stack of tasks */
 int InitTaskStack( task_stack_t * p_stack )
@@ -46,7 +44,7 @@ int InitTaskStack( task_stack_t * p_stack )
     pthread_mutex_init( &p_stack->stack_lock, NULL );
 
     /* initially, no task available: sem=0 */
-    if ( ( rc = semaphore_init( &p_stack->sem_tasks, 0 ) ) )
+    if ( ( rc = sem_init( &p_stack->sem_tasks, 0, 0 ) ) )
     {
         pthread_mutex_destroy( &p_stack->stack_lock );
         DisplayLog( LVL_CRIT, FSSCAN_TAG, "ERROR initializing semaphore" );
@@ -60,7 +58,7 @@ int InitTaskStack( task_stack_t * p_stack )
 
 
 /* insert a task in the stack */
-int InsertTask_to_Stack( task_stack_t * p_stack, robinhood_task_t * p_task )
+void InsertTask_to_Stack( task_stack_t * p_stack, robinhood_task_t * p_task )
 {
     unsigned int   prof = p_task->depth;
 
@@ -83,9 +81,7 @@ int InsertTask_to_Stack( task_stack_t * p_stack, robinhood_task_t * p_task )
     V( p_stack->stack_lock );
 
     /* unblock waiting worker threads */
-    semaphore_V( &p_stack->sem_tasks );
-
-    return 0;
+    sem_post_safe( &p_stack->sem_tasks );
 
 }
 
@@ -99,7 +95,7 @@ robinhood_task_t *GetTask_from_Stack( task_stack_t * p_stack )
     int            index;
 
     /* wait for a task */
-    semaphore_P( &p_stack->sem_tasks );
+    sem_wait_safe( &p_stack->sem_tasks );
 
     /* lock the stack */
     P( p_stack->stack_lock );
@@ -110,6 +106,7 @@ robinhood_task_t *GetTask_from_Stack( task_stack_t * p_stack )
     /* sanity check */
     if ( p_task == NULL )
     {
+        V( p_stack->stack_lock );
         DisplayLog( LVL_CRIT, FSSCAN_TAG, "UNEXPECTED ERROR: NO TASK FOUND" );
         return NULL;
     }
@@ -119,7 +116,7 @@ robinhood_task_t *GetTask_from_Stack( task_stack_t * p_stack )
 
     /* if the list at current depth is empty, we need to
      * update max_task_depth.
-     */ 
+     */
     if ( p_task->next_task == NULL )
     {
         for ( index = p_stack->max_task_depth; index >= 0; index-- )

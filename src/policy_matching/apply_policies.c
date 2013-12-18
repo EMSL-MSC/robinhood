@@ -266,7 +266,7 @@ obj_type_t ListMgr2PolicyType( const char * str_type )
  * \return -1 if this is not a criteria stored in DB.
  */
 int CriteriaToFilter(const compare_triplet_t * p_comp, int * p_attr_index,
-                     filter_comparator_t * p_compar, db_type_u * p_value,
+                     filter_comparator_t * p_compar, filter_value_t * p_value,
                      int * p_must_release)
 {
     int len;
@@ -318,7 +318,7 @@ int CriteriaToFilter(const compare_triplet_t * p_comp, int * p_attr_index,
         len++;
         new_str[len]='\0';
 
-        p_value->val_str = new_str;
+        p_value->value.val_str = new_str;
         break;
 
     case CRITERIA_PATH: /* fullpath 'path' */
@@ -333,10 +333,10 @@ int CriteriaToFilter(const compare_triplet_t * p_comp, int * p_attr_index,
             new_str = MemAlloc( len + 1 ); /* +1 for \0 */
             *p_must_release = TRUE;
             sprintf(new_str, "%s/%s", global_config.fs_path, p_comp->val.str);
-            p_value->val_str = new_str;
+            p_value->value.val_str = new_str;
         }
         else
-            p_value->val_str = p_comp->val.str;
+            p_value->value.val_str = p_comp->val.str;
 
         break;
 
@@ -344,7 +344,7 @@ int CriteriaToFilter(const compare_triplet_t * p_comp, int * p_attr_index,
 
         *p_attr_index = ATTR_INDEX_name;
         *p_compar = Policy2FilterComparator( p_comp->op );
-        p_value->val_str = p_comp->val.str;
+        p_value->value.val_str = p_comp->val.str;
 
         break;
 
@@ -353,38 +353,38 @@ int CriteriaToFilter(const compare_triplet_t * p_comp, int * p_attr_index,
 
         *p_attr_index = ATTR_INDEX_type;
         *p_compar = Policy2FilterComparator( p_comp->op );
-        p_value->val_str = Policy2ListMgrType( p_comp->val.type );
+        p_value->value.val_str = Policy2ListMgrType( p_comp->val.type );
         break;
 #endif
     case CRITERIA_OWNER: /* owner like 'owner' */
         *p_attr_index = ATTR_INDEX_owner;
         *p_compar = Policy2FilterComparator( p_comp->op );
-        p_value->val_str = p_comp->val.str;
+        p_value->value.val_str = p_comp->val.str;
         break;
 
     case CRITERIA_GROUP:
         *p_attr_index = ATTR_INDEX_gr_name;
         *p_compar = Policy2FilterComparator( p_comp->op );
-        p_value->val_str = p_comp->val.str;
+        p_value->value.val_str = p_comp->val.str;
         break;
 
     case CRITERIA_SIZE:
         *p_attr_index = ATTR_INDEX_size;
         *p_compar = Policy2FilterComparator( p_comp->op );
-        p_value->val_biguint = p_comp->val.size;
+        p_value->value.val_biguint = p_comp->val.size;
         break;
 
     case CRITERIA_DEPTH:
         *p_attr_index = ATTR_INDEX_depth;
         *p_compar = Policy2FilterComparator( p_comp->op );
-        p_value->val_uint = p_comp->val.integer;
+        p_value->value.val_uint = p_comp->val.integer;
         break;
 
 #ifdef ATTR_INDEX_dircount
     case CRITERIA_DIRCOUNT:
         *p_attr_index = ATTR_INDEX_dircount;
         *p_compar = Policy2FilterComparator( p_comp->op );
-        p_value->val_uint = p_comp->val.integer;
+        p_value->value.val_uint = p_comp->val.integer;
         break;
 #endif
     case CRITERIA_LAST_ACCESS:
@@ -393,7 +393,7 @@ int CriteriaToFilter(const compare_triplet_t * p_comp, int * p_attr_index,
     /*   last_access > 2h <=> access_time < time(NULL) - 2h */
 
         *p_compar = Policy2FilterComparator( oppose_compare( p_comp->op ) );
-        p_value->val_uint = time(NULL) - p_comp->val.duration;
+        p_value->value.val_uint = time(NULL) - p_comp->val.duration;
         break;
 
 
@@ -401,14 +401,24 @@ int CriteriaToFilter(const compare_triplet_t * p_comp, int * p_attr_index,
     case CRITERIA_LAST_MOD:
         *p_attr_index = ATTR_INDEX_last_mod;
         *p_compar = Policy2FilterComparator( oppose_compare( p_comp->op ) );
-        p_value->val_uint = time(NULL) - p_comp->val.duration;
+        p_value->value.val_uint = time(NULL) - p_comp->val.duration;
         break;
 
 #ifdef ATTR_INDEX_last_archive
     case CRITERIA_LAST_ARCHIVE:
         *p_attr_index = ATTR_INDEX_last_archive;
         *p_compar = Policy2FilterComparator( oppose_compare( p_comp->op ) );
-        p_value->val_uint = time(NULL) - p_comp->val.duration;
+        p_value->value.val_uint = time(NULL) - p_comp->val.duration;
+
+        /* last_archive == 0 has a special meaning that file
+         * has never been archived */
+        if ((p_comp->op == COMP_EQUAL)
+            && (p_comp->val.duration == 0))
+        {
+            p_value->value.val_uint = 0;
+            /* Caller (append_simple_AND_expr) must also set ALLOW_NULL flag */
+        }
+
         break;
 #endif
 
@@ -416,7 +426,7 @@ int CriteriaToFilter(const compare_triplet_t * p_comp, int * p_attr_index,
     case CRITERIA_LAST_RESTORE:
         *p_attr_index = ATTR_INDEX_last_restore;
         *p_compar = Policy2FilterComparator( oppose_compare( p_comp->op ) );
-        p_value->val_uint = time(NULL) - p_comp->val.duration;
+        p_value->value.val_uint = time(NULL) - p_comp->val.duration;
         break;
 #endif
 
@@ -424,7 +434,7 @@ int CriteriaToFilter(const compare_triplet_t * p_comp, int * p_attr_index,
     case CRITERIA_CREATION:
         *p_attr_index = ATTR_INDEX_creation_time;
         *p_compar = Policy2FilterComparator( oppose_compare( p_comp->op ) );
-        p_value->val_uint = time(NULL) - p_comp->val.duration;
+        p_value->value.val_uint = time(NULL) - p_comp->val.duration;
         break;
 #endif
 
@@ -433,13 +443,14 @@ int CriteriaToFilter(const compare_triplet_t * p_comp, int * p_attr_index,
     case CRITERIA_POOL:
         *p_attr_index = ATTR_INDEX_stripe_info;
         *p_compar = Policy2FilterComparator( p_comp->op );
-        p_value->val_str = p_comp->val.str;
+        p_value->value.val_str = p_comp->val.str;
         break;
 
     case CRITERIA_OST:
         *p_attr_index = ATTR_INDEX_stripe_items;
         *p_compar = Policy2FilterComparator( p_comp->op );
-        p_value->val_uint = p_comp->val.integer;
+        p_value->value.val_uint = p_comp->val.integer;
+        /* TODO support sets of OSTs */
         break;
 
     case CRITERIA_XATTR:
@@ -461,7 +472,7 @@ static inline time_t time_modify( time_t orig, const policy_modifier_t *p_pol_mo
 
     /* if orig is already under time_min, keep it */
     if (orig <= p_pol_mod->time_min)
-        return orig; 
+        return orig;
 
     newtime = orig * p_pol_mod->time_factor;
     if (newtime < p_pol_mod->time_min)
@@ -624,8 +635,16 @@ static policy_match_t eval_condition( const entry_id_t * p_entry_id,
 
 #ifdef ATTR_INDEX_last_archive
     case CRITERIA_LAST_ARCHIVE:
-        /* last_archive is required */
-        CHECK_ATTR( p_entry_attr, last_archive, no_warning );
+        /* last_archive == 0 IF-AND-ONLY-IF file has never been archived */
+        if (!ATTR_MASK_TEST(p_entry_attr, last_archive)
+            || ATTR(p_entry_attr, last_archive) == 0)
+        {
+            if ((p_triplet->op == COMP_EQUAL)
+                && (p_triplet->val.duration == 0))
+                return POLICY_MATCH;
+            else /* last_archive > X do not match */
+                return POLICY_NO_MATCH;
+        }
 
         rc = int_compare( time( NULL ) - ATTR( p_entry_attr, last_archive ), p_triplet->op,
                           time_modify(p_triplet->val.duration, p_pol_mod) );
@@ -657,6 +676,7 @@ static policy_match_t eval_condition( const entry_id_t * p_entry_id,
         break;
 #endif
 
+#ifdef _LUSTRE
     case CRITERIA_POOL:
         /* /!\ objects != file or dir don't have stripe info (never match) */
         if ( ATTR_MASK_TEST( p_entry_attr, type ) &&
@@ -694,7 +714,7 @@ static policy_match_t eval_condition( const entry_id_t * p_entry_id,
 
         for ( i = 0; i < ATTR(p_entry_attr, stripe_items).count; i++ )
         {
-            if ( ATTR(p_entry_attr, stripe_items).stripe_units[i] == p_triplet->val.integer )
+            if ( ATTR(p_entry_attr, stripe_items).stripe[i].ost_idx == p_triplet->val.integer )
             {
                 /* if comparator is ==, at least 1 OST must match,
                  * if the cmp is !=, none must match */
@@ -713,6 +733,8 @@ static policy_match_t eval_condition( const entry_id_t * p_entry_id,
             return POLICY_NO_MATCH;
         break;
     }
+#endif
+
     case CRITERIA_XATTR:
 #ifdef HAVE_ATTR_XATTR_H
     {
@@ -728,7 +750,7 @@ static policy_match_t eval_condition( const entry_id_t * p_entry_id,
             /* use fid path */
             rc = BuildFidPath( p_entry_id, tmpbuff );
             if ( rc )
-               return POLICY_ERR; 
+               return POLICY_ERR;
             entry_path = tmpbuff;
         }
         else if (ATTR_MASK_TEST(p_entry_attr, fullpath))
@@ -754,7 +776,7 @@ static policy_match_t eval_condition( const entry_id_t * p_entry_id,
                 strcpy( value, "" );
             else if  (errno == ENOTSUP )
             {
-                DisplayLog(LVL_CRIT, POLICY_TAG, "Error: condition on extended attribute " 
+                DisplayLog(LVL_CRIT, POLICY_TAG, "Error: condition on extended attribute "
                            "whereas this feature is not supported by the filesystem");
                 return POLICY_ERR;
             }
@@ -767,7 +789,7 @@ static policy_match_t eval_condition( const entry_id_t * p_entry_id,
         }
         else
         {
-            /* security: set byte n+1 to '\0', to avaoid overflows if attr is not a string */
+            /* security: set byte n+1 to '\0', to avoid overflows if attr is not a string */
             if ( rc < 1024 )
                 value[rc] = '\0';
         }
@@ -795,6 +817,10 @@ static policy_match_t eval_condition( const entry_id_t * p_entry_id,
         /* fullpath is required if fids are not available */
         /* @TODO */
         break;
+
+    default:
+        DisplayLog(LVL_CRIT, POLICY_TAG, "This criteria (%#x) is not supported in this mode", p_triplet->crit);
+        return POLICY_ERR;
     }
 
     return POLICY_ERR;
@@ -805,7 +831,7 @@ static policy_match_t eval_condition( const entry_id_t * p_entry_id,
 /* function for testing a boolean expression on a given entry */
 static policy_match_t _EntryMatches( const entry_id_t * p_entry_id, const attr_set_t * p_entry_attr,
                                      bool_node_t * p_node, const policy_modifier_t * p_pol_mod,
-                                     int no_warning ) 
+                                     int no_warning )
 {
     policy_match_t rc;
 
@@ -871,7 +897,9 @@ policy_match_t EntryMatches( const entry_id_t * p_entry_id, const attr_set_t * p
     return _EntryMatches( p_entry_id, p_entry_attr, p_node, p_pol_mod, FALSE );
 }
 
-static policy_match_t _IsWhitelisted( const entry_id_t * p_entry_id, attr_set_t * p_entry_attr,
+static policy_match_t _IsWhitelisted( const entry_id_t * p_entry_id,
+                                      attr_set_t * p_attrs_out,
+                                      const attr_set_t * p_attrs_in,
                               policy_type_t policy_type, int no_warning )
 {
     unsigned int   i, count;
@@ -910,26 +938,37 @@ static policy_match_t _IsWhitelisted( const entry_id_t * p_entry_id, attr_set_t 
 
     for ( i = 0; i < count; i++ )
     {
-        switch ( _EntryMatches( p_entry_id, p_entry_attr, &list[i].bool_expr, NULL, no_warning ) )
+        switch ( _EntryMatches( p_entry_id, p_attrs_in, &list[i].bool_expr, NULL, no_warning ) )
         {
         case POLICY_MATCH:
 #ifdef HAVE_PURGE_POLICY
             /* remember the matched fileset */
             if ( policy_type == PURGE_POLICY )
             {
-                strcpy( ATTR( p_entry_attr, release_class ), CLASS_IGNORED );
-                ATTR_MASK_SET( p_entry_attr, release_class );
-                ATTR( p_entry_attr, rel_cl_update ) = time(NULL);
-                ATTR_MASK_SET( p_entry_attr, rel_cl_update );
+                strcpy( ATTR( p_attrs_out, release_class ), CLASS_IGNORED );
+                ATTR_MASK_SET( p_attrs_out, release_class );
+                ATTR( p_attrs_out, rel_cl_update ) = time(NULL);
+                ATTR_MASK_SET( p_attrs_out, rel_cl_update );
             }
 #endif
+#ifdef HAVE_RMDIR_POLICY
+            /* tag whitelisted dir as 'IGNORED' */
+            if ( policy_type == RMDIR_POLICY )
+            {
+                strcpy( ATTR( p_attrs_out, release_class ), CLASS_IGNORED );
+                ATTR_MASK_SET( p_attrs_out, release_class );
+                ATTR( p_attrs_out, rel_cl_update ) = time(NULL);
+                ATTR_MASK_SET( p_attrs_out, rel_cl_update );
+            }
+#endif
+
 #ifdef HAVE_MIGR_POLICY
             if ( policy_type == MIGR_POLICY )
             {
-                strcpy( ATTR( p_entry_attr, archive_class ), CLASS_IGNORED );
-                ATTR_MASK_SET( p_entry_attr, archive_class );
-                ATTR( p_entry_attr, arch_cl_update ) = time(NULL);
-                ATTR_MASK_SET( p_entry_attr, arch_cl_update );
+                strcpy( ATTR( p_attrs_out, archive_class ), CLASS_IGNORED );
+                ATTR_MASK_SET( p_attrs_out, archive_class );
+                ATTR( p_attrs_out, arch_cl_update ) = time(NULL);
+                ATTR_MASK_SET( p_attrs_out, arch_cl_update );
             }
 #endif
             return POLICY_MATCH;
@@ -985,32 +1024,41 @@ static policy_match_t _IsWhitelisted( const entry_id_t * p_entry_id, attr_set_t 
 
     for ( i = 0; i < count; i++ )
     {
-        switch ( _EntryMatches( p_entry_id, p_entry_attr, &fs_list[i]->definition, NULL, no_warning ) )
+#ifdef _DEBUG_POLICIES
+        printf( "Checking if entry matches whitelisted fileset %s...\n", fs_list[i]->fileset_id );
+#endif
+        switch ( _EntryMatches( p_entry_id, p_attrs_in, &fs_list[i]->definition, NULL, no_warning ) )
         {
         case POLICY_MATCH:
         {
+#ifdef _DEBUG_POLICIES
+            printf( "   -> match\n");
+#endif
 #ifdef HAVE_PURGE_POLICY
             /* remember the matched fileset */
             if ( policy_type == PURGE_POLICY )
             {
-                strcpy( ATTR( p_entry_attr, release_class ), fs_list[i]->fileset_id );
-                ATTR_MASK_SET( p_entry_attr, release_class );
-                ATTR( p_entry_attr, rel_cl_update ) = time(NULL);
-                ATTR_MASK_SET( p_entry_attr, rel_cl_update );
+                strcpy( ATTR( p_attrs_out, release_class ), fs_list[i]->fileset_id );
+                ATTR_MASK_SET( p_attrs_out, release_class );
+                ATTR( p_attrs_out, rel_cl_update ) = time(NULL);
+                ATTR_MASK_SET( p_attrs_out, rel_cl_update );
             }
 #endif
 #ifdef HAVE_MIGR_POLICY
             if ( policy_type == MIGR_POLICY )
             {
-                strcpy( ATTR( p_entry_attr, archive_class ), fs_list[i]->fileset_id );
-                ATTR_MASK_SET( p_entry_attr, archive_class );
-                ATTR( p_entry_attr, arch_cl_update ) = time(NULL);
-                ATTR_MASK_SET( p_entry_attr, arch_cl_update );
+                strcpy( ATTR( p_attrs_out, archive_class ), fs_list[i]->fileset_id );
+                ATTR_MASK_SET( p_attrs_out, archive_class );
+                ATTR( p_attrs_out, arch_cl_update ) = time(NULL);
+                ATTR_MASK_SET( p_attrs_out, arch_cl_update );
             }
 #endif
             return POLICY_MATCH;
         }
         case POLICY_MISSING_ATTR:
+#ifdef _DEBUG_POLICIES
+            printf( "   -> missing attr\n");
+#endif
             if ( !no_warning )
                 DisplayLog( LVL_MAJOR, POLICY_TAG,
                         "Attribute is missing for checking ignore_fileclass rule" );
@@ -1018,11 +1066,17 @@ static policy_match_t _IsWhitelisted( const entry_id_t * p_entry_id, attr_set_t 
                 rc = POLICY_MISSING_ATTR;
             break;
         case POLICY_ERR:
+#ifdef _DEBUG_POLICIES
+            printf( "   -> error\n");
+#endif
             DisplayLog( LVL_CRIT, POLICY_TAG,
                         "An error occured when checking ignore_fileclass rule" );
             rc = POLICY_ERR;
             break;
         case POLICY_NO_MATCH:
+#ifdef _DEBUG_POLICIES
+            printf( "   -> no match\n");
+#endif
             /* continue testing other whitelist rules */
             break;
         }
@@ -1034,7 +1088,7 @@ static policy_match_t _IsWhitelisted( const entry_id_t * p_entry_id, attr_set_t 
 policy_match_t IsWhitelisted( const entry_id_t * p_entry_id, attr_set_t * p_entry_attr,
                               policy_type_t policy_type )
 {
-    return _IsWhitelisted( p_entry_id, p_entry_attr, policy_type, FALSE );
+    return _IsWhitelisted( p_entry_id, p_entry_attr, p_entry_attr, policy_type, FALSE );
 }
 
 
@@ -1073,7 +1127,7 @@ int WhitelistedClass( const char * class_id, policy_type_t policy_type )
 }
 
 
-/** @TODO XXX is this usefull? */
+/** @TODO XXX is this useful? */
 #if 0
 char          *FilesetMatch( const entry_id_t * p_entry_id, const attr_set_t * p_entry_attr )
 {
@@ -1290,7 +1344,7 @@ policy_item_t * GetPolicyCaseByClass( const char * class_id,
         }
     }
 
-    DisplayLog( LVL_MAJOR, POLICY_TAG, "saved fileclass '%s' is no more used in %s policy. Refresh needed.",
+    DisplayLog( LVL_MAJOR, POLICY_TAG, "saved fileclass '%s' is not used anymore in %s policy. Refresh needed.",
                 class_id, ( policy_type == PURGE_POLICY ) ? "purge" : "migration" );
     return NULL;
 }
@@ -1313,7 +1367,7 @@ policy_match_t PolicyMatchAllConditions( const entry_id_t * p_entry_id,
     /* if it MATCHES any whitelist condition, return NO_MATCH
      * else, it could potentially match a policy, so we must test them.
      */
-    switch ( _IsWhitelisted( p_entry_id, p_entry_attr, policy_type, TRUE ) )
+    switch ( _IsWhitelisted( p_entry_id, p_entry_attr, p_entry_attr, policy_type, TRUE ) )
     {
     case POLICY_MATCH:
         return POLICY_NO_MATCH;
@@ -1522,29 +1576,38 @@ policy_match_t PolicyMatchAllConditions( const entry_id_t * p_entry_id,
  * check whitelist condition for file or directory entries
  * optionnally match fileclasses.
  */
-int check_policies( const entry_id_t * p_id, attr_set_t * p_attrs,
+int check_policies( const entry_id_t * p_id, attr_set_t * p_attrs_new,
+                    attr_set_t * p_attrs_cached,
                     int match_all_fc )
 {
-    policy_match_t isok;
+#ifdef HAVE_MIGR_POLICY
+    int wl_migr = FALSE;
+#endif
+#ifdef HAVE_PURGE_POLICY
+    int wl_purge = FALSE;
+#endif
+    /* merge new attrs with cached attrs to do the check */
+    attr_set_t attrs = *p_attrs_new;
+    if (p_attrs_cached)
+        /* don't override new attrs with cached one */
+        ListMgr_MergeAttrSets( &attrs, p_attrs_cached, FALSE );
 
 #ifdef HAVE_RMDIR_POLICY
-    if ( ATTR_MASK_TEST( p_attrs, type )
-         && !strcmp( ATTR( p_attrs, type ), STR_TYPE_DIR ) )
+    if ( ATTR_MASK_TEST( &attrs, type )
+         && !strcmp( ATTR( &attrs, type ), STR_TYPE_DIR ) )
     {
-        /* generate needed fields */
-        ListMgr_GenerateFields( p_attrs, policies.rmdir_policy.global_attr_mask );
+        /* generate missing fields (e.g. name and depth from fullpath...) */
+        ListMgr_GenerateFields( &attrs, policies.rmdir_policy.global_attr_mask );
 
-        isok = _IsWhitelisted( p_id, p_attrs, RMDIR_POLICY, TRUE );
-
-        if ( isok == POLICY_MATCH )
+        /* set release class if whitelisted */
+        if (_IsWhitelisted( p_id, p_attrs_new, &attrs, RMDIR_POLICY, TRUE )
+            == POLICY_NO_MATCH)
         {
-            ATTR_MASK_SET( p_attrs, whitelisted );
-            ATTR( p_attrs, whitelisted ) = TRUE;
-        }
-        else if ( isok == POLICY_NO_MATCH )
-        {
-            ATTR_MASK_SET( p_attrs, whitelisted );
-            ATTR( p_attrs, whitelisted ) = FALSE;
+            /* set DEFAULT class for non-whitelisted dirs */
+            strcpy( ATTR( p_attrs_new, release_class ), CLASS_DEFAULT );
+            ATTR_MASK_SET( p_attrs_new, release_class );
+            ATTR( p_attrs_new, rel_cl_update ) = time(NULL);
+            ATTR_MASK_SET( p_attrs_new, rel_cl_update );
         }
         return 0;
     }
@@ -1554,74 +1617,72 @@ int check_policies( const entry_id_t * p_id, attr_set_t * p_attrs,
 
     /* generate needed fields */
 #ifdef HAVE_PURGE_POLICY
-    ListMgr_GenerateFields( p_attrs, policies.purge_policies.global_attr_mask );
-
-    isok = _IsWhitelisted( p_id, p_attrs, PURGE_POLICY, TRUE );
-
-#ifdef ATTR_INDEX_whitelisted
-    if ( isok == POLICY_MATCH )
-    {
-        ATTR_MASK_SET( p_attrs, whitelisted );
-        ATTR( p_attrs, whitelisted ) = TRUE;
-    }
-    else if ( isok == POLICY_NO_MATCH )
-    {
-        ATTR_MASK_SET( p_attrs, whitelisted );
-        ATTR( p_attrs, whitelisted ) = FALSE;
-    }
+    ListMgr_GenerateFields( &attrs, policies.purge_policies.global_attr_mask );
+    /* set release class if whitelisted */
+    if (_IsWhitelisted( p_id, p_attrs_new, &attrs, PURGE_POLICY, TRUE ) == POLICY_MATCH)
+        wl_purge = TRUE;
+#ifdef _DEBUG_POLICIES
+            printf( "release_class=%s\n", ATTR(p_attrs_new, release_class));
 #endif
 #endif
 
 #ifdef HAVE_MIGR_POLICY
     /* check whitelisted fileclasses for migration */
-    ListMgr_GenerateFields( p_attrs, policies.migr_policies.global_attr_mask );
-    _IsWhitelisted( p_id, p_attrs, MIGR_POLICY, TRUE );
+    ListMgr_GenerateFields( &attrs, policies.migr_policies.global_attr_mask );
+    if (_IsWhitelisted( p_id, p_attrs_new, &attrs, MIGR_POLICY, TRUE ) == POLICY_MATCH)
+        wl_migr = TRUE;
 #endif
 
     if ( match_all_fc )
     {
 #ifdef HAVE_PURGE_POLICY
-        if ( need_fileclass_update( p_attrs, PURGE_POLICY ) == TRUE )
+        if (!wl_purge && (need_fileclass_update( &attrs, PURGE_POLICY ) == TRUE) )
+                                     /* can return -1 on error */
         {
             policy_item_t *policy_case = NULL;
             fileset_item_t *p_fileset = NULL;
 
-            policy_case = GetPolicyCase( p_id, p_attrs, PURGE_POLICY,
+            policy_case = GetPolicyCase( p_id, &attrs, PURGE_POLICY,
                                          &p_fileset );
             if ( policy_case != NULL )
             {
                 /* store the matched fileclass */
                 if ( p_fileset )
-                    strcpy( ATTR( p_attrs, release_class ),
+                    strcpy( ATTR( p_attrs_new, release_class ),
                             p_fileset->fileset_id );
                 else
-                    strcpy( ATTR( p_attrs, release_class ), CLASS_DEFAULT );
-                ATTR_MASK_SET( p_attrs, release_class );
-                ATTR( p_attrs, rel_cl_update ) = time(NULL);
-                ATTR_MASK_SET( p_attrs, rel_cl_update );
+                    strcpy( ATTR( p_attrs_new, release_class ), CLASS_DEFAULT );
+                ATTR_MASK_SET( p_attrs_new, release_class );
+                ATTR( p_attrs_new, rel_cl_update ) = time(NULL);
+                ATTR_MASK_SET( p_attrs_new, rel_cl_update );
+
+#ifdef _DEBUG_POLICIES
+                printf( "release_class=%s\n",  ATTR( p_attrs_new, release_class ) );
+#endif
             }
         }
 #endif
 
 #ifdef HAVE_MIGR_POLICY
-        if ( need_fileclass_update( p_attrs, MIGR_POLICY ) == TRUE )
+        if ( !wl_migr && (need_fileclass_update( &attrs, MIGR_POLICY ) == TRUE))
+                                     /* can return -1 on error */
         {
             policy_item_t *policy_case = NULL;
             fileset_item_t *p_fileset = NULL;
 
-            policy_case = GetPolicyCase( p_id, p_attrs, MIGR_POLICY,
+            policy_case = GetPolicyCase( p_id, &attrs, MIGR_POLICY,
                                          &p_fileset );
             if ( policy_case != NULL )
             {
                 /* store the matched fileclass */
                 if ( p_fileset )
-                    strcpy( ATTR( p_attrs, archive_class ),
+                    strcpy( ATTR( p_attrs_new, archive_class ),
                             p_fileset->fileset_id );
                 else
-                    strcpy( ATTR( p_attrs, archive_class ), CLASS_DEFAULT );
-                ATTR_MASK_SET( p_attrs, archive_class );
-                ATTR( p_attrs, arch_cl_update ) = time(NULL);
-                ATTR_MASK_SET( p_attrs, arch_cl_update );
+                    strcpy( ATTR( p_attrs_new, archive_class ), CLASS_DEFAULT );
+                ATTR_MASK_SET( p_attrs_new, archive_class );
+                ATTR( p_attrs_new, arch_cl_update ) = time(NULL);
+                ATTR_MASK_SET( p_attrs_new, arch_cl_update );
             }
         }
 #endif
@@ -1735,8 +1796,7 @@ int need_info_update( const attr_set_t * p_attrs, int * update_if_event,
     {
        what = "POSIX path";
        pol = policies.updt_policy.path;
-       is_set = ( ATTR_MASK_TEST( p_attrs, fullpath )
-                && ATTR_MASK_TEST( p_attrs, path_update ) );
+       is_set = ATTR_MASK_TEST( p_attrs, path_update );
        if ( is_set )
            last = ATTR( p_attrs, path_update );
     }
@@ -1829,7 +1889,7 @@ static const char *empty_str = "";
  * \param hints malloc'ated string.
  *        It can be reallocated or freed in this function.
  */
-char * analyze_hints_params(  char * hints,
+static char * analyze_hints_params(  char * hints,
                           const policy_item_t * policy,
                           const fileset_item_t * fileset,
                           const entry_id_t * p_entry_id,
@@ -1882,7 +1942,7 @@ char * analyze_hints_params(  char * hints,
                 error = TRUE;
                 break;
            }
-           value = ATTR(p_entry_attr, fullpath); 
+           value = ATTR(p_entry_attr, fullpath);
         }
         else if (!strcasecmp( begin_var, "name" ) )
         {
@@ -1892,7 +1952,7 @@ char * analyze_hints_params(  char * hints,
                 error = TRUE;
                 break;
            }
-           value = ATTR(p_entry_attr, name); 
+           value = ATTR(p_entry_attr, name);
         }
         else if (!strcasecmp( begin_var, "ost_pool" ) )
         {
@@ -1902,7 +1962,7 @@ char * analyze_hints_params(  char * hints,
                 error = TRUE;
                 break;
            }
-           value = ATTR(p_entry_attr, stripe_info).pool_name; 
+           value = ATTR(p_entry_attr, stripe_info).pool_name;
         }
         else
         {

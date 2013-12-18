@@ -14,7 +14,7 @@
 
 /**
  * \file  policies.h
- * \brief policies management. 
+ * \brief policies management.
  */
 
 #ifndef _POLICIES_H
@@ -85,8 +85,10 @@ typedef enum
 } obj_type_t;
 
 
-/* string representation in database (not in config file) */
-
+/* string representation in database (not in config file)
+ *
+ * When adding a new type, fix the database enum in
+ * listmgr_init.c:append_field_def() */
 #define STR_TYPE_LINK   "symlink"
 #define STR_TYPE_DIR    "dir"
 #define STR_TYPE_FILE   "file"
@@ -178,6 +180,9 @@ typedef struct rmdir_policy_t
     int            global_attr_mask;             /**< minimum set of attributes for checking all rules */
 } rmdir_policy_t;
 
+#define NO_DIR_POLICY( p_pol ) (((p_pol)->whitelist_count + (p_pol)->recursive_rmdir_count == 0) && ((p_pol)->age_rm_empty_dirs == 0))
+
+
 #endif
 
 #define POLICY_ID_LEN   128
@@ -210,7 +215,7 @@ typedef struct fileset_item_t
 #endif
 
 #ifdef _LUSTRE_HSM
-    unsigned int archive_num;
+    unsigned int archive_id;
 #endif
 
     /** @TODO aggregation policy */
@@ -242,7 +247,7 @@ typedef struct policy_item_t
 
     char           hints[HINTS_LEN];             /* for migration only */
 #ifdef _LUSTRE_HSM
-    unsigned int   archive_num;
+    unsigned int   archive_id;
 #endif
 
 } policy_item_t;
@@ -310,7 +315,7 @@ typedef struct updt_policy_t
 } updt_policy_t;
 
 
-/* ====================================================================== 
+/* ======================================================================
  * Function for managing all policy configuration (migration, purge, unlink)
  * ======================================================================*/
 
@@ -346,7 +351,7 @@ extern policies_t policies;
  *  Functions for applying policies to entries
  * ==============================================*/
 
-static inline int is_class_defined()
+static inline int is_file_class_defined(void)
 {
 #ifdef HAVE_PURGE_POLICY
     if ( !NO_POLICY( &policies.purge_policies ) )
@@ -357,6 +362,15 @@ static inline int is_class_defined()
         return TRUE;
 #endif
 
+    return FALSE;
+}
+
+static inline int is_dir_class_defined(void)
+{
+#ifdef HAVE_RMDIR_POLICY
+    if ( !NO_DIR_POLICY( &policies.rmdir_policy) )
+        return TRUE;
+#endif
     return FALSE;
 }
 
@@ -434,7 +448,8 @@ policy_match_t EntryMatches( const entry_id_t * p_entry_id, const attr_set_t * p
  * check whitelist condition for file or directory entries
  * optionnally match fileclasses.
  */
-int check_policies( const entry_id_t * p_id, attr_set_t * p_attrs,
+int check_policies( const entry_id_t * p_id, attr_set_t * p_attrs_new,
+                    attr_set_t * p_attrs_cached,
                     int match_all_fc );
 
 /**
@@ -454,7 +469,7 @@ int need_info_update( const attr_set_t * p_attrs, int * update_on_event,
 #define need_path_update( _pa, _pu )    need_info_update( (_pa), (_pu), UPDT_PATH )
 #define need_md_update( _pa, _pu )    need_info_update( (_pa), (_pu), UPDT_MD )
 
-/** 
+/**
  * Compare 2 boolean expressions
  * @return TRUE if expression structure changed.
  * @return FALSE if they have the same structure,
@@ -484,7 +499,7 @@ int update_boolexpr( const bool_node_t * tgt, const bool_node_t * src );
  * \return -1 if this is not a criteria stored in DB.
  */
 int CriteriaToFilter(const compare_triplet_t * p_comp, int * p_attr_index,
-                     filter_comparator_t * p_compar, db_type_u * p_value,
+                     filter_comparator_t * p_compar, filter_value_t * p_value,
                      int * p_must_release);
 
 #endif

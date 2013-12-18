@@ -13,7 +13,7 @@
 */
 
 /**
- * policy management 
+ * policy management
  */
 #ifdef HAVE_CONFIG_H
 #include "config.h"
@@ -79,7 +79,7 @@ policies_t     policies = {
                                 } while (0)
 
 
-/** 
+/**
  * Compare 2 boolean expressions
  * @return TRUE if expression structure changed.
  * @return FALSE if they have the same structure,
@@ -124,7 +124,7 @@ int compare_boolexpr( const bool_node_t * expr1, const bool_node_t * expr2 )
 }                               /* compare_boolexpr */
 
 
-/** 
+/**
  * Update the numerical values of a boolean expression.
  * /!\ compare_boolexpr() must have returned 0 (else, unguarantied behavior).
  * @param tgt Boolean expression to be updated
@@ -261,7 +261,7 @@ int update_boolexpr( const bool_node_t * tgt, const bool_node_t * src )
             return FALSE;
 
         case CRITERIA_XATTR:
-            if ( strcmp( p_triplet1->val.str, p_triplet2->val.str ) 
+            if ( strcmp( p_triplet1->val.str, p_triplet2->val.str )
                  || strcmp( p_triplet1->xattr_name, p_triplet2->xattr_name ) )
             {
                 DisplayLog( LVL_MAJOR, RELOAD_TAG,
@@ -285,7 +285,7 @@ int update_boolexpr( const bool_node_t * tgt, const bool_node_t * src )
 
 /** Update whitelist rules */
 /* @TODO support whitelist rules update on SIGHUP */
-static void __attribute__(( __unused__ )) 
+static void __attribute__(( __unused__ ))
             update_whitelist( whitelist_item_t * old_items, unsigned int old_count,
                               whitelist_item_t * new_items, unsigned int new_count,
                               const char *block_name )
@@ -478,7 +478,7 @@ static int reload_purge_policy( purge_policy_t *policy )
 
     /* XXX global_attr_mask is unchanged, since we keep the same expressions */
 
-    /* free reloaded config structure (no more used) */
+    /* free reloaded config structure (not used anymore) */
     free_whitelist( policy->whitelist_rules, policy->whitelist_count );
     free_blacklist( policy->blacklist_rules, policy->blacklist_count );
 
@@ -492,7 +492,9 @@ static int set_default_update_policy( updt_policy_t *policy, char *msg_out )
 {
     policy->md.policy = UPDT_ALWAYS;
 #ifdef _HAVE_FID
-    policy->path.policy = UPDT_ALWAYS;
+    policy->path.policy = UPDT_ON_EVENT_PERIODIC;
+    policy->path.period_min = 0;
+    policy->path.period_max = 3600;
 #endif
     policy->fileclass.policy = UPDT_ALWAYS;
 
@@ -504,7 +506,7 @@ static int write_default_update_policy( FILE * output )
     print_begin_block( output, 0, UPDTPOLICY_BLOCK, NULL );
     print_line( output, 1, "md_update        : always;" );
 #ifdef _HAVE_FID
-    print_line( output, 1, "path_update      : always;" );
+    print_line( output, 1, "path_update      : on_event_periodic(0,1h);" );
 #endif
     print_line( output, 1, "fileclass_update : always;" );
     print_end_block( output, 0 );
@@ -518,7 +520,7 @@ static int write_update_policy_template( FILE * output )
     print_line( output, 1, "# possible policies for refreshing metadata and path in database:" );
     print_line( output, 1, "#   never: get the information once, then never refresh it" );
     print_line( output, 1, "#   always: always update entry info when processing it" );
-    print_line( output, 1, "#   on_event: only update on related event" ); 
+    print_line( output, 1, "#   on_event: only update on related event" );
     print_line( output, 1, "#   periodic(interval): only update periodically");
     print_line( output, 1, "#   on_event_periodic(min_interval,max_interval)= on_event + periodic" );
     fprintf( output, "\n" );
@@ -526,7 +528,7 @@ static int write_update_policy_template( FILE * output )
     print_line( output, 1, "md_update = always ;" );
 #ifdef _HAVE_FID
     print_line( output, 1, "# Updating file path in database" );
-    print_line( output, 1, "path_update = always ;" );
+    print_line( output, 1, "path_update = on_event_periodic(0,1h) ;" );
 #endif
     print_line( output, 1, "# File classes matching"  );
     print_line( output, 1, "fileclass_update = always ;" );
@@ -641,7 +643,7 @@ static int read_update_policy( config_file_t config,  updt_policy_t *policy, cha
 
     static const char *update_expect[] =
     {
-        "md_update", 
+        "md_update",
 #ifdef _HAVE_FID
         "path_update",
 #endif
@@ -1058,9 +1060,8 @@ static int write_template_filesets( FILE * output )
     print_line( output, 2, "migration_hints = \"cos=3,class={FileClass},priority=2\" ;" );
 #endif
 #ifdef _LUSTRE_HSM
-    fprintf( output, "\n" );
-    print_line( output, 2, "# target archive" );
-    print_line( output, 2, "archive_num = 1 ;" );
+    print_line(output, 2, "# target archive");
+    print_line(output, 2, "archive_id = 1 ;");
 #endif
     print_end_block( output, 1 );
 
@@ -1078,9 +1079,9 @@ static int write_template_filesets( FILE * output )
     print_line( output, 2, "migration_hints = \"cos=4,class={Fileclass},priority=5\";" );
 #endif
 #ifdef _LUSTRE_HSM
-    fprintf( output, "\n" );
-    print_line( output, 2, "# target archive" );
-    print_line( output, 2, "archive_num = 2 ;" );
+    fprintf(output, "\n");
+    print_line(output, 2, "# target archive");
+    print_line(output, 2, "archive_id = 2 ;");
 #endif
     print_end_block( output, 1 );
     fprintf( output, "\n" );
@@ -1143,20 +1144,19 @@ static int write_migration_policy_template( FILE * output )
     print_line( output, 2, "target_fileclass = pool_ssd;" );
     fprintf( output, "\n" );
 
-    print_line( output, 2, "# copy files not modified for 6 hours," );
-    print_line( output, 2, "# or archived more that 5d ago (it the case it is" );
-    print_line( output, 2, "# continuously modified)" );
-
+    print_line( output, 2, "# Copy a file 6hours after its creation if it as never been archived.");
+    print_line( output, 2, "# For next changes, archive it daily.");
+    print_line( output, 2, "# In all cases, do nothing when it has been modified too recently (-30min).");
     print_begin_block( output, 2, CONDITION_BLOCK, NULL );
-    print_line( output, 3, "last_mod > 6h" );
-    print_line( output, 3, "or" );
-    print_line( output, 3, "last_archive > 5d" );
+    print_line( output, 3, "((last_archive == 0 and creation > 6h) " );
+    print_line( output, 3, "  or last_archive > 1d)" );
+    print_line( output, 3, "and last_mod > 30min");
     print_end_block( output, 2 );
 
 #ifdef _LUSTRE_HSM
-    fprintf( output, "\n" );
-    print_line( output, 2, "# target archive (/!\\ policy archive_num overrides fileset archive_num) " );
-    print_line( output, 2, "archive_num = 3 ;" );
+    fprintf(output, "\n");
+    print_line(output, 2, "# target archive (/!\\ policy archive_id overrides fileset archive_id)");
+    print_line(output, 2, "archive_id = 3 ;");
 #endif
 
     print_end_block( output, 1 );
@@ -1192,9 +1192,9 @@ static int write_migration_policy_template( FILE * output )
     print_end_block( output, 2 );
 
 #ifdef _LUSTRE_HSM
-    fprintf( output, "\n" );
-    print_line( output, 2, "# target archive" );
-    print_line( output, 2, "archive_num = 2 ;" );
+    fprintf(output, "\n");
+    print_line(output, 2, "# target archive");
+    print_line(output, 2, "archive_id = 2 ;");
 #endif
 
     print_end_block( output, 1 );
@@ -1382,7 +1382,7 @@ static int hints_mask(  char * hints )
            DisplayLog(LVL_CRIT,CHK_TAG, "ERROR: unmatched '{' in migration hints '%s'", hints);
            return -1;
         }
-        
+
         memset( varname, 0, sizeof(varname) );
         strncpy( varname, begin_var+1, end_var-begin_var-1 );
 
@@ -1392,7 +1392,7 @@ static int hints_mask(  char * hints )
            mask |= ATTR_MASK_name;
         else if (!strcasecmp( varname, "ost_pool" ) )
            mask |= ATTR_MASK_stripe_info;
-        else if (strcasecmp( varname, "policy" ) && 
+        else if (strcasecmp( varname, "policy" ) &&
                  strcasecmp( varname, "fileclass" ) )
         {
             DisplayLog(LVL_CRIT,CHK_TAG, "ERROR: unknown parameter '%s' in hints '%s'", varname, hints);
@@ -1639,29 +1639,30 @@ static int read_filesets( config_file_t config, fileset_list_t * fileset_list,
                         else
 #endif
 #ifdef _LUSTRE_HSM
-                        /* manage archive_num */
-                        if ( strcasecmp( subitem_name, "archive_num" ) == 0 )
+                        /* manage archive_id */
+                        if (!strcasecmp(subitem_name,"archive_id")
+                            || !strcasecmp(subitem_name,"archive_num")) /* for backward compat. */
                         {
                             int tmp;
 
                             if ( extra_args )
                             {
-                                sprintf( msg_out,
-                                         "Unexpected arguments for archive_num parameter, line %d.",
-                                         rh_config_GetItemLine( sub_item ) );
+                                sprintf(msg_out,
+                                        "Unexpected arguments for archive_id parameter, line %d.",
+                                        rh_config_GetItemLine(sub_item));
                                 rc = EINVAL;
                                 goto clean_filesets;
                             }
                             tmp = str2int( value );
                             if ( tmp <= 0 )
                             {
-                                sprintf( msg_out,
-                                         "Positive integer expected for archive_num parameter, line %d.",
-                                         rh_config_GetItemLine( sub_item ) );
+                                sprintf(msg_out,
+                                        "Positive integer expected for archive_id parameter, line %d.",
+                                        rh_config_GetItemLine(sub_item));
                                 rc = EINVAL;
                                 goto clean_filesets;
                             }
-                            fileset_list->fileset_list[i].archive_num = tmp;
+                            fileset_list->fileset_list[i].archive_id = tmp;
                         }
                         else
 #endif
@@ -1706,7 +1707,7 @@ static int read_filesets( config_file_t config, fileset_list_t * fileset_list,
             goto clean_filesets;
         }
 
-        
+
     }                           /* end of "filesets" section */
 
     return 0;
@@ -2015,14 +2016,15 @@ static int parse_policy_block( config_item_t config_item,
                 }
             }
 #ifdef _LUSTRE_HSM
-            else if ( !strcasecmp( subitem_name, "archive_num" ) )
+            else if (!strcasecmp(subitem_name, "archive_id")
+                     || !strcasecmp(subitem_name, "archive_num")) /* for backward compat */
             {
                 int tmp;
 
                 if ( policy_type != MIGR_POLICY )
                 {
-                    sprintf( msg_out, "archive_num defined in a non-migration policy, line %d.",
-                             rh_config_GetItemLine( sub_item ) );
+                    sprintf(msg_out, "archive_id defined in a non-migration policy, line %d.",
+                            rh_config_GetItemLine(sub_item));
                     return EINVAL;
                 }
 
@@ -2037,12 +2039,12 @@ static int parse_policy_block( config_item_t config_item,
                 tmp = str2int( value );
                 if ( tmp <= 0 )
                 {
-                    sprintf( msg_out,
-                             "Positive integer expected for archive_num parameter, line %d.",
-                             rh_config_GetItemLine( sub_item ) );
+                    sprintf(msg_out,
+                            "Positive integer expected for archive_id parameter, line %d.",
+                            rh_config_GetItemLine(sub_item));
                     return EINVAL;
                 }
-                output_policy->archive_num = tmp;
+                output_policy->archive_id = tmp;
             }
 #endif
             else
@@ -2140,7 +2142,7 @@ static int read_policy( config_file_t config, policies_t * policies, char *msg_o
     }
 
     /* initialize output */
-    memset( policy_list, 0, sizeof( policy_list ) );
+    memset( policy_list, 0, sizeof( *policy_list ) );
 
     /* get policy section */
 
@@ -2356,7 +2358,7 @@ static int reload_policies( policies_t * policies )
 
     /* XXX global_attr_mask is unchanged, since we keep the same expressions */
 
-    /* free reloaded config structure (no more used) */
+    /* free reloaded config structure (no used anymore) */
     free_whitelist( policy->whitelist_rules, policy->whitelist_count );
 
 #endif

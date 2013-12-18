@@ -30,6 +30,11 @@
 #include <libgen.h>             /* for dirname */
 #include <stdarg.h>
 #include <fnmatch.h>
+#include <sys/types.h>
+#include <utime.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+
 
 #ifndef HAVE_GETMNTENT_R
 #include "mntent_compat.h"
@@ -75,7 +80,7 @@ void Exit( int error_code )
 }
 
 /* global info about the filesystem to be managed */
-static char    mount_point[RBH_PATH_MAX] = "";
+static char   *mount_point;
 static char    fsname[RBH_PATH_MAX] = "";
 static dev_t   dev_id = 0;
 static uint64_t fs_key = 0;
@@ -83,6 +88,10 @@ static uint64_t fs_key = 0;
 /* to optimize string concatenation */
 static unsigned int mount_len = 0;
 
+#ifdef _HAVE_FID
+#define FIDDIR      "/.lustre/fid/"
+static char *fid_dir;
+#endif
 
 /* used at initialization time, to avoid several modules
  * that start in parallel to check it several times.
@@ -132,22 +141,31 @@ static uint64_t fsidto64(fsid_t fsid)
  */
 static void _set_mount_point( char *mntpnt )
 {
+    char path[RBH_PATH_MAX + 100];
+
     /* cannot change during a run */
     if (mount_len == 0)
     {
-        strcpy( mount_point, mntpnt );
-        mount_len = strlen( mntpnt );
+        strcpy(path, mntpnt );
 
         /* remove final slash, if any */
-        if ( (mount_len > 1) && (mount_point[mount_len-1] == '/') )
+        if ( (mount_len > 1) && (path[mount_len-1] == '/') )
         {
-            mount_point[mount_len-1] = '\0';
-            mount_len --;
+            path[mount_len-1] = '\0';
         }
+
+        mount_point = strdup( path );
+        mount_len = strlen( mount_point );
+
+#ifdef _HAVE_FID
+        /* Now, the .fid directory */
+        strcat(path, FIDDIR);
+        fid_dir = strdup(path);
+#endif
     }
 }
 
-void set_fs_info( char *name, char * mountp, dev_t dev, fsid_t fsid)
+static void set_fs_info( char *name, char * mountp, dev_t dev, fsid_t fsid)
 {
     P( mount_point_lock );
     _set_mount_point(mountp);
@@ -184,19 +202,27 @@ const char          *get_mount_point( unsigned int * plen )
     return mount_point;
 }
 
+#if _HAVE_FID
+/* Retrieve the .fid directory */
+const char          *get_fid_dir( void )
+{
+    return fid_dir;
+}
+#endif
+
 /* retrieve fsname from any module */
-const char          *get_fsname(  )
+const char          *get_fsname( void )
 {
     return fsname;
 }
 
 /* return Filesystem device id  */
-dev_t          get_fsdev()
+dev_t          get_fsdev( void )
 {
     return dev_id;
 }
 
-uint64_t       get_fskey()
+uint64_t       get_fskey( void )
 {
     return fs_key;
 }
@@ -230,34 +256,34 @@ int SendMail( const char *recipient, const char *subject, const char *message )
  * If cfg_in is empty: search any config in config paths
  * /!\ not thread safe
  */
-int SearchConfig( const char * cfg_in, char * cfg_out, int * changed )
+int SearchConfig( const char * cfg_in, char * cfg_out, int * changed, char * unmatched )
 {
-    static const char * default_cfg_paths[] =
-    {
-       "/etc/robinhood.d/"PURPOSE_EXT,
-       "/etc/robinhood.d",
-       "/etc/robinhood",
-       ".",
-       NULL
-    };
-    const char * current_path;
-    int i;
+    static const char * default_cfg_path = SYSCONFDIR"/robinhood.d/"PURPOSE_EXT;
     DIR * dir;
     struct dirent * ent;
-    struct stat stbuf;
+
     *changed = 1; /* most of the cases */
 
     if (cfg_in == NULL || EMPTY_STRING(cfg_in))
     {
-       for ( i = 0, current_path = default_cfg_paths[0];
-             current_path != NULL;
-             i++, current_path = default_cfg_paths[i] )
-       {
-            /* look for files in current path */
-            dir = opendir( current_path );
-            if ( !dir )
-                continue;
+        /* check if a default config file is specified */
+        cfg_in = getenv(DEFAULT_CFG_VAR);
+    }
 
+    /* set unmatched, for better logging */
+    if (unmatched) {
+        if (cfg_in)
+            strcpy(unmatched, cfg_in);
+        else
+            sprintf(unmatched, "%s/*.conf", default_cfg_path);
+    }
+
+    if (cfg_in == NULL || EMPTY_STRING(cfg_in)) {
+        int found = 0;
+
+        /* look for files in default config path */
+        dir = opendir( default_cfg_path );
+        if ( dir ) {
             while ( (ent = readdir(dir)) != NULL )
             {
                 /* ignore .xxx files */
@@ -267,23 +293,30 @@ int SearchConfig( const char * cfg_in, char * cfg_out, int * changed )
                     /* not a config file */
                     continue;
 
-                sprintf( cfg_out, "%s/%s", current_path, ent->d_name );
-                if ( (stat( cfg_out, &stbuf ) == 0)
-                     && S_ISREG(stbuf.st_mode) )
-                {
-                    /* file found: OK */
-                    closedir(dir);
-                    return 0;
+                sprintf( cfg_out, "%s/%s", default_cfg_path, ent->d_name );
+                if ( access(cfg_out, F_OK) == 0 ) {
+                    /* that file matches. */
+                    found ++;
+                    if (found >= 2)
+                        /* No need to continue. */
+                        break;
                 }
             }
 
             closedir(dir);
        }
+
+       if (found == 1) {
+           /* Only one file found. cfg_out is already set. We're
+            * good. */
+           return 0;
+       }
     }
     else if (access(cfg_in, F_OK) == 0)
     {
         /* the specified config file exists */
-        strcpy(cfg_out, cfg_in);
+        if (cfg_out != cfg_in)
+            strcpy(cfg_out, cfg_in);
         *changed=0;
         return 0;
     }
@@ -292,7 +325,7 @@ int SearchConfig( const char * cfg_in, char * cfg_out, int * changed )
         /* the argument is a path (not a single name
          * and this path was not found) */
         *changed=0;
-        return -ENOENT;
+        goto notfound;
     }
     else /* look for a file in the given paths */
     {
@@ -301,29 +334,25 @@ int SearchConfig( const char * cfg_in, char * cfg_out, int * changed )
 
         strcpy(cfg_cp, cfg_in);
 
-        for ( i = 0, current_path = default_cfg_paths[0];
-             current_path != NULL;
-             i++, current_path = default_cfg_paths[i] )
+        /* if the file already has an extension, try path/name */
+        if (has_ext)
         {
-            /* if the file already has an extension, try path/name */
-            if (has_ext)
-            {
-                sprintf(cfg_out, "%s/%s", current_path, cfg_cp);
-                if (access(cfg_out, F_OK) == 0)
-                    return 0;
-            }
-
-            /* try path/name.cfg, path/name.conf */
-            sprintf(cfg_out, "%s/%s.conf", current_path, cfg_cp);
-            if (access(cfg_out, F_OK) == 0)
-                return 0;
-
-            sprintf(cfg_out, "%s/%s.cfg", current_path, cfg_cp);
+            sprintf(cfg_out, "%s/%s", default_cfg_path, cfg_cp);
             if (access(cfg_out, F_OK) == 0)
                 return 0;
         }
+
+        /* try path/name.cfg, path/name.conf */
+        sprintf(cfg_out, "%s/%s.conf", default_cfg_path, cfg_cp);
+        if (access(cfg_out, F_OK) == 0)
+            return 0;
+
+        sprintf(cfg_out, "%s/%s.cfg", default_cfg_path, cfg_cp);
+        if (access(cfg_out, F_OK) == 0)
+            return 0;
     }
 
+notfound:
     /* no file found, cleaning cfg_out */
     cfg_out[0] = '\0';
     return -ENOENT;
@@ -373,6 +402,26 @@ char          *gid2str( gid_t gid, char *groupname )
     return groupname;
 }
 
+const char * mode2type(mode_t mode)
+{
+    if ( S_ISREG( mode ) )
+        return STR_TYPE_FILE;
+    else if ( S_ISDIR( mode ) )
+        return STR_TYPE_DIR;
+    else if ( S_ISLNK( mode ) )
+        return STR_TYPE_LINK;
+    else if ( S_ISCHR( mode ) )
+        return STR_TYPE_CHR;
+    else if ( S_ISBLK( mode ) )
+        return STR_TYPE_BLK;
+    else if ( S_ISFIFO( mode ) )
+        return STR_TYPE_FIFO;
+    else if ( S_ISSOCK( mode ) )
+        return STR_TYPE_SOCK;
+    else
+        return NULL;
+}
+
 void PosixStat2EntryAttr( struct stat *p_inode, attr_set_t * p_attr_set, int size_info )
 {
     ATTR_MASK_SET( p_attr_set, owner );
@@ -400,12 +449,7 @@ void PosixStat2EntryAttr( struct stat *p_inode, attr_set_t * p_attr_set, int siz
         MAX3( p_inode->st_atime, p_inode->st_mtime, p_inode->st_ctime );
 
     ATTR_MASK_SET( p_attr_set, last_mod );
-    /* @TODO is this really what we want? */
-#if defined(_SHERPA) || defined(_HSM_LITE)
     ATTR( p_attr_set, last_mod ) = p_inode->st_mtime;
-#else
-    ATTR( p_attr_set, last_mod ) = MAX2( p_inode->st_mtime, p_inode->st_ctime );
-#endif
 
 #ifdef ATTR_INDEX_creation_time
     if (ATTR_MASK_TEST(p_attr_set, creation_time))
@@ -422,46 +466,21 @@ void PosixStat2EntryAttr( struct stat *p_inode, attr_set_t * p_attr_set, int siz
 #endif
 
 #ifdef ATTR_INDEX_type
-    if ( S_ISREG( p_inode->st_mode ) )
+    const char * type = mode2type(p_inode->st_mode);
+    if (type != NULL)
     {
         ATTR_MASK_SET( p_attr_set, type );
-        strcpy( ATTR( p_attr_set, type ), STR_TYPE_FILE );
-    }
-    else if ( S_ISDIR( p_inode->st_mode ) )
-    {
-        ATTR_MASK_SET( p_attr_set, type );
-        strcpy( ATTR( p_attr_set, type ), STR_TYPE_DIR );
-    }
-    else if ( S_ISCHR( p_inode->st_mode ) )
-    {
-        ATTR_MASK_SET( p_attr_set, type );
-        strcpy( ATTR( p_attr_set, type ), STR_TYPE_CHR );
-    }
-    else if ( S_ISBLK( p_inode->st_mode ) )
-    {
-        ATTR_MASK_SET( p_attr_set, type );
-        strcpy( ATTR( p_attr_set, type ), STR_TYPE_BLK );
-    }
-    else if ( S_ISFIFO( p_inode->st_mode ) )
-    {
-        ATTR_MASK_SET( p_attr_set, type );
-        strcpy( ATTR( p_attr_set, type ), STR_TYPE_FIFO );
-    }
-    else if ( S_ISLNK( p_inode->st_mode ) )
-    {
-        ATTR_MASK_SET( p_attr_set, type );
-        strcpy( ATTR( p_attr_set, type ), STR_TYPE_LINK );
-    }
-    else if ( S_ISSOCK( p_inode->st_mode ) )
-    {
-        ATTR_MASK_SET( p_attr_set, type );
-        strcpy( ATTR( p_attr_set, type ), STR_TYPE_SOCK );
+        strcpy(ATTR( p_attr_set, type ), type);
     }
 #endif
 
 #ifdef ATTR_INDEX_nlink
     ATTR_MASK_SET( p_attr_set, nlink );
     ATTR( p_attr_set, nlink ) = p_inode->st_nlink;
+#endif
+#ifdef ATTR_INDEX_mode
+    ATTR_MASK_SET( p_attr_set, mode );
+    ATTR( p_attr_set, mode ) = p_inode->st_mode & 07777 ; /*  mode + sticky bits */
 #endif
 }
 
@@ -763,7 +782,7 @@ int CheckFSInfo( char *path, char *expected_type,
  * - global_config must be set
  * - initialize mount_point, fsname and dev_id
  */
-int InitFS()
+int InitFS( void )
 {
     int rc;
 
@@ -796,7 +815,7 @@ int InitFS()
  * return 0 if fskey is unchanged and update mount_point, fsname and dev_id
  * else, return -1
  */
-int ResetFS()
+int ResetFS( void )
 {
     char   name[RBH_PATH_MAX];
     dev_t  dev;
@@ -886,7 +905,7 @@ int ResetFS()
 /**
  *  Check that FS path is the same as the last time.
  */
-int CheckLastFS(  )
+int CheckLastFS( void )
 {
     int            rc;
     lmgr_t         lmgr;
@@ -1040,62 +1059,12 @@ char          *FormatDurationFloat( char *buff, size_t str_sz, time_t duration )
 
 }
 
-char          *FormatStripeList( char *buff, size_t sz, const stripe_items_t * p_stripe_items )
-{
-    unsigned int   i;
-    size_t         written = 0;
-
-    if ( !p_stripe_items || ( p_stripe_items->count == 0 ) )
-    {
-        strncpy( buff, "(none)", sz );
-        return buff;
-    }
-
-    buff[0] = '\0';
-
-    for ( i = 0; i < p_stripe_items->count; i++ )
-    {
-        if ( i != p_stripe_items->count - 1 )
-            written +=
-                snprintf( ( char * ) ( buff + written ), sz - written, "OST #%u, ",
-                          p_stripe_items->stripe_units[i] );
-        else
-            written +=
-                snprintf( ( char * ) ( buff + written ), sz - written, "OST #%u",
-                          p_stripe_items->stripe_units[i] );
-    }
-
-    return buff;
-}
-
-/**
- * Convert a string to an integer
- * @return -1 on error.
- */
-int str2int( char *str )
-{
-    char           suffix[256];
-    int            nb_read, value;
-
-    if ( str == NULL )
-        return -1;
-
-    nb_read = sscanf( str, "%d%s", &value, suffix );
-
-    if ( nb_read <= 0 )
-        return -1;              /* invalid format */
-
-    if ( ( nb_read == 1 ) || ( suffix[0] == '\0' ) )
-        return value;           /* no suffix => 0K */
-    else
-        return -1;
-}
 
 /**
  * Convert a string to a long integer
  * @return -1 on error.
  */
-long long str2bigint( char *str )
+long long str2bigint( const char *str )
 {
     char           suffix[256];
     int            nb_read;
@@ -1117,10 +1086,10 @@ long long str2bigint( char *str )
 
 
 /**
- * Convert a string to a boolean 
- * @return -1 on error. 
+ * Convert a string to a boolean
+ * @return -1 on error.
  */
-int str2bool( char *str )
+int str2bool( const char *str )
 {
     if ( str == NULL )
         return -1;
@@ -1138,8 +1107,8 @@ int str2bool( char *str )
 
 
 /**
- * Convert a string to a duration in seconds 
- * @return -1 on error. 
+ * Convert a string to a duration in seconds
+ * @return -1 on error.
  */
 int str2duration( const char *str )
 {
@@ -1176,9 +1145,9 @@ int str2duration( const char *str )
 
 /**
  * Convert a string to a size (in bytes)
- * @return -1 on error. 
+ * @return -1 on error.
  */
-uint64_t str2size( char *str )
+uint64_t str2size( const char *str )
 {
     int                   nb_read;
     unsigned long long    size;
@@ -1237,7 +1206,7 @@ static inline int extract_digits( const char * src, char * dest, unsigned int co
 }
 
 /** parse date/time yyyymmdd[HH[MM[SS]]] */
-time_t str2date( char *str )
+time_t str2date( const char *str )
 {
     struct tm datetime = {
         .tm_sec = 0,
@@ -1252,8 +1221,8 @@ time_t str2date( char *str )
     };
     char tmpstr[16];
     int  tmpint;
-    char * curr = str;
-    
+    const char * curr = str;
+
     /* extract year */
     if (extract_digits(curr, tmpstr, 4) < 4)
         return (time_t)-1;
@@ -1269,7 +1238,7 @@ time_t str2date( char *str )
     if ((tmpint = str2int(tmpstr)) <= 0)
         return (time_t)-1;
     else if (tmpint > 12)
-        return (time_t)-1; 
+        return (time_t)-1;
     datetime.tm_mon = tmpint - 1; /* January => 0 */
 
     /* extract day */
@@ -1279,7 +1248,7 @@ time_t str2date( char *str )
     if ((tmpint = str2int(tmpstr)) <= 0)
         return (time_t)-1;
     else if (tmpint > 31)
-        return (time_t)-1; 
+        return (time_t)-1;
     datetime.tm_mday = tmpint; /* 1st => 1 */
 
     /* extract hours */
@@ -1292,7 +1261,7 @@ time_t str2date( char *str )
     if ((tmpint = str2int(tmpstr)) == -1)
         return (time_t)-1;
     else if (tmpint > 23)
-        return (time_t)-1; 
+        return (time_t)-1;
     datetime.tm_hour = tmpint;
 
     /* extract minutes */
@@ -1305,7 +1274,7 @@ time_t str2date( char *str )
     if ((tmpint = str2int(tmpstr)) == -1)
         return (time_t)-1;
     else if (tmpint > 59)
-        return (time_t)-1; 
+        return (time_t)-1;
     datetime.tm_min = tmpint;
 
     /* extract seconds */
@@ -1318,7 +1287,7 @@ time_t str2date( char *str )
     if ((tmpint = str2int(tmpstr)) == -1)
         return (time_t)-1;
     else if (tmpint > 59)
-        return (time_t)-1; 
+        return (time_t)-1;
     datetime.tm_sec = tmpint;
 
     if (*curr != '\0')
@@ -1328,77 +1297,581 @@ convert:
      return mktime(&datetime);
 }
 
+#define TYPEINDEX(mode) (((mode) >> 12) & 0x0f)
+#define TYPECHAR(mode)  ("0pcCd?bB-?l?s???" [TYPEINDEX(mode)])
+
+/* The special bits. If set, display SMODE0/1 instead of MODE0/1 */
+static const mode_t SBIT[] = {
+    0, 0, S_ISUID,
+    0, 0, S_ISGID,
+    0, 0, S_ISVTX
+};
+
+/* The 9 mode bits to test */
+static const mode_t MBIT[] = {
+    S_IRUSR, S_IWUSR, S_IXUSR,
+    S_IRGRP, S_IWGRP, S_IXGRP,
+    S_IROTH, S_IWOTH, S_IXOTH
+};
+
+static const char MODE1[]  = "rwxrwxrwx";
+static const char MODE0[]  = "---------";
+static const char SMODE1[] = "..s..s..t";
+static const char SMODE0[] = "..S..S..T";
+
+/*
+ * Return the standard ls-like mode string from a file mode.
+ * This is static and so is overwritten on each call.
+ */
+const char *mode_string(mode_t mode, char *buf)
+{
+    int i;
+
+    for (i = 0; i < 9; i++) {
+        if (mode & SBIT[i])
+            buf[i] = (mode & MBIT[i]) ? SMODE1[i] : SMODE0[i];
+        else
+            buf[i] = (mode & MBIT[i]) ? MODE1[i] : MODE0[i];
+    }
+    return buf;
+}
+
 
 /**
  *  Print attributes to a string
  */
-int PrintAttrs( char *out_str, size_t strsize, const attr_set_t * p_attr_set, int overide_mask )
+int PrintAttrs( char *out_str, size_t strsize, const attr_set_t * p_attr_set, int overide_mask, int brief )
 {
     int            mask = p_attr_set->attr_mask;
     size_t         written = 0;
-    char           tmpbuf[256];
+    char           tmpbuf[24576];
+    const char *   format;
 
     if ( overide_mask )
         mask = mask & overide_mask;
 
     if ( mask & ATTR_MASK_fullpath )
+    {
+        if (brief)
+            format = "path='%s',";
+        else
+            format = "Path:     \"%s\"\n";
         written +=
-            snprintf( out_str + written, strsize - written, "Fullpath: \"%s\"\n",
+            snprintf( out_str + written, strsize - written, format,
                       ATTR( p_attr_set, fullpath ) );
-    if ( mask & ATTR_MASK_name )
+    }
+    /* this information is redundant with fullpath,
+     * so only display it if path is not known */
+    else if ( mask & ATTR_MASK_name )
+    {
+        if (brief)
+            format = "name='%s',";
+        else
+            format = "Name:     \"%s\"\n";
         written +=
-            snprintf( out_str + written, strsize - written, "Name:     \"%s\"\n",
+            snprintf( out_str + written, strsize - written, format,
                       ATTR( p_attr_set, name ) );
+    }
+    if ( mask & ATTR_MASK_parent_id )
+    {
+        if (brief)
+            format = "parent="DFID",";
+        else
+            format = "Parent:   "DFID"\n";
+        written +=
+            snprintf( out_str + written, strsize - written, format,
+                      PFID(&ATTR(p_attr_set, parent_id)) );
+    }
 #ifdef ATTR_INDEX_type
     if ( mask & ATTR_MASK_type )
+    {
+        if (brief)
+            format = "type=%s,";
+        else
+            format = "Type:     %s\n";
         written +=
-            snprintf( out_str + written, strsize - written, "Type:     %s\n",
+            snprintf( out_str + written, strsize - written, format,
                       ATTR( p_attr_set, type ) );
+    }
 #endif
+    if (mask & ATTR_MASK_nlink)
+    {
+        if (brief)
+            format = "nlink=%u,";
+        else
+            format = "Nlinks:   %u\n";
+        written +=
+            snprintf(out_str + written, strsize - written, format,
+                      ATTR(p_attr_set, nlink));
+    }
+
+#ifdef ATTR_INDEX_mode
+    if ( mask & ATTR_MASK_mode )
+    {
+        if (brief)
+            format = "mode=%#o,";
+        else
+            format = "Mode:     %#o\n";
+        written +=
+            snprintf( out_str + written, strsize - written, format,
+                      ATTR( p_attr_set, mode ) );
+    }
+#endif
+
     if ( mask & ATTR_MASK_owner )
+    {
+        if (brief)
+            format = "owner=%s,";
+        else
+            format = "Owner:    \"%s\"\n";
         written +=
-            snprintf( out_str + written, strsize - written, "Owner:    \"%s\"\n",
+            snprintf( out_str + written, strsize - written, format,
                       ATTR( p_attr_set, owner ) );
+    }
     if ( mask & ATTR_MASK_gr_name )
+    {
+        if (brief)
+            format = "group=%s,";
+        else
+            format = "Group:    \"%s\"\n";
         written +=
-            snprintf( out_str + written, strsize - written, "Group:    \"%s\"\n",
+            snprintf( out_str + written, strsize - written, format,
                       ATTR( p_attr_set, gr_name ) );
+    }
     if ( mask & ATTR_MASK_size )
     {
-        FormatFileSize( tmpbuf, 256, ATTR( p_attr_set, size ) );
-        written += snprintf( out_str + written, strsize - written, "Size:     %s\n", tmpbuf );
+        if (brief)
+        {
+            written += snprintf( out_str + written, strsize - written, "size=%"PRIu64",",
+                        ATTR( p_attr_set, size ));
+        }
+        else
+        {
+            FormatFileSize( tmpbuf, sizeof(tmpbuf), ATTR( p_attr_set, size ) );
+            written += snprintf( out_str + written, strsize - written, "Size:     %s\n", tmpbuf );
+        }
+    }
+    if ( mask & ATTR_MASK_blocks )
+    {
+        if (brief)
+            format = "blocks=%Lu,";
+        else
+            format = "Blocks:   %Lu\n";
+        written +=
+            snprintf( out_str + written, strsize - written, format,
+                      ATTR( p_attr_set, blocks ) );
     }
     if ( mask & ATTR_MASK_depth )
+    {
+        if (brief)
+            format = "depth=%u,";
+        else
+            format = "Depth:    %u\n";
         written +=
-            snprintf( out_str + written, strsize - written, "Depth:    %d\n",
+            snprintf( out_str + written, strsize - written, format,
                       ATTR( p_attr_set, depth ) );
+    }
 #ifdef ATTR_INDEX_dircount
     if ( mask & ATTR_MASK_dircount )
+    {
+        if (brief)
+            format = "dircount=%u,";
+        else
+            format = "DirCount: %u\n";
         written +=
-            snprintf( out_str + written, strsize - written, "DirCount: %d\n",
+            snprintf( out_str + written, strsize - written, format,
                       ATTR( p_attr_set, dircount ) );
+    }
 #endif
     if ( mask & ATTR_MASK_last_access )
     {
-        FormatDurationFloat( tmpbuf, 256, time( NULL ) - ATTR( p_attr_set, last_access ) );
-        written +=
-            snprintf( out_str + written, strsize - written, "Last Access: %s ago\n", tmpbuf );
+        if (brief)
+        {
+            written +=
+                snprintf( out_str + written, strsize - written, "access=%u,", ATTR( p_attr_set, last_access ));
+        }
+        else
+        {
+            FormatDurationFloat( tmpbuf, 256, time( NULL ) - ATTR( p_attr_set, last_access ) );
+            written +=
+                snprintf( out_str + written, strsize - written, "Last Access: %s ago\n", tmpbuf );
+        }
     }
+    if ( mask & ATTR_MASK_last_mod )
+    {
+        if (brief)
+        {
+            written += snprintf( out_str + written, strsize - written, "modif=%u,",
+                    ATTR( p_attr_set, last_mod ));
+        }
+        else
+        {
+            FormatDurationFloat( tmpbuf, 256, time( NULL ) - ATTR( p_attr_set, last_mod ) );
+            written += snprintf( out_str + written, strsize - written, "Last Mod: %s ago\n", tmpbuf );
+        }
+    }
+#ifdef ATTR_INDEX_creation_time
+    if ( mask & ATTR_MASK_creation_time )
+    {
+        if (brief)
+        {
+            written += snprintf( out_str + written, strsize - written, "creation=%lu,",
+                                 (unsigned long)ATTR( p_attr_set, creation_time ));
+        }
+        else
+        {
+            FormatDurationFloat( tmpbuf, 256, time( NULL ) - ATTR( p_attr_set, creation_time ) );
+            written += snprintf( out_str + written, strsize - written, "Creation: %s ago\n", tmpbuf );
+        }
+    }
+#endif
+
 #ifdef ATTR_INDEX_last_copy
     if ( mask & ATTR_MASK_last_copy )
     {
-        FormatDurationFloat( tmpbuf, 256, time( NULL ) - ATTR( p_attr_set, last_copy ) );
-        written += snprintf( out_str + written, strsize - written, "Last Copy: %s ago\n", tmpbuf );
+        if (brief)
+        {
+            written += snprintf( out_str + written, strsize - written, "copy=%u,",
+                    ATTR( p_attr_set, last_copy ));
+        }
+        else
+        {
+            FormatDurationFloat( tmpbuf, 256, time( NULL ) - ATTR( p_attr_set, last_copy ) );
+            written += snprintf( out_str + written, strsize - written, "Last Copy: %s ago\n", tmpbuf );
+        }
     }
 #endif
-    if ( mask & ATTR_MASK_last_mod )
+
+#ifdef _LUSTRE
+    if ( mask & ATTR_MASK_stripe_items)
     {
-        FormatDurationFloat( tmpbuf, 256, time( NULL ) - ATTR( p_attr_set, last_mod ) );
-        written += snprintf( out_str + written, strsize - written, "Last Mod: %s ago\n", tmpbuf );
+        if (brief)
+            format = "stripes={%s},";
+        else
+            format = "Stripes: %s\n";
+        written +=
+            snprintf( out_str + written, strsize - written, format,
+                      FormatStripeList( tmpbuf, sizeof(tmpbuf), &ATTR( p_attr_set, stripe_items), brief));
+    }
+
+    if (mask & ATTR_MASK_stripe_info)
+    {
+        if (brief){
+            if (!EMPTY_STRING(ATTR( p_attr_set, stripe_info).pool_name)) {
+                format = "stripe_count=%u,stripe_size=%"PRIu64",ost_pool=%s,";
+                written +=
+                    snprintf( out_str + written, strsize - written, format,
+                              ATTR( p_attr_set, stripe_info).stripe_count,
+                              ATTR( p_attr_set, stripe_info).stripe_size,
+                              ATTR( p_attr_set, stripe_info).pool_name );
+            }
+            else
+            {
+                format = "stripe_count=%u,stripe_size=%"PRIu64",";
+                written +=
+                    snprintf( out_str + written, strsize - written, format,
+                              ATTR( p_attr_set, stripe_info).stripe_count,
+                              ATTR( p_attr_set, stripe_info).stripe_size );
+            }
+        }
+        else
+        {
+            FormatFileSize( tmpbuf, 256, ATTR( p_attr_set, stripe_info).stripe_size);
+            if (!EMPTY_STRING(ATTR( p_attr_set, stripe_info).pool_name)) {
+                format = "Stripe count: %u\n"
+                         "Stripe size:  %s\n"
+                         "OST pool:     %s\n";
+                written +=
+                    snprintf( out_str + written, strsize - written, format,
+                              ATTR( p_attr_set, stripe_info).stripe_count, tmpbuf,
+                              ATTR( p_attr_set, stripe_info).pool_name );
+            }
+            else
+            {
+                format = "Stripe count: %u\n"
+                         "Stripe size:  %s\n";
+                written +=
+                    snprintf( out_str + written, strsize - written, format,
+                              ATTR( p_attr_set, stripe_info).stripe_count,
+                              tmpbuf);
+            }
+        }
+    }
+#endif
+
+#ifdef ATTR_INDEX_status
+    if ( mask & ATTR_MASK_status )
+    {
+        if (brief)
+        {
+            written +=
+                snprintf(out_str + written, strsize - written, "status=%s,",
+                         db_status2str(ATTR(p_attr_set, status), 1));
+        }
+        else
+        {
+            written +=
+                snprintf( out_str + written, strsize - written, "Status:  %s\n",
+                         db_status2str(ATTR(p_attr_set, status), 0));
+        }
+    }
+#endif
+
+#ifdef ATTR_INDEX_backendpath
+    if ( mask & ATTR_MASK_backendpath )
+    {
+        if (brief)
+        {
+            written +=
+                snprintf(out_str + written, strsize - written, "backendpath='%s',",
+                         ATTR(p_attr_set, backendpath));
+        }
+        else
+        {
+            written +=
+                snprintf( out_str + written, strsize - written, "Backend path: \"%s\"\n",
+                         ATTR(p_attr_set, backendpath));
+        }
+    }
+#endif
+
+    if ( mask & ATTR_MASK_link )
+    {
+        if (brief)
+        {
+            written +=
+                snprintf(out_str + written, strsize - written, "lnk='%s',",
+                         ATTR(p_attr_set, link));
+        }
+        else
+        {
+            written +=
+                snprintf( out_str + written, strsize - written, "link: \"%s\"\n",
+                         ATTR(p_attr_set, link));
+        }
+    }
+
+
+    if (brief && written) {
+        /* remove final , */
+        out_str[written-1] = '\0';
+        written --;
     }
 
     return written;
 }
+
+/* helpers for attr change */
+#define APPLYTAG "ChgAttr"
+#define LOG_ATTR_CHANGE(_nfunc, _arg_fmt, _dr, _rc, ...) do { \
+            if (_rc)                                          \
+                DisplayLog(LVL_CRIT, APPLYTAG, "%s("_arg_fmt") failed: %s", _nfunc, __VA_ARGS__, strerror(_rc)); \
+            else                                              \
+                DisplayReport("%s%s("_arg_fmt")", _dr?"(dry-run) ":"", _nfunc, __VA_ARGS__ ); \
+        } while(0)
+
+/**
+ *  Apply attribute changes
+ *  \param change_mask mask of attributes to be changed
+ */
+int            ApplyAttrs(const entry_id_t *p_id, const attr_set_t * p_attr_new,
+                          const attr_set_t * p_attr_old,
+                          int change_mask, int dry_run)
+{
+    int  mask = p_attr_new->attr_mask & change_mask;
+    int rc, err = 0;
+    const char *chattr_path = NULL;
+#ifdef _HAVE_FID
+    char fid_path[RBH_PATH_MAX];
+#endif
+
+    if (!mask)
+        return 0;
+
+    if (!ATTR_MASK_TEST(p_attr_new, fullpath))
+    {
+#ifdef _HAVE_FID
+        /* build fid path */
+        BuildFidPath( p_id, fid_path );
+        chattr_path = fid_path;
+#else
+        DisplayLog(LVL_CRIT, APPLYTAG, "No path: cannot apply changes to entry");
+        return -EINVAL;
+#endif
+    }
+    else
+        chattr_path = ATTR(p_attr_new, fullpath);
+
+    if ( mask & ATTR_MASK_fullpath )
+    {
+        if (!ATTR_MASK_TEST(p_attr_old, fullpath))
+        {
+            DisplayLog(LVL_CRIT, APPLYTAG, "Cannot rename: source path is unknown");
+            err++;
+        }
+        else
+        {
+            if (!dry_run && rename(ATTR(p_attr_old,fullpath), ATTR(p_attr_new, fullpath)))
+               rc = errno;
+            else
+               rc = 0;
+
+            LOG_ATTR_CHANGE("rename", "%s, %s", dry_run, rc,
+                            ATTR(p_attr_old,fullpath), ATTR(p_attr_new, fullpath));
+        }
+    }
+    else if ( mask & ATTR_MASK_parent_id )
+    {
+        /* can't change parent without changing path!!! */
+    }
+    else if ( mask & ATTR_MASK_name )
+    {
+        /* just change name */
+    }
+
+#ifdef ATTR_INDEX_type
+    if ( mask & ATTR_MASK_type )
+    {
+        /* can't change entry type without creating/removing it */
+    }
+#endif
+    if ( mask & (ATTR_MASK_owner | ATTR_MASK_gr_name))
+    {
+        uid_t u = -1;
+        gid_t g = -1;
+
+        if (mask & ATTR_MASK_owner)
+        {
+            struct passwd p;
+            char buf[4096];
+            struct passwd *res = NULL;
+
+            rc = getpwnam_r(ATTR(p_attr_new, owner), &p, buf, 4096,
+                           &res);
+            if (rc == 0 && res != NULL)
+                u = res->pw_uid;
+        }
+
+        if (mask & ATTR_MASK_gr_name)
+        {
+            struct group gs;
+            char buf[4096];
+            struct group *res = NULL;
+
+            rc = getgrnam_r(ATTR(p_attr_new, gr_name), &gs, buf, 4096,
+                            &res);
+            if (rc == 0 && res != NULL)
+                g = res->gr_gid;
+        }
+
+        if (u != -1 || g != -1)
+        {
+
+            if (!dry_run && lchown(chattr_path, u, g))
+               rc = errno;
+            else
+               rc = 0;
+
+            LOG_ATTR_CHANGE("lchown", "%s, u=%d, g=%d", dry_run, rc,
+                            chattr_path, u, g);
+        }
+    }
+
+#ifdef ATTR_INDEX_mode
+    /* always set mode after chown, as it can be changed by chown */
+    if ( mask & ATTR_MASK_mode )
+    {
+
+        if (!dry_run && chmod(chattr_path,  ATTR(p_attr_new, mode)))
+           rc = errno;
+        else
+           rc = 0;
+
+        LOG_ATTR_CHANGE("chmod", "%s, %#o", dry_run, rc,
+                        chattr_path,  ATTR(p_attr_new, mode));
+    }
+#endif
+
+
+#ifdef _LUSTRE
+    if ( mask & ATTR_MASK_stripe_items)
+    {
+    }
+
+    if (mask & ATTR_MASK_stripe_info)
+    {
+    }
+#endif
+
+#ifdef ATTR_INDEX_status
+    if ( mask & ATTR_MASK_status )
+    {
+    }
+#endif
+
+
+    if ( mask & ATTR_MASK_size )
+    {
+        /* if new size is zero: truncate.
+         * else, we have no idea of what's in the file...
+         */
+    }
+    if (mask & (ATTR_MASK_last_access | ATTR_MASK_last_mod))
+    {
+        struct utimbuf t = {
+            .actime = -1,
+            .modtime = -1
+        };
+        int get_stat = 0;
+
+        if (mask & ATTR_MASK_last_access)
+            t.actime = ATTR(p_attr_new, last_access);
+        if (mask & ATTR_MASK_last_mod)
+            t.modtime = ATTR(p_attr_new, last_mod);
+
+        /* if there is still a value == -1, we must fill it
+         * or utime will set a bad value
+         */
+        if (t.actime == -1)
+        {
+            if (ATTR_MASK_TEST(p_attr_old, last_access))
+                t.actime = ATTR(p_attr_old, last_access);
+            else
+                /* need to get old value of atime */
+                get_stat = 1;
+        }
+        if (t.modtime == -1)
+        {
+            if (ATTR_MASK_TEST(p_attr_old, last_mod))
+                t.modtime = ATTR(p_attr_old, last_mod);
+            else
+                /* need to get old value of atime */
+                get_stat = 1;
+        }
+        if (get_stat)
+        {
+            struct stat st;
+            if (lstat(chattr_path, &st) == 0)
+            {
+                if (t.modtime == -1)
+                    t.modtime = st.st_mtime;
+                if (t.actime == -1)
+                    t.actime = st.st_atime;
+            }
+        }
+
+        if (!dry_run && utime(chattr_path, &t))
+           rc = errno;
+        else
+           rc = 0;
+
+        LOG_ATTR_CHANGE("utime", "%s, a=%ld, m=%ld", dry_run, rc,
+                        chattr_path, t.actime, t.modtime);
+    }
+
+    return err;
+}
+
 
 
 /** Compute greatest common divisor (GCD) of 2 numbers */
@@ -1432,7 +1905,7 @@ void rh_sleep( unsigned int seconds )
        remain = sleep( remain );
        if ( remain <= 0 )
        {
-           spent = time(NULL)-start; 
+           spent = time(NULL)-start;
            if ( spent < seconds )
                remain = seconds - spent;
        }
@@ -1600,14 +2073,14 @@ int execute_shell_command( const char * cmd, int argc, ... )
         else
             str_error = "external command exited";
 
-        DisplayLog( LVL_MAJOR, SHCMD,
+        DisplayLog( LVL_CRIT, SHCMD,
                     "ERROR: %s, error %d (cmdline=%s)",
-                    str_error, exrc, cmdline );
+                    str_error, (signed char)exrc, cmdline );
         rc = -exrc;
     }
     else if (WIFSIGNALED(rc))
     {
-            DisplayLog( LVL_MAJOR, SHCMD,
+            DisplayLog( LVL_CRIT, SHCMD,
                         "ERROR: command terminated by signal %d. cmdline=%s",
                         WTERMSIG(rc), cmdline );
             rc = -EINTR;
@@ -1622,19 +2095,20 @@ int execute_shell_command( const char * cmd, int argc, ... )
  * in the given cmd line.
  * Result string is allocated using malloc()
  * and must be released using free().
+ * \param replace_array char** of param1, value1, param2, value2, ..., NULL, NULL
  */
-char * replace_cmd_parameters(const char * cmd_in)
+char *replace_cmd_parameters(const char *cmd_in, const char **replace_array)
 {
 #define CMDPARAMS "CmdParams"
-    int error = FALSE;
-    char * pass_begin;
-    char * begin_var;
-    char * end_var;
-    const char * value;
+    int i;
+    char *pass_begin = NULL;
+    char *begin_var;
+    char *end_var;
+    const char *var_value;
 
-    /* allocate tmp copy of cmd in */
-    pass_begin = (char *)malloc(strlen(cmd_in)+1);
-    strcpy(pass_begin, cmd_in);
+    pass_begin = strdup(cmd_in);
+    if (!pass_begin)
+        return NULL;
 
     do
     {
@@ -1654,32 +2128,47 @@ char * replace_cmd_parameters(const char * cmd_in)
         end_var = strchr( begin_var, '}' );
         if (!end_var)
         {
-           DisplayLog(LVL_CRIT,CMDPARAMS, "ERROR: unmatched '{' in command parameters '%s'", cmd_in);
-           error = TRUE;
-           break;
+            DisplayLog(LVL_CRIT,CMDPARAMS, "ERROR: unmatched '{' in command parameters '%s'", cmd_in);
+            free(pass_begin);
+            errno = EINVAL;
+            return NULL;
         }
 
         *end_var = '\0';
         end_var++;
 
-        value = NULL;
+        var_value = NULL;
 
         /* compute final length, depending on variable name */
-        if (!strcasecmp( begin_var, "cfg" ))
-           value = process_config_file;
-        else if (!strcasecmp( begin_var, "fspath" ))
-           value = global_config.fs_path;
-        else
+        for (i = 0; replace_array[i] != NULL; i += 2)
         {
-            DisplayLog(LVL_CRIT,CMDPARAMS, "ERROR: unknown parameter '%s' in command parameters '%s'", begin_var, cmd_in);
-            error = TRUE;
-            break;
+            const char *param = replace_array[i];
+            const char *value = replace_array[i+1];
+
+            if (!strcasecmp(begin_var, param))
+            {
+                var_value = value;
+                break;
+            }
         }
 
-        /* allocate a new string if var length < value length */
-        new_str = malloc( strlen(pass_begin)+strlen(value)+strlen(end_var)+1 );
+        if (var_value == NULL)
+        {
+            DisplayLog(LVL_CRIT,CMDPARAMS, "ERROR: unknown parameter '%s' in command parameters '%s'", begin_var, cmd_in);
+            free(pass_begin);
+            errno = EINVAL;
+            return NULL;
+        }
 
-        sprintf(new_str, "%s%s%s", pass_begin, value, end_var );
+        /* allocate a new string */
+        new_str = malloc(strlen(pass_begin) + strlen(var_value) + strlen(end_var) + 1);
+        if (!new_str)
+        {
+            free(pass_begin);
+            return NULL;
+        }
+
+        sprintf(new_str, "%s%s%s", pass_begin, var_value, end_var);
 
         free(pass_begin);
         pass_begin = new_str;
@@ -1690,3 +2179,499 @@ char * replace_cmd_parameters(const char * cmd_in)
 }
 
 
+#ifdef ATTR_INDEX_status
+/* ===  status display and conversion routines === */
+
+/* status conversion array */
+struct status_descr
+{
+    file_status_t db_status;
+    char * short_descr;
+}
+status_array[] =
+{
+#ifdef _LUSTRE_HSM
+    { STATUS_UNKNOWN, "n/a" },
+    { STATUS_NEW, "new" },
+    { STATUS_MODIFIED, "modified" },
+    { STATUS_RESTORE_RUNNING, "retrieving" },
+    { STATUS_ARCHIVE_RUNNING, "archiving" },
+    { STATUS_SYNCHRO, "synchro" },
+    { STATUS_RELEASED, "released" },
+    { STATUS_RELEASE_PENDING, "release_pending" },
+
+    /* alternative names */
+    { STATUS_UNKNOWN, "unknown" },
+    { STATUS_MODIFIED, "dirty" },
+    { STATUS_RESTORE_RUNNING, "restoring" },
+
+#define ALLOWED_STATUS "unknown, new, modified|dirty, retrieving|restoring, archiving, synchro, released, release_pending"
+
+#elif defined(_HSM_LITE)
+    { STATUS_UNKNOWN, "n/a" },
+    { STATUS_NEW, "new" },
+    { STATUS_MODIFIED, "modified" },
+    { STATUS_RESTORE_RUNNING, "retrieving" },
+    { STATUS_ARCHIVE_RUNNING, "archiving" },
+    { STATUS_SYNCHRO, "synchro" },
+    { STATUS_RELEASED, "released" },
+    { STATUS_RELEASE_PENDING, "release_pending" },
+    { STATUS_REMOVED, "removed" },
+
+    /* alternative names */
+    { STATUS_UNKNOWN, "unknown" },
+    { STATUS_MODIFIED, "dirty" },
+    { STATUS_RESTORE_RUNNING, "restoring" },
+
+#define ALLOWED_STATUS "unknown, new, modified|dirty, retrieving|restoring, archiving, synchro, removed, released, release_pending"
+
+#endif
+    { (file_status_t)-1, NULL }
+};
+
+const char * db_status2str( file_status_t status, int csv )
+{
+    struct status_descr * curr;
+
+    for ( curr = status_array; curr->short_descr != NULL; curr ++ )
+    {
+       if ( status == curr->db_status )
+       {
+           return curr->short_descr;
+       }
+    }
+    /* not found */
+    return "?";
+}
+
+file_status_t status2dbval( char * status_str )
+{
+    struct status_descr * curr;
+    int len;
+
+    if (  (status_str == NULL) || (status_str[0] == '\0') )
+        return (file_status_t)-1;
+
+    len = strlen( status_str );
+
+    for ( curr = status_array; curr->short_descr != NULL; curr ++ )
+    {
+       if ( !strncmp( status_str, curr->short_descr, len ) )
+            return curr->db_status;
+    }
+    /* not found */
+    return (file_status_t)-1;
+}
+
+const char * allowed_status()
+{
+    return ALLOWED_STATUS;
+}
+
+#endif /* status attr exists */
+
+static int path2id(const char *path, entry_id_t *id)
+{
+    int rc;
+#ifdef _HAVE_FID
+    rc = Lustre_GetFidFromPath( path, id );
+    if (rc)
+        return rc;
+#else
+    struct stat st;
+    if (lstat(path, &st))
+    {
+        rc = -errno;
+        DisplayLog( LVL_CRIT,"path2id", "ERROR: cannot stat '%s': %s",
+                    path, strerror(-rc) );
+        return rc;
+    }
+    /* build id from dev/inode*/
+    id->inode = st.st_ino;
+    id->fs_key = get_fskey();
+    id->validator = st.st_ctime;
+#endif
+    return 0;
+}
+
+#define MKDIR_TAG "MkDir"
+int mkdir_recurse(const char * full_path, mode_t mode, entry_id_t *dir_id)
+{
+    char path_copy[MAXPATHLEN];
+    const char * curr;
+    int rc;
+    int exists = 0;
+
+    if ( strncmp(global_config.fs_path, full_path, strlen(global_config.fs_path)) != 0 )
+    {
+        DisplayLog( LVL_MAJOR, MKDIR_TAG, "Error: '%s' in not under filesystem root '%s'",
+                    full_path, global_config.fs_path );
+        return -EINVAL;
+    }
+    /* skip fs root */
+    curr = full_path + strlen(global_config.fs_path);
+
+    if ( *curr == '\0' ) /* full_path is root dir */
+    {
+        exists = 1;
+        goto get_id;
+    }
+    else if ( *curr != '/' ) /* slash expected */
+    {
+        DisplayLog( LVL_MAJOR, MKDIR_TAG, "Error: '%s' in not under filesystem root '%s'",
+                    full_path, global_config.fs_path );
+        return -EINVAL;
+    }
+
+    /* skip first slash */
+    curr ++;
+
+    while( (curr = strchr( curr, '/' )) != NULL )
+    {
+         /* if fullpath = '/a/b',
+         * curr = &(fullpath[2]);
+         * so, copy 2 chars to get '/a'.
+         * and set fullpath[2] = '\0'
+         */
+        int path_len = curr - full_path;
+
+        /* extract directory name */
+        strncpy( path_copy, full_path, path_len );
+        path_copy[path_len]='\0';
+
+        DisplayLog(LVL_FULL, MKDIR_TAG, "mkdir(%s)", path_copy );
+        if ( (mkdir( path_copy, mode ) != 0) && (errno != EEXIST) )
+        {
+            rc = -errno;
+            DisplayLog( LVL_CRIT, MKDIR_TAG, "mkdir(%s) failed: %s",
+                        path_copy, strerror(-rc) );
+            return rc;
+        }
+
+        curr++;
+    }
+
+    /* finaly create last level of dir */
+    DisplayLog(LVL_FULL, MKDIR_TAG, "mkdir(%s)", full_path );
+    if ( (mkdir( full_path, mode ) != 0) && (errno != EEXIST) )
+    {
+        rc = -errno;
+        DisplayLog( LVL_CRIT, MKDIR_TAG, "mkdir(%s) failed: %s", full_path, strerror(-rc) );
+        return rc;
+    }
+    else if (errno == EEXIST)
+        exists = 1;
+
+get_id:
+    /* must return directory id */
+    if (dir_id)
+    {
+        rc = path2id(full_path, dir_id);
+        if (rc)
+            return rc;
+    }
+
+    if (exists)
+        return -EEXIST;
+    else
+        return 0;
+}
+
+/* create parent directory, and return its id (even if it already exists) */
+static inline int create_parent_of(const char * child_path, entry_id_t * p_parent_id)
+{
+    char tmp[RBH_PATH_MAX];
+    char * destdir;
+
+    /* copy to tmp buffer as dirname modifies its argument */
+    strcpy( tmp, child_path );
+    /* extract parent dir path */
+    destdir = dirname( tmp );
+    if (destdir == NULL)
+    {
+        DisplayLog( LVL_CRIT, MKDIR_TAG, "Error extracting directory path of '%s'",
+                    child_path );
+        return -EINVAL;
+    }
+
+    /* create the directory */
+    return mkdir_recurse(destdir, 0750, p_parent_id);
+}
+
+
+#define CREAT_TAG "Create"
+/* create an object with the given attributes */
+int create_from_attrs(const attr_set_t * attrs_in,
+                      attr_set_t * attrs_out,
+                      entry_id_t *new_id, int overwrite, int setstripe)
+{
+    char link[RBH_PATH_MAX] = "";
+    const char * fspath;
+    int rc;
+    struct stat st_dest;
+    int fd;
+    mode_t mode_create = 0;
+    int set_mode = FALSE;
+
+    if (!ATTR_MASK_TEST( attrs_in, fullpath ) || !ATTR_MASK_TEST(attrs_in, type))
+    {
+        DisplayLog( LVL_MAJOR, CREAT_TAG, "Missing mandatory attribute to create entry");
+        return -EINVAL;
+    }
+    fspath = ATTR(attrs_in, fullpath);
+
+    /* initialize out attrs */
+    ATTR_MASK_INIT( attrs_out );
+
+    /* first create parent and retrieve parent id */
+    rc = create_parent_of(fspath, &ATTR(attrs_out, parent_id));
+    if (rc != 0 && rc != -EEXIST)
+        return rc;
+    else
+        ATTR_MASK_SET(attrs_out, parent_id);
+
+    if (!strcasecmp(ATTR(attrs_in, type), STR_TYPE_DIR))
+    {
+        /* entry is a directory */
+        if (ATTR_MASK_TEST(attrs_in,mode))
+            mode_create = ATTR(attrs_in, mode);
+        else
+            mode_create = 750;
+
+        /* then create the directory itself */
+        rc = mkdir(fspath, mode_create)?-errno:0;
+        if (rc != 0 && rc != -EEXIST)
+            return rc;
+        else if (rc == -EEXIST)
+            set_mode = TRUE;
+    }
+    else if (!strcasecmp(ATTR(attrs_in, type), STR_TYPE_LINK))
+    {
+        /* entry is a symlink */
+
+        if (!ATTR_MASK_TEST(attrs_in, link))
+        {
+            DisplayLog( LVL_MAJOR, CREAT_TAG, "Missing mandatory attribute 'link' to create link");
+            return -EINVAL;
+        }
+
+        if ( symlink(ATTR(attrs_in, link), fspath) != 0 )
+        {
+            rc = -errno;
+            DisplayLog( LVL_MAJOR,  CREAT_TAG, "Error creating symlink %s->\"%s\" in filesystem: %s",
+                        fspath, link, strerror(-rc) );
+            return rc;
+        }
+        /* can't set mode on a symlink */
+    }
+    else if (!strcasecmp(ATTR(attrs_in, type), STR_TYPE_FILE))
+    {
+        int created = FALSE;
+
+        if (ATTR_MASK_TEST(attrs_in, mode))
+            mode_create = ATTR(attrs_in, mode);
+        else
+            mode_create = 0640; /* default */
+
+#ifdef _LUSTRE
+        if (setstripe)
+        {
+            /* create the file with the appropriate stripe in Lustre */
+            if (ATTR_MASK_TEST(attrs_in, stripe_info))
+            {
+                rc = CreateStriped( fspath, &ATTR(attrs_in, stripe_info), overwrite );
+                if (rc == 0 || rc == -EEXIST)
+                {
+                    created = TRUE;
+                    set_mode= TRUE;
+                }
+                else
+                    DisplayLog(LVL_MAJOR, CREAT_TAG, "setstripe failed: trying to create file with default striping");
+            }
+        }
+        else
+        {
+            /* create with no stripe */
+            rc = CreateWithoutStripe( fspath, mode_create & 07777, overwrite );
+            if (rc == 0)
+            {
+                created = TRUE;
+                set_mode = FALSE;
+            }
+            else if (rc == -EEXIST)
+            {
+                created = TRUE;
+                set_mode = TRUE;
+            }
+            else
+                DisplayLog(LVL_MAJOR, CREAT_TAG, "create(O_LOV_DELAY_CREATE) failed: trying to create file with default striping");
+        }
+#endif
+        if (!created)
+        {
+            fd = creat(fspath, mode_create & 07777);
+            if (fd < 0)
+            {
+                rc = -errno;
+                DisplayLog( LVL_CRIT, CREAT_TAG, "ERROR: couldn't create '%s': %s",
+                            fspath, strerror(-rc) );
+                return rc;
+            }
+            else
+                close(fd);
+        }
+
+        /* set times */
+        if (ATTR_MASK_TEST(attrs_in, last_mod))
+        {
+            struct utimbuf utb;
+            utb.modtime = ATTR(attrs_in, last_mod);
+
+            if (ATTR_MASK_TEST(attrs_in, last_access))
+                utb.actime = ATTR(attrs_in, last_access);
+            else
+                utb.actime = utb.modtime;
+
+            /* set the same mtime as in the DB */
+            DisplayLog( LVL_FULL, CREAT_TAG, "Restoring times for '%s': atime=%lu, mtime=%lu",
+                        fspath, utb.actime, utb.modtime );
+            if ( utime( fspath, &utb ) )
+                DisplayLog( LVL_MAJOR, CREAT_TAG, "Warning: couldn't restore times for '%s': %s",
+                            fspath, strerror(errno) );
+        }
+    }
+    else
+    {
+        /* type not supported */
+        DisplayLog( LVL_CRIT, CREAT_TAG, "Error: cannot restore entries of type '%s' (%s)",
+                    ATTR(attrs_in,type), fspath );
+        return -ENOTSUP;
+    }
+
+    /* set owner, group */
+    if ( ATTR_MASK_TEST( attrs_in, owner ) || ATTR_MASK_TEST( attrs_in, gr_name ) )
+    {
+        uid_t uid = -1;
+        gid_t gid = -1;
+        char buff[4096];
+
+        if ( ATTR_MASK_TEST( attrs_in, owner ) )
+        {
+            struct passwd pw;
+            struct passwd * p_pw;
+
+            if ((getpwnam_r( ATTR(attrs_in, owner ), &pw, buff, 4096, &p_pw ) != 0)
+                 || (p_pw == NULL))
+            {
+                DisplayLog( LVL_MAJOR, CREAT_TAG, "Warning: couldn't resolve uid for user '%s'",
+                            ATTR(attrs_in, owner ));
+                uid = -1;
+            }
+            else
+                uid = p_pw->pw_uid;
+        }
+
+        if ( ATTR_MASK_TEST( attrs_in, gr_name ) )
+        {
+            struct group gr;
+            struct group * p_gr;
+            if ((getgrnam_r( ATTR(attrs_in, gr_name ), &gr, buff, 4096, &p_gr ) != 0)
+                 || (p_gr == NULL))
+            {
+                DisplayLog( LVL_MAJOR, CREAT_TAG, "Warning: couldn't resolve gid for group '%s'",
+                            ATTR(attrs_in, gr_name ) );
+                gid = -1;
+            }
+            else
+                gid = p_gr->gr_gid;
+        }
+
+        DisplayLog( LVL_FULL, CREAT_TAG, "Restoring owner/group for '%s': uid=%u, gid=%u",
+                    fspath, uid, gid );
+
+        if ( lchown( fspath, uid, gid ) )
+        {
+            rc = -errno;
+            DisplayLog( LVL_MAJOR, CREAT_TAG, "Warning: cannot set owner/group for '%s': %s",
+                        fspath, strerror(-rc) );
+        }
+        else
+        {
+            /* According to chown(2) manual: chown may clear sticky bits even if root does it,
+             * so, we must set the mode again if it contains special bits */
+            if (!set_mode && (mode_create & 07000))
+                set_mode = TRUE;
+        }
+    }
+
+    if (set_mode)
+    {
+        /* set the same mode as in the backend */
+        DisplayLog( LVL_FULL, CREAT_TAG, "Restoring mode for '%s': mode=%#o",
+                    fspath, mode_create & 07777 );
+        if ( chmod( fspath, mode_create & 07777 ) )
+            DisplayLog( LVL_MAJOR, CREAT_TAG, "Warning: couldn't restore mode for '%s': %s",
+                        fspath, strerror(errno) );
+    }
+
+    if ( lstat( fspath, &st_dest ) )
+    {
+        rc = -errno;
+        DisplayLog( LVL_CRIT, CREAT_TAG, "ERROR: lstat() failed on restored entry '%s': %s",
+                    fspath, strerror(-rc) );
+        return rc;
+    }
+
+#ifdef _HAVE_FID
+    /* get the new fid */
+    rc = Lustre_GetFidFromPath( fspath, new_id );
+    if (rc)
+        return rc;
+#else
+    /* build id from dev/inode*/
+    new_id->inode =  st_dest.st_ino;
+    new_id->fs_key = get_fskey();
+    new_id->validator =  st_dest.st_ctime;
+#endif
+
+    /* update with the new attributes */
+    PosixStat2EntryAttr(&st_dest, attrs_out, TRUE);
+
+    /* copy missing info: path, name, link, ...*/
+    strcpy( ATTR( attrs_out, fullpath ), fspath );
+    ATTR_MASK_SET( attrs_out, fullpath );
+
+    char *name = strrchr(fspath, '/');
+    if (name)
+    {
+        name++;
+        strcpy(ATTR(attrs_out, name), name);
+        ATTR_MASK_SET(attrs_out, name);
+    }
+    ATTR(attrs_out, path_update) = time(NULL);
+    ATTR_MASK_SET(attrs_out, path_update);
+    ATTR(attrs_out, md_update) = time(NULL);
+    ATTR_MASK_SET(attrs_out, md_update);
+
+    if (S_ISLNK(st_dest.st_mode))
+    {
+        strcpy(ATTR(attrs_out,link), link);
+        ATTR_MASK_SET(attrs_out, link);
+    }
+
+#ifdef _LUSTRE
+    /* get new stripe */
+    if (S_ISREG(st_dest.st_mode))
+    {
+        /* get the new stripe info */
+        if ( File_GetStripeByPath( fspath,
+                                   &ATTR( attrs_out, stripe_info ),
+                                   &ATTR( attrs_out, stripe_items ) ) == 0 )
+        {
+            ATTR_MASK_SET( attrs_out, stripe_info );
+            ATTR_MASK_SET( attrs_out, stripe_items );
+        }
+    }
+#endif
+    return 0;
+}

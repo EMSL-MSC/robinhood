@@ -117,8 +117,6 @@ static inline void display_version( char *bin_name )
     printf( "    Lustre-HSM Policy Engine\n" );
 #elif defined(_TMP_FS_MGR)
     printf( "    Temporary filesystem manager\n" );
-#elif defined(_SHERPA)
-    printf( "    SHERPA cache zapper\n" );
 #elif defined(_HSM_LITE)
     printf( "    Backup filesystem to external storage\n" );
 #else
@@ -188,12 +186,12 @@ static int mk_path_filter( lmgr_filter_t * filter, int do_display, int * initial
         if ( path_filter[len-1] != '/' )
         {
             /* ( fullpath LIKE 'path' OR fullpath LIKE 'path/%' ) */
-            fv.val_str = path_filter;
+            fv.value.val_str = path_filter;
             lmgr_simple_filter_add( filter, ATTR_INDEX_fullpath, LIKE, fv,
                                     FILTER_FLAG_BEGIN );
 
             snprintf( path_regexp, RBH_PATH_MAX, "%s/*", path_filter );
-            fv.val_str = path_regexp;
+            fv.value.val_str = path_regexp;
             lmgr_simple_filter_add( filter, ATTR_INDEX_fullpath, LIKE, fv,
                                     FILTER_FLAG_OR | FILTER_FLAG_END );
         }
@@ -202,12 +200,12 @@ static int mk_path_filter( lmgr_filter_t * filter, int do_display, int * initial
             snprintf( path_regexp, RBH_PATH_MAX, "%s*", path_filter );
             /* directory or directory/% */
 
-            fv.val_str = path_regexp;
+            fv.value.val_str = path_regexp;
             lmgr_simple_filter_add( filter, ATTR_INDEX_fullpath, LIKE, fv,
                                     FILTER_FLAG_BEGIN );
             /* remove last slash */
             path_filter[len-1] = '\0';
-            fv.val_str = path_filter;
+            fv.value.val_str = path_filter;
             lmgr_simple_filter_add( filter, ATTR_INDEX_fullpath, LIKE, fv,
                                     FILTER_FLAG_OR | FILTER_FLAG_END );
         }
@@ -259,7 +257,7 @@ static inline void display_rm_entry(entry_id_t * id, const char *last_known_path
 }
 
 
-int list_rm()
+static int list_rm( void )
 {
     int            rc, index;
     struct lmgr_rm_list_t * list;
@@ -370,7 +368,7 @@ static inline void undo_rm_helper( entry_id_t * id, const char *last_known_path,
 
     printf("Restoring '%s'...\n", last_known_path );
 
-    ATTR_MASK_INIT( &attrs );
+    ATTR_MASK_INIT(&attrs);
     ATTR_MASK_SET(&attrs, fullpath);
     strcpy( ATTR(&attrs, fullpath), last_known_path );
 
@@ -381,8 +379,10 @@ static inline void undo_rm_helper( entry_id_t * id, const char *last_known_path,
     }
 
     /* copy file to Lustre */
+    ATTR_MASK_INIT(&new_attrs);
     st = rbhext_recover( id, &attrs, &new_id, &new_attrs, NULL );
-    if ( (st == RS_OK) || (st == RS_DELTA) )
+    if ((st == RS_FILE_OK) || (st == RS_FILE_DELTA)|| (st == RS_FILE_EMPTY)
+        ||  (st == RS_NON_FILE))
     {
         printf("Success\n");
         /* discard entry from remove list */
@@ -402,7 +402,7 @@ static inline void undo_rm_helper( entry_id_t * id, const char *last_known_path,
 }
 
 
-int undo_rm()
+static int undo_rm( void )
 {
     int            rc;
     struct lmgr_rm_list_t * list;
@@ -495,6 +495,7 @@ int main( int argc, char **argv )
     char           err_msg[4096];
     robinhood_config_t config;
     int chgd = 0;
+    char    badcfg[RBH_PATH_MAX];
 
     /* parse command line options */
     while ( ( c = getopt_long( argc, argv, SHORT_OPT_STRING, option_tab,
@@ -554,9 +555,9 @@ int main( int argc, char **argv )
     strncpy( path_filter, argv[optind], RBH_PATH_MAX );
 
     /* get default config file, if not specified */
-    if ( SearchConfig( config_file, config_file, &chgd ) != 0 )
+    if ( SearchConfig( config_file, config_file, &chgd, badcfg ) != 0 )
     {
-        fprintf(stderr, "No config file found in '/etc/robinhood.d/"PURPOSE_EXT"', ...\n" );
+        fprintf(stderr, "No config file (or too many) found matching %s\n", badcfg);
         exit(2);
     }
     else if (chgd)

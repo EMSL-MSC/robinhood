@@ -25,6 +25,7 @@
 /* mysql includes */
 #include <mysqld_error.h>
 #include <errmsg.h>
+#include <time.h>
 
 #define _DEBUG_DB
 
@@ -57,13 +58,16 @@ static int mysql_error_convert( int err )
         /* In case of a deconnection, mysql_stmt_fetch returns this error CR_COMMANDS_OUT_OF_SYNC.
          * which is actually not very appropriate... */
     case CR_COMMANDS_OUT_OF_SYNC:
-        /* when connection is lost, statements are no more valid */
+        /* when connection is lost, statements are no longer valid */
     case ER_UNKNOWN_STMT_HANDLER:
 
         /* It also returns ER_UNKNOWN_ERROR... In this case, we treat it as a disconnection anyway,
          * to give a chance to the client to clean its internal state.
          */
     case ER_UNKNOWN_ERROR:
+
+    /* query may be interrupted for a connexion shutdown */
+    case ER_QUERY_INTERRUPTED:
 
         /* These are really connection errors: */
     case ER_SERVER_SHUTDOWN:
@@ -119,7 +123,7 @@ int db_connect( db_conn_t * conn )
         /* connect to server */
         if ( !mysql_real_connect
              ( conn, lmgr_config.db_config.server, lmgr_config.db_config.user,
-               lmgr_config.db_config.password, lmgr_config.db_config.db, 
+               lmgr_config.db_config.password, lmgr_config.db_config.db,
                lmgr_config.db_config.port,
                EMPTY_STRING(lmgr_config.db_config.socket)?
                             NULL:lmgr_config.db_config.socket,
@@ -191,6 +195,7 @@ static int _db_exec_sql( db_conn_t * conn, const char *query,
                          int quiet )
 {
     int            rc;
+    time_t         start;
     unsigned int   retry = lmgr_config.connect_retry_min;
 #ifdef _DEBUG_DB
     DisplayLog( LVL_FULL, LISTMGR_TAG, "SQL query: %s", query );
@@ -199,6 +204,7 @@ static int _db_exec_sql( db_conn_t * conn, const char *query,
     do
     {
         int dberr;
+        start = time(NULL);
         rc = mysql_real_query( conn, query, strlen( query ) );
 
         dberr = mysql_errno( conn );
@@ -210,8 +216,8 @@ static int _db_exec_sql( db_conn_t * conn, const char *query,
                             __FUNCTION__, retry );
             else
                 DisplayLog( LVL_MAJOR, LISTMGR_TAG,
-                            "Deadlock during DB request... Retrying in %u sec.",
-                            retry );
+                            "Deadlock during DB request '%s' after %u sec. Retrying in %u sec.",
+                            query, (unsigned int)(time(NULL) - start), retry );
 
             rh_sleep( retry );
             retry *= 2;
@@ -372,30 +378,143 @@ void db_escape_string( db_conn_t * conn, char * str_out, size_t out_size, const 
         mysql_real_escape_string( conn, str_out, str_in, strlen( str_in ) );
 }
 
-/* remove a trigger */
-int db_drop_trigger( db_conn_t * conn, const char *name )
+
+/* remove a database component (table, trigger, function, ...) */
+int            db_drop_component( db_conn_t * conn, db_object_e obj_type, const char *name )
 {
-#ifdef _MYSQL5
-    
+    const char * tname="";
     char query[1024];
+
+    switch (obj_type)
+    {
+        case DBOBJ_TABLE: tname = "TABLE"; break;
+        case DBOBJ_FUNCTION: tname = "FUNCTION"; break;
+        case DBOBJ_PROC: tname = "PROCEDURE"; break;
+        case DBOBJ_TRIGGER: tname = "TRIGGER"; break;
+        default:
+             DisplayLog( LVL_CRIT, LISTMGR_TAG, "Object type not supported in %s", __func__);
+            return DB_NOT_SUPPORTED;
+    }
+
+#ifndef _MYSQL5 /* only tables are supported before MySQL 5 */
+    if (obj_type != DBOBJ_TABLE)
+    {
+        DisplayLog( LVL_CRIT, LISTMGR_TAG, "You should upgrade to MYSQL 5 or + to use %s", tname  );
+        return DB_NOT_SUPPORTED;
+    }
+#endif
+
     if( mysql_get_server_version(conn) < 50032 )
     {
-        sprintf( query, "DROP TRIGGER %s ", name );
+        sprintf( query, "DROP %s %s ", tname, name );
         return _db_exec_sql( conn, query, NULL, TRUE );
     }
     else
     {
-        sprintf( query, "DROP TRIGGER IF EXISTS %s ", name );
+        sprintf( query, "DROP %s IF EXISTS %s ", tname, name );
         return _db_exec_sql( conn, query, NULL, FALSE );
     }
+}
 
-#else
+/**
+ * check a component exists in the database
+ * \param arg depends on the object type: src table for triggers, NULL for others.
+ */
+int db_check_component(db_conn_t *conn, db_object_e obj_type, const char *name, const char *arg)
+{
+    char       query[1024];
+    MYSQL_RES *result;
+    MYSQL_ROW  row;
+    int rc;
 
-    DisplayLog( LVL_CRIT, LISTMGR_TAG, "Trigger %s was not dropped: "
-                "you should upgrade to MYSQL 5 to use triggers", name  );
-    return DB_NOT_SUPPORTED;
+    if (obj_type == DBOBJ_TRIGGER)
+    {
+        sprintf(query, "SELECT EVENT_OBJECT_TABLE FROM INFORMATION_SCHEMA.TRIGGERS WHERE TRIGGER_SCHEMA='%s'"
+                "AND TRIGGER_NAME='%s'", lmgr_config.db_config.db, name);
 
-#endif
+        rc = _db_exec_sql(conn, query, &result, FALSE);
+        if ( rc )
+            return rc;
+
+        if (!result)
+        {
+            DisplayLog(LVL_DEBUG, LISTMGR_TAG, "%s does not exist", name);
+            return DB_NOT_EXISTS;
+        }
+
+        row = mysql_fetch_row(result);
+        if (row)
+        {
+            DisplayLog(LVL_FULL, LISTMGR_TAG, "Trigger %s exists and is defined on %s",
+                       name, row[0] ? row[0] : "<null>"); 
+            if (!arg)
+            {
+                /* just check the row is set */
+                if (row[0] == NULL || row[0][0] == '\0')
+                    rc = DB_BAD_SCHEMA;
+                else
+                    rc = DB_SUCCESS;
+            }
+            else if (strcmp(arg, row[0]))
+            {
+                DisplayLog(LVL_CRIT, LISTMGR_TAG, "Trigger %s is on wrong table: expected %s, got %s",
+                           name, arg, row[0]);
+                rc = DB_BAD_SCHEMA;
+            }
+            else
+                rc = DB_SUCCESS;
+
+            if (mysql_fetch_row(result))
+            {
+                DisplayLog(LVL_CRIT, LISTMGR_TAG, "Unexpected multiple definition of %s on %s",
+                           name, row[0]);
+                rc = DB_BAD_SCHEMA;
+            }
+        }
+        else
+            rc = DB_NOT_EXISTS;
+
+        mysql_free_result(result);
+        return rc;
+    }
+    else if (obj_type == DBOBJ_FUNCTION)
+    {
+        sprintf(query, "SHOW FUNCTION STATUS WHERE DB='%s' AND NAME='%s'",
+                lmgr_config.db_config.db, name);
+
+        rc = _db_exec_sql(conn, query, &result, FALSE);
+        if ( rc )
+            return rc;
+
+        if (!result)
+        {
+            DisplayLog(LVL_DEBUG, LISTMGR_TAG, "%s does not exist", name);
+            return DB_NOT_EXISTS;
+        }
+
+        row = mysql_fetch_row(result);
+        if (row)
+        {
+            DisplayLog(LVL_FULL, LISTMGR_TAG, "Function %s exists", name);
+            rc = DB_SUCCESS;
+
+            if (mysql_fetch_row(result))
+            {
+                DisplayLog(LVL_CRIT, LISTMGR_TAG, "Unexpected multiple definition of %s",
+                           name);
+                rc = DB_BAD_SCHEMA;
+            }
+        }
+        else
+            rc = DB_NOT_EXISTS;
+
+        mysql_free_result(result);
+        return rc;
+    }
+    else
+    {
+        RBH_BUG("Only triggers are supported for now");
+    }
 }
 
 /* create a trigger */
@@ -417,3 +536,30 @@ int db_create_trigger( db_conn_t * conn, const char *name, const char *event,
 
 #endif
 }
+
+static inline const char * txlvl_str(tx_level_e lvl)
+{
+    switch(lvl)
+    {
+        case TXL_SERIALIZABLE: return "SERIALIZABLE";
+        case TXL_REPEATABLE_RD: return "REPEATABLE READ";
+        case TXL_READ_COMMITTED: return "READ COMMITTED";
+        case TXL_READ_UNCOMMITTED: return "READ UNCOMMITTED";
+        default: return "";
+    }
+}
+
+/** set transaction level (optimize performance or locking) */
+int db_transaction_level(db_conn_t * conn, what_trans_e what_tx, tx_level_e tx_level)
+{
+    char query[1024];
+    if (what_tx == TRANS_NEXT)
+        sprintf(query, "SET TRANSACTION ISOLATION LEVEL %s",
+                txlvl_str(tx_level));
+    else
+        sprintf(query, "SET SESSION TRANSACTION ISOLATION LEVEL %s",
+                txlvl_str(tx_level));
+
+    return _db_exec_sql( conn, query, NULL, FALSE );
+}
+

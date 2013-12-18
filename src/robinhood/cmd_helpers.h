@@ -33,7 +33,7 @@
 #define U_ "[0m"
 
 /** The caller's function to be called for scanned entries */
-typedef int    ( *scrub_callback_t ) ( entry_id_t * id_list,
+typedef int    ( *scrub_callback_t ) ( wagon_t * id_list,
                                        attr_set_t * attr_list,
                                        unsigned int entry_count,
                                        void * arg );
@@ -42,19 +42,27 @@ typedef int    ( *scrub_callback_t ) ( entry_id_t * id_list,
 /** scan sets of directories
  * \param cb_func, callback function for each set of directory
  */
-int rbh_scrub(lmgr_t   * p_mgr, entry_id_t * id_list,
+int rbh_scrub(lmgr_t   * p_mgr, const wagon_t * id_list,
               unsigned int id_count, int dir_attr_mask,
               scrub_callback_t cb_func,
-              void * arg);
+              void * arg );
 
 
 int Path2Id(const char *path, entry_id_t * id);
 
-#ifdef ATTR_INDEX_status
-/** status conversion functions */
-const char * db_status2str( file_status_t status, int csv );
-file_status_t status2dbval( char * status_str );
-const char * allowed_status();
-#endif
+/** Free the content of a wagon list. */
+static inline void free_wagon(wagon_t *ids, int first, int last)
+{
+    int i;
+
+    if (ids) {
+        for (i=first; i < last; i++) {
+            free(ids[i].fullname);
+        }
+    }
+}
+
+/* parse attrset for --diff option */
+int parse_diff_mask(const char * arg, int * diff_mask, char * msg);
 
 #endif

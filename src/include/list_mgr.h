@@ -56,14 +56,22 @@
 #define DB_NOT_ALLOWED         14
 #define DB_TRG_NOT_EXISTS      15
 #define DB_DEADLOCK            16
+#define DB_BAD_SCHEMA          17
 
 
 /* Tag in logfile */
 #define LISTMGR_TAG     "ListMgr"
 
-/* stripe info for all kind of FS and applications */
+#ifdef _LUSTRE
+/* stripe info for Lustre */
 
-typedef unsigned int storage_unit_id_t;
+typedef struct stripe_item_t
+{
+    unsigned int ost_idx; /* ost index */
+    unsigned int ost_gen; /* always 0 ? */
+    uint64_t obj_id;      /* object index on OST */
+    uint64_t obj_seq;     /* sequence from object fid */
+} stripe_item_t;
 
 typedef struct stripe_info_t
 {
@@ -75,16 +83,23 @@ typedef struct stripe_info_t
 typedef struct stripe_items_t
 {
     unsigned int   count;
-    storage_unit_id_t *stripe_units;             /* list of storage units used for striping */
+    stripe_item_t *stripe;   /* list of stripe pieces */
 } stripe_items_t;
+#else
+typedef int stripe_items_t; /* dummy type */
+typedef int stripe_info_t; /* dummy type */
+#endif
 
 /* access pattern for fields in database */
 #define INIT_ONLY    0x00000001 /* set at insert only: stored in an annex table (can't be modified) */
 #define ANNEX_INFO   0x00000002 /* annex information, rarely accessed: stored in an annex table */
 #define FREQ_ACCESS  0x00000004 /* frequently updated, or used as select filter: stored in the main table */
+#define DNAMES       0x01000000 /* field in DNAMES table. */
+#define FUNC_ATTR    0x02000000 /* special attr built using a DB function */
 #define GENERATED    0x10000000 /* field not stored in database: generated in SELECT requests (read-only) */
 #define INDEXED      0x20000000 /* this field must be indexed */
 #define DIR_ATTR     0x40000000 /* need to aggregate directory info (specific DB request) */
+#define SLINK_ATTR   0x80000000 /* specific attr for symlinks */
 
 /** type of fields in database */
 typedef enum
@@ -95,16 +110,20 @@ typedef enum
     DB_TEXT,    /**< string/text        */
     DB_INT,     /**< signed integer     */
     DB_UINT,    /**< unsigned integer   */
+    DB_SHORT,   /**< short integer     */
+    DB_USHORT,  /**< short unsigned integer   */
     DB_BIGINT,  /**< 64 bits integer    */
     DB_BIGUINT, /**< 64 bits unsigned integer */
-    DB_BOOL     /**< boolean            */
+    DB_BOOL,    /**< boolean            */
+    DB_ENUM_FTYPE    /**< file type enumeration */
 } db_type_t;
 
 
 #define DB_IS_NULL( _p_v ) ( ((_p_v)->type == DB_TEXT) && ((_p_v)->value_u.val_str == NULL) )
 
-/** generic function from generating fields: 1rst parameter points to the field
- * to be generated. 2nd parameter is the source field.
+/** generic function from generating fields:
+ * 1st parameter points to the field to be generated.
+ * 2nd parameter is the source field.
  */
 typedef int    ( *gen_func_t ) ( void *, const void * );
 
@@ -142,8 +161,6 @@ typedef struct field_info_t
 #include "lustre_hsm_types.h"
 #elif defined(_TMP_FS_MGR)
 #include "tmp_fs_mgr_types.h"
-#elif defined(_SHERPA)
-#include "sherpa_types.h"
 #elif defined(_HSM_LITE)
 #include "hsmlite_types.h"
 #else
@@ -155,6 +172,8 @@ typedef union
     const char    *val_str;
     int            val_int;
     unsigned int   val_uint;
+    short          val_short;
+    unsigned short val_ushort;
     long long      val_bigint;
     unsigned long long val_biguint;
     int            val_bool;
@@ -179,14 +198,27 @@ typedef enum
     TAB_IDMAP
 } db_tables_t;
 
+typedef enum {
+    OPIDX_GET,
+    OPIDX_INSERT,
+    OPIDX_UPDATE,
+    OPIDX_RM,
+
+    OPCOUNT
+} op_idx_e;
+
 /** Connection related information for a thread */
 typedef struct lmgr_t
 {
     db_conn_t      conn;
     unsigned int   last_commit;
 
-    /* flag for forcing commit */
+    /* flag to force commit */
     int            force_commit;
+
+    /* operation statistics */
+    unsigned int nbop[OPCOUNT];
+
 } lmgr_t;
 
 /** List manager configuration */
@@ -202,6 +234,12 @@ typedef struct lmgr_config_t
     int user_acct;
     int group_acct;
 } lmgr_config_t;
+
+/** Container to associate an ID with its pathname. */
+typedef struct wagon {
+    entry_id_t id;
+    char *fullname;
+} wagon_t;
 
 /**
  * Configuration management routines
@@ -250,13 +288,24 @@ typedef enum
     LESSTHAN_STRICT,
     MORETHAN_STRICT,
     LIKE,
-    UNLIKE
+    UNLIKE,
+    IN,
+    NOTIN,
 } filter_comparator_t;
 
 /** filter values associated to db_type field in field_infos array */
+typedef struct value_list {
+        unsigned int count;
+        db_type_u *values;
+} value_list_t;
 
-typedef db_type_u filter_value_t;
+typedef union filter_value
+{
+    db_type_u value;
+    value_list_t list;
+} filter_value_t;
 
+#define FV_NULL {{NULL}}
 
 /** simple filter definition */
 typedef struct lmgr_simple_filter_t
@@ -345,6 +394,8 @@ int            ListMgr_GetCommitStatus( lmgr_t * p_mgr );
  */
 int            ListMgr_Exists( lmgr_t * p_mgr, const entry_id_t * p_id );
 
+
+#ifdef _LUSTRE
 /**
  * Check that validator is matching for the given entry.
  * @param p_mgr pointer to a DB connection
@@ -361,11 +412,19 @@ int            ListMgr_CheckStripe( lmgr_t * p_mgr, const entry_id_t * p_id );
  */
 int            ListMgr_SetStripe( lmgr_t * p_mgr, const entry_id_t * p_id,
                                   stripe_info_t * p_stripe_info, stripe_items_t * p_stripe_items );
+#endif
 
 /**
  * Retrieves an entry from database.
  */
 int            ListMgr_Get( lmgr_t * p_mgr, const entry_id_t * p_id, attr_set_t * p_info );
+
+/**
+ * Retrieve the FID from the database given the parent FID and the
+ * file name.
+ */
+int ListMgr_Get_FID_from_Path( lmgr_t * p_mgr, const entry_id_t * parent_fid,
+                               const char *name, entry_id_t * fid);
 
 /**
  * Releases resources of an attr set.
@@ -375,15 +434,23 @@ void           ListMgr_FreeAttrs( attr_set_t * p_attrs );
 /**
  * Inserts a new entry to the database.
  */
-int            ListMgr_Insert( lmgr_t * p_mgr, entry_id_t * p_id,
-                               const attr_set_t * p_info,
-                               int update_if_exists);
+int ListMgr_Insert(lmgr_t *p_mgr, entry_id_t *p_id,
+                   attr_set_t *p_info,
+                   int update_if_exists);
+/**
+ * Insert a batch of entries into the database.
+ * All entries must have the same attr mask.
+ */
+int            ListMgr_BatchInsert(lmgr_t * p_mgr, entry_id_t ** p_ids,
+                                   attr_set_t ** p_attrs,
+                                   unsigned int count,
+                                   int update_if_exists);
 
 /**
  * Modifies an existing entry in the database.
  */
-int            ListMgr_Update( lmgr_t * p_mgr, const entry_id_t * p_id,
-                               const attr_set_t * p_update_set );
+int            ListMgr_Update(lmgr_t * p_mgr, entry_id_t *p_id,
+                              attr_set_t *p_update_set);
 
 /**
  * Applies a modification to all entries that match the specified filter.
@@ -391,10 +458,27 @@ int            ListMgr_Update( lmgr_t * p_mgr, const entry_id_t * p_id,
 int            ListMgr_MassUpdate( lmgr_t * p_mgr, const lmgr_filter_t * p_filter,
                                    const attr_set_t * p_attr_set );
 
+/** remove callback function */
+typedef void    ( *rm_cb_func_t ) (const entry_id_t *);
+
 /**
- * Removes an entry from the database.
+ * Removes a name from the database. Remove the entry if last is TRUE.
  */
-int            ListMgr_Remove( lmgr_t * p_mgr, const entry_id_t * p_id );
+int            ListMgr_Remove( lmgr_t * p_mgr, const entry_id_t * p_id,
+                               const attr_set_t * p_attr_set, int last );
+
+/**
+ * Removes all entries that match the specified filter.
+ */
+int            ListMgr_MassRemove( lmgr_t * p_mgr, const lmgr_filter_t * p_filter,
+                                   rm_cb_func_t );
+
+/**
+ * Atomically replace an entry with another, and relink childs in the namespace if needed.
+ */
+int ListMgr_Replace(lmgr_t * p_mgr, entry_id_t *old_id, attr_set_t *old_attrs,
+                    entry_id_t *new_id, attr_set_t *new_attrs,
+                    int src_is_last, int update_target_if_exists);
 
 #ifdef HAVE_RM_POLICY
 /**
@@ -409,17 +493,14 @@ int            ListMgr_Remove( lmgr_t * p_mgr, const entry_id_t * p_id );
  * \param real_remove_time time when the entry must be really removed.
  */
 int            ListMgr_SoftRemove( lmgr_t * p_mgr, const entry_id_t * p_id,
-                                   const char * last_known_path,
-#ifdef _HSM_LITE
-                                   const char * bkpath,
-#endif
+                                   attr_set_t * p_old_attrs,
                                    time_t real_remove_time );
 
 /**
  * Soft remove a set of entries according to a filter.
  */
 int            ListMgr_MassSoftRemove( lmgr_t * p_mgr, const lmgr_filter_t * p_filter,
-                                       time_t real_remove_time );
+                                       time_t real_remove_time, rm_cb_func_t );
 
 /**
  * Definitly remove an entry from the delayed removal table.
@@ -467,11 +548,35 @@ int     ListMgr_GetRmEntry(lmgr_t * p_mgr,
 
 #endif
 
+/**
+ * Create a (persitent) table to tag entries.
+ * \param filter indicate this applies to a restricted set of entries.
+ * \param reset indicate if the table is cleaned in case it already exists.
+ */
+int ListMgr_CreateTag(lmgr_t * p_mgr, const char *tag_name,
+                      lmgr_filter_t * p_filter, int reset);
+/** destroy a tag */
+int ListMgr_DestroyTag(lmgr_t * p_mgr, const char *tag_name);
+
+/**
+ * Tag an entry (in the set specified by CreateTag filter)
+ */
+int ListMgr_TagEntry(lmgr_t * p_mgr, const char *tag_name, const entry_id_t * p_id);
+/**
+ * Return an iterator on non-tagged entries (in the set specified by CreateTag filter)
+ */
+struct lmgr_iterator_t *ListMgr_ListUntagged( lmgr_t * p_mgr,
+                                          const char * tag_name,
+                                          const lmgr_iter_opt_t * p_opt );
+
+
+
 #ifdef _HSM_LITE
 
 #define RECOV_ATTR_MASK ( ATTR_MASK_fullpath | ATTR_MASK_size | ATTR_MASK_owner | \
                           ATTR_MASK_gr_name | ATTR_MASK_last_mod | ATTR_MASK_backendpath | \
-                          ATTR_MASK_status | ATTR_MASK_stripe_info | ATTR_MASK_type )
+                          ATTR_MASK_status | ATTR_MASK_stripe_info | ATTR_MASK_type | \
+                          ATTR_MASK_mode | ATTR_MASK_link )
 
 #define SOFTRM_MASK ( ATTR_MASK_fullpath | ATTR_MASK_backendpath )
 
@@ -482,10 +587,12 @@ int     ListMgr_GetRmEntry(lmgr_t * p_mgr,
  */
 
 typedef enum {
-    RS_OK          = 0,
-    RS_DELTA       = 1,
-    RS_NOBACKUP    = 2,
-    RS_ERROR       = 3,
+    RS_FILE_OK     = 0, /* non-empty file/symlink can be recovered */
+    RS_FILE_DELTA  = 1, /* file recovered at previous version */
+    RS_FILE_EMPTY  = 2, /* empty file recovered */
+    RS_NON_FILE    = 3, /* non-file recovered */
+    RS_NOBACKUP    = 4, /* entry can't be recovered: no backup */
+    RS_ERROR       = 5, /* recovery error */
     RS_COUNT
 } recov_status_t;
 
@@ -502,19 +609,29 @@ typedef struct _lmgr_recov_stat
 
 /**
  *  Initialize a recovery process.
+ *  \param p_filter[in] (optional) filter partial filesystem recovery
  *  \retval DB_SUCCESS the recovery process successfully started;
  *          the stats indicate the recovery states we can expect.
  *  \retval DB_ALREADY_EXISTS a recovery process already started
  *          and was not properly completed.
  *  \retval error   another error occured.
  */
-int ListMgr_RecovInit( lmgr_t * p_mgr, lmgr_recov_stat_t * p_stats );
+int ListMgr_RecovInit( lmgr_t * p_mgr, const lmgr_filter_t * p_filter,
+                       lmgr_recov_stat_t * p_stats );
 
 /**
  * Clear the recovery table.
- * /!\ all previously unrecovered entry will be lost
+ * /!\ all previously unrecovered entries will be lost
  */
 int ListMgr_RecovReset( lmgr_t * p_mgr );
+
+/**
+ *  List entries by recovery status.
+ *  \param st type of entries to be listed
+ *  (done, failed, to be done, all)
+ */
+typedef enum {RT_ALL, RT_TODO, RT_DONE, RT_FAILED} recov_type_e;
+struct lmgr_iterator_t * ListMgr_RecovList( lmgr_t * p_mgr,recov_type_e st );
 
 /**
  *  Continue a recovery process (returns an iterator on entry list),
@@ -523,13 +640,14 @@ int ListMgr_RecovReset( lmgr_t * p_mgr );
  */
 struct lmgr_iterator_t * ListMgr_RecovResume( lmgr_t * p_mgr,
                                               const char * dir_path,
-                                              int retry, /* also retry previously errorneous entries */
+                                              int retry, /* also retry previously erroneous entries */
                                               const lmgr_iter_opt_t * p_opt );
 
 
 int ListMgr_RecovGetNext( struct lmgr_iterator_t *p_iter,
                           entry_id_t * p_id,
-                          attr_set_t * p_info );
+                          attr_set_t * p_info,
+                          recov_status_t * last_status ); /* last status of the entry (-1: not processed yet) */
 
 int ListMgr_RecovComplete( lmgr_t * p_mgr, lmgr_recov_stat_t * p_stats );
 
@@ -545,15 +663,9 @@ int ListMgr_RecovSetState( lmgr_t * p_mgr, const entry_id_t * p_id,
 #define SOFTRM_MASK ( ATTR_MASK_fullpath )
 #endif
 
-
-/**
- * Removes all entries that match the specified filter.
- */
-int            ListMgr_MassRemove( lmgr_t * p_mgr, const lmgr_filter_t * p_filter );
-
 /**
  * Function for handling iterators.
- * 
+ *
  * \addtogroup ITERATOR_FUNCTIONS
  * @{
  */
@@ -596,10 +708,10 @@ void           ListMgr_CloseIterator( struct lmgr_iterator_t *p_iter );
  * and child_id_list and child_attr_list must be freed with MemFree()
  */
 int ListMgr_GetChild( lmgr_t * p_mgr, const lmgr_filter_t * p_filter,
-                      const entry_id_t * parent_list, unsigned int parent_count,
+                      const wagon_t * parent_list, unsigned int parent_count,
                       int attr_mask,
-                      entry_id_t ** child_id_list, attr_set_t ** child_attr_list,
-                      unsigned int * child_count );
+                      wagon_t ** child, attr_set_t ** child_attr_list,
+                      unsigned int * child_count);
 
 
 /** @} */
@@ -628,7 +740,7 @@ typedef enum
 typedef struct report_field_descr_t
 {
     unsigned int   attr_index;
-    report_type_t  report_type; 
+    report_type_t  report_type;
     sort_order_t   sort_flag;
 
     int            filter;      /**< is there a filter on this value ? */
@@ -712,6 +824,11 @@ void           ListMgr_CloseReport( struct lmgr_report_t *p_iter );
 
 
 /**
+ * Get the number of entries in DB.
+ */
+int ListMgr_EntryCount(lmgr_t * p_mgr, uint64_t *count);
+
+/**
  * Retrieve profile (on size, atime, mtime, ...)
  * (by status, by user, by group, ...)
  * @param profile_descr information about the attribute to be profiled
@@ -754,7 +871,6 @@ void           ListMgr_CloseProfile( struct lmgr_profile_t *p_iter );
 /*
  * Name of variables stored in database
  */
-
 #define LAST_PURGE_TIME     "LastPurgeTime"
 #define LAST_PURGE_TARGET   "LastPurgeTarget"
 #define LAST_PURGE_STATUS   "LastPurgeStatus"
@@ -789,7 +905,8 @@ void           ListMgr_CloseProfile( struct lmgr_profile_t *p_iter );
 #define SCAN_STATUS_PARTIAL    "partial"
 
 // Changelog statitics
-#define CL_LAST_READ_ID       "ChangelogLastId"
+#define CL_LAST_READ_REC_ID    "ChangelogLastId"
+#define CL_LAST_READ_REC_TIME  "ChangelogLastRecTime"
 #define CL_LAST_READ_TIME     "ChangelogLastTime"
 #define CL_LAST_COMMITTED     "ChangelogLastCommit"
 #define CL_COUNT_PREFIX       "ChangelogCount" /* variable is <prefix>_<event_name> */
@@ -828,7 +945,8 @@ int            lmgr_simple_filter_init( lmgr_filter_t * p_filter );
 #define FILTER_FLAG_END           0x00000008 /* ends a section with parenthesis */
 #define FILTER_FLAG_ALLOW_NULL    0x00000010 /* null value is allowed to match the condition */
 
-#define FILTER_FLAG_ALLOC_STR     0x10000000 /* for internal usage */
+#define FILTER_FLAG_ALLOC_STR     0x10000000 /* for internal usage: string in filter is allocated */
+#define FILTER_FLAG_ALLOC_LIST    0x20000000 /* for internal usage: list in filter is allocated */
 
 /** Add a criteria to a simple filter */
 int            lmgr_simple_filter_add( lmgr_filter_t * p_filter,
@@ -836,6 +954,9 @@ int            lmgr_simple_filter_add( lmgr_filter_t * p_filter,
                                        filter_comparator_t comparator,
                                        filter_value_t value,
                                        int flag );
+
+/* check if the given attribute is part of a filter */
+int lmgr_filter_check_field(const lmgr_filter_t *p_filter, unsigned int attr_index);
 
 /** Add a criteria to a simple filter or modify it if it already exists in the filter */
 int            lmgr_simple_filter_add_or_replace( lmgr_filter_t * p_filter,
@@ -864,6 +985,12 @@ int            lmgr_set_filter_expression( lmgr_filter_t * p_filter, struct bool
 /** Check that all fields in filter are in the given mask of supported attributes */
 int lmgr_check_filter_fields( lmgr_filter_t * p_filter, unsigned int attr_mask );
 
+/** Convert a set notation (eg. "3,5-8,12") to a list of values
+ * \param type[in] the type of output array (DB_INT, DB_UINT, ...)
+ * \param p_list[out] list of values (the function allocates a buffer for p_list->values)
+ */
+int lmgr_range2list(const char * set, db_type_t type, value_list_t * p_list);
+
 
 /** @} */
 
@@ -877,6 +1004,8 @@ void           ListMgr_MergeAttrSets( attr_set_t * p_target_attrset,
                                       attr_set_t * p_source_attrset,
                                       int update );
 
+/** return the mask of attributes that differ */
+int ListMgr_WhatDiff(const attr_set_t * p_tgt, const attr_set_t * p_src);
 
 /**
  * Generate fields automatically from already existing fields,

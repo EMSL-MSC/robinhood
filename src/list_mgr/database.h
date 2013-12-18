@@ -17,9 +17,11 @@
 #include "list_mgr.h"
 
 #define MAIN_TABLE	        "ENTRIES"
+#define DNAMES_TABLE        "NAMES"
 #define ANNEX_TABLE	        "ANNEX_INFO"
 #define STRIPE_INFO_TABLE	"STRIPE_INFO"
 #define STRIPE_ITEMS_TABLE	"STRIPE_ITEMS"
+#define SOFT_RM_TABLE       "SOFT_RM"
 #define VAR_TABLE           "VARS"
 #define ACCT_TABLE          "ACCT_STAT"
 #define ACCT_TRIGGER_INSERT "ACCT_ENTRY_INSERT"
@@ -28,6 +30,8 @@
 #define ACCT_FIELD_COUNT    "count"
 #define ACCT_DEFAULT_OWNER  "unknown"
 #define ACCT_DEFAULT_GROUP  "unknown"
+#define ONE_PATH_FUNC       "one_path"
+#define THIS_PATH_FUNC      "this_path"
 
 /* name of sz fields */
 #define ACCT_SIZE_PREFIX "sz"
@@ -48,10 +52,6 @@ char * sz_field[SZ_PROFIL_COUNT] =
 
 #define ACCT_SZ_VAL(_s) "FLOOR(LOG2("_s")/5)"
 
-
-#ifdef HAVE_RM_POLICY
-#   define SOFT_RM_TABLE    "SOFT_RM"
-#endif
 
 #ifdef _HSM_LITE
 #   define  RECOV_TABLE     "RECOVERY"
@@ -90,8 +90,30 @@ int            db_result_nb_records( db_conn_t * conn, result_handle_t * p_resul
 /* free result resources */
 int            db_result_free( db_conn_t * conn, result_handle_t * p_result );
 
-/* remove a trigger */
-int            db_drop_trigger( db_conn_t * conn, const char *name );
+typedef enum {DBOBJ_TABLE, DBOBJ_TRIGGER, DBOBJ_FUNCTION, DBOBJ_PROC } db_object_e;
+
+static inline const char *dbobj2str(db_object_e ot)
+{
+    switch(ot)
+    {
+        case DBOBJ_TABLE:    return "table";
+        case DBOBJ_TRIGGER:  return "trigger";
+        case DBOBJ_FUNCTION: return "function";
+        case DBOBJ_PROC:     return "procedure";
+    }
+    return NULL;
+}
+
+
+/** remove a database component (table, trigger, function, ...) */
+int            db_drop_component( db_conn_t * conn, db_object_e obj_type, const char *name );
+
+/**
+ * check a component exists in the database
+ * \param arg depends on the object type: src table for triggers, NULL for others.
+ */
+int db_check_component(db_conn_t *conn, db_object_e obj_type, const char *name, const char *arg);
+
 
 /* create a trigger */
 int            db_create_trigger( db_conn_t * conn, const char *name, const char *event,
@@ -114,6 +136,14 @@ int            db_list_table_fields( db_conn_t * conn, const char *table,
 /* id of the last inserted row */
 unsigned long long db_last_id( db_conn_t * conn );
 
+typedef enum { TRANS_NEXT, TRANS_SESSION } what_trans_e;
+typedef enum { TXL_SERIALIZABLE,
+               TXL_REPEATABLE_RD,
+               TXL_READ_COMMITTED,
+               TXL_READ_UNCOMMITTED } tx_level_e;
+
+/** set transaction level (optimize performance or locking) */
+int db_transaction_level(db_conn_t * conn, what_trans_e what_tx, tx_level_e tx_level);
 
 
 #endif

@@ -15,7 +15,7 @@
  * \file    analyze.h
  * \author  $Author: leibovic $
  * \date    $Date: 2008/07/04 07:57:35 $
- * \version	$Revision: 1.2 $ 
+ * \version	$Revision: 1.2 $
  * \brief   Building the syntax tree.
  *
  * Build the structure that represents a config file.
@@ -172,7 +172,7 @@ typedef generic_item *list_items;
 /**
  *  create a list of items
  */
-list_items    *rh_config_CreateItemsList(  );
+list_items    *rh_config_CreateItemsList( void );
 
 /**
  *  Create a block item with the given content
@@ -221,7 +221,7 @@ generic_item  *rh_config_CreateSet_Singleton( char* set_name );
 
 /*  ------ Arglist management functions -------- */
 
-arg_list_t    *rh_config_CreateArgList(  );
+arg_list_t    *rh_config_CreateArgList( void );
 void           rh_config_AddArg( arg_list_t * arglist, char *arg );
 void           rh_config_SetArglist( generic_item * item, arg_list_t * arglist );
 
@@ -242,6 +242,11 @@ void           rh_config_print_list( FILE * output, list_items * list );
  * Free ressources for a list
  */
 void           rh_config_free_list( list_items * list );
+
+/**
+ * Resolve an environment variable.
+ */
+void rh_config_resov_var(char *dstvalue, char*var);
 
 
 

@@ -1,6 +1,17 @@
 #!/bin/bash
 
 CFG_SCRIPT="../../scripts/rbh-config"
+BKROOT="/tmp/backend"
+
+if [ -z "$LFS" ]; then
+	LFS=lfs
+	LCTL=lctl
+	COPYTOOL=lhsmtool_posix
+else
+	lutils_dir=$(dirname $LFS)
+	LCTL=$lutils_dir/lctl
+	COPYTOOL=$lutils_dir/lhsmtool_posix
+fi
 
 service mysqld start
 
@@ -11,24 +22,26 @@ if [[ -z "$NOLOG" || $NOLOG = "0" ]]; then
 	$CFG_SCRIPT enable_chglogs lustre
 fi
 
-if [[ -z "$PURPOSE" || $PURPOSE = "LUSTRE_HSM" ]]; then
+if [[ $PURPOSE = "LUSTRE_HSM" ]]; then
 	
-	echo -n "checking coordinator status: "
-	status=`cat /proc/fs/lustre/mdt/lustre-MDT0000/hsm_control`
-	echo $status
+	for mdt in /proc/fs/lustre/mdt/lustre-MDT* ; do
+		echo -n "checking coordinator status on $(basename $mdt): "
+		status=`cat $mdt/hsm_control`
+		echo $status
 
-	if [[ $status != "enabled" ]]; then
-		echo "enabled" >  /proc/fs/lustre/mdt/lustre-MDT0000/hsm_control
-		sleep 2
-	fi
+		if [[ $status != "enabled" ]]; then
+			$LCTL set_param mdt.$(basename $mdt).hsm_control=enabled
+			sleep 2
+		fi
 
-	echo 10 > /proc/fs/lustre/mdt/lustre-MDT0000/hsm/grace_delay
+		$LCTL set_param mdt.$(basename $mdt).hsm/grace_delay=10
+	done
 
 	echo "Checking if copytool is already running..."
-	if (( `pgrep -f lhsmd_posix | wc -l` > 0 )); then
+	if (( `pgrep -f lhsmtool_posix | wc -l` > 0 )); then
 		echo "Already running"
 	else
-		lhsmd_posix --hsm_root=/tmp --noshadow lustre &
+		$COPYTOOL --hsm_root=$BKROOT --no-shadow --daemon /mnt/lustre &
 	fi
 
 fi

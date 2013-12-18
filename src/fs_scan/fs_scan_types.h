@@ -14,11 +14,11 @@
 #ifndef _FSSCAN_TYPES_H
 #define _FSSCAN_TYPES_H
 
-#include "SemN.h"
 #include "rbh_const.h"
 #include "list_mgr.h"
 
 #include <sys/types.h>
+#include <semaphore.h>
 #include <pthread.h>
 #include <sys/param.h>
 #include <sys/stat.h>
@@ -54,7 +54,7 @@ typedef struct robinhood_task__
     /* lock for protecting the child list
      * and the task_finished boolean.
      */
-    pthread_mutex_t child_list_lock;
+    pthread_spinlock_t child_list_lock;
 
     /* list of child tasks running */
 
@@ -95,7 +95,7 @@ typedef struct robinhood_task__
 typedef struct tasks_stack__
 {
     pthread_mutex_t stack_lock;                  /* lock on the stack */
-    semaphore_t    sem_tasks;                    /* token for available tasks */
+    sem_t          sem_tasks;                    /* token for available tasks */
 
     /* Indicates the depth for the first task available */
     unsigned int   max_task_depth;

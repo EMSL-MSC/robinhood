@@ -103,7 +103,6 @@ int ReadRobinhoodConfig( int module_mask, char *file_path, char *err_msg_out,
 int ReloadRobinhoodConfig( int module_mask, robinhood_config_t * new_config )
 {
     int            rc = 0;
-    char           msg_buf[2048] = "";
     const module_config_def_t *p_curr;
 
 #define RELOAD_TAG "ReloadConfig"
@@ -391,7 +390,7 @@ int GetBoolParam( config_item_t block,
 
 
 /**
- *  Retrieve a duration parameter and check its format 
+ *  Retrieve a duration parameter and check its format
  *  @return 0 on success
  *          ENOENT if the parameter does not exist in the block
  *          EINVAL if the parameter does not satisfy restrictions
@@ -471,7 +470,7 @@ int GetDurationParam( config_item_t block,
 }
 
 /**
- *  Retrieve a size parameter and check its format 
+ *  Retrieve a size parameter and check its format
  *  @return 0 on success
  *          ENOENT if the parameter does not exist in the block
  *          EINVAL if the parameter does not satisfy restrictions
@@ -548,7 +547,7 @@ int GetSizeParam( config_item_t block,
 
 
 /**
- *  Retrieve an integer parameter and check its format 
+ *  Retrieve an integer parameter and check its format
  *  @return 0 on success
  *          ENOENT if the parameter does not exist in the block
  *          EINVAL if the parameter does not satisfy restrictions
@@ -636,7 +635,7 @@ int GetIntParam( config_item_t block,
 }
 
 /**
- *  Retrieve a long integer parameter and check its format. 
+ *  Retrieve a long integer parameter and check its format.
  *  (a suffix can be used in config file).
  *  @return 0 on success
  *          ENOENT if the parameter does not exist in the block
@@ -735,7 +734,7 @@ int GetInt64Param( config_item_t block,
 }
 
 /**
- *  Retrieve a float parameter and check its format 
+ *  Retrieve a float parameter and check its format
  *  @return 0 on success
  *          ENOENT if the parameter does not exist in the block
  *          EINVAL if the parameter does not satisfy restrictions
@@ -986,7 +985,7 @@ static int interpret_condition( type_key_value * key_value, compare_triplet_t * 
             return EINVAL;
         }
 
-        /* in case the string containts regexpr, those comparators are changed to LIKE / UNLIKE */
+        /* in case the string contains regexpr, those comparators are changed to LIKE / UNLIKE */
         if ( WILDCARDS_IN( p_triplet->val.str ) )
         {
             if ( p_triplet->op == COMP_EQUAL )
@@ -1033,7 +1032,7 @@ static int interpret_condition( type_key_value * key_value, compare_triplet_t * 
             return EINVAL;
         }
 
-        /* in case the string containts regexpr, those comparators are changed to LIKE / UNLIKE */
+        /* in case the string contains regexpr, those comparators are changed to LIKE / UNLIKE */
         if ( WILDCARDS_IN( p_triplet->val.str ) )
         {
             if ( p_triplet->op == COMP_EQUAL )
@@ -1074,7 +1073,7 @@ static int interpret_condition( type_key_value * key_value, compare_triplet_t * 
             return EINVAL;
         }
 
-        /* in case the string containts regexpr, those comparators are changed to LIKE / UNLIKE */
+        /* in case the string contains regexpr, those comparators are changed to LIKE / UNLIKE */
         if ( WILDCARDS_IN( p_triplet->val.str ) )
         {
             if ( p_triplet->op == COMP_EQUAL )
@@ -1139,7 +1138,7 @@ static int interpret_condition( type_key_value * key_value, compare_triplet_t * 
             return EINVAL;
         }
 
-        /* in case the string containts regexpr, those comparators are changed to LIKE / UNLIKE */
+        /* in case the string contains regexpr, those comparators are changed to LIKE / UNLIKE */
         if ( WILDCARDS_IN( p_triplet->val.str ) )
         {
             if ( p_triplet->op == COMP_EQUAL )
@@ -1348,7 +1347,7 @@ static int interpret_condition( type_key_value * key_value, compare_triplet_t * 
             return EINVAL;
         }
 
-        /* in case the string containts regexpr, those comparators are changed to LIKE / UNLIKE */
+        /* in case the string contains regexpr, those comparators are changed to LIKE / UNLIKE */
         if ( WILDCARDS_IN( p_triplet->val.str ) )
         {
             if ( p_triplet->op == COMP_EQUAL )
@@ -1438,8 +1437,8 @@ static int interpret_condition( type_key_value * key_value, compare_triplet_t * 
 } /* interpret_condition */
 
 
-/** 
- *  Recursive fonction for building boolean expression.
+/**
+ *  Recursive function for building boolean expression.
  */
 static int build_bool_expr( type_bool_expr * p_in_bool_expr, bool_node_t * p_out_node,
                             int *p_attr_mask, char *err_msg )
@@ -1663,8 +1662,8 @@ int GetBoolExpr( config_item_t block, const char *block_name,
 
 }
 
-/** 
- *  Recursive fonction for freeing boolean expression.
+/**
+ *  Recursive function for freeing boolean expression.
  *  TODO: check these functions, in particular the 'owner'
  *        system, when an expression is a sub-part of another.
  */
@@ -1699,8 +1698,8 @@ int FreeBoolExpr( bool_node_t * p_expr, int free_top_node )
     return 0;
 }
 
-/** 
- *  Recursive fonction for building boolean expression, from a union/intersection
+/**
+ *  Recursive function for building boolean expression, from a union/intersection
  *  of defined classes.
  */
 static int build_set_expr( type_set * p_in_set,
@@ -2089,7 +2088,7 @@ int BoolExpr2str( bool_node_t * p_bool_node, char *out_str, size_t str_size )
 
 
 /**
- * Check that no unknown parameter or block is found. 
+ * Check that no unknown parameter or block is found.
  * @param param_array NULL terminated array of allowed parameters.
  */
 void CheckUnknownParameters( config_item_t block, const char *block_name, const char **param_array )

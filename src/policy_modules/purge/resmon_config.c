@@ -39,9 +39,14 @@ int SetDefault_ResourceMon_Config( void *module_config, char *msg_out )
 #ifdef ATTR_INDEX_status
     conf->check_purge_status_on_startup = TRUE;
 #endif
+    conf->recheck_ignored_classes = TRUE;
 
     conf->trigger_list = NULL;
     conf->trigger_count = 0;
+
+#ifdef _TMP_FS_MGR
+    conf->purge_command[0] = '\0';
+#endif
 
     return 0;
 }
@@ -55,6 +60,10 @@ int Write_ResourceMon_ConfigDefault( FILE * output )
     print_line( output, 1, "db_result_size_max    : 10000" );
 #ifdef ATTR_INDEX_status
     print_line( output, 1, "check_purge_status_on_startup: TRUE" );
+#endif
+    print_line( output, 1, "recheck_ignored_classes: TRUE" );
+#ifdef _TMP_FS_MGR
+    print_line( output, 1, "purge_command          : <built-in: unlink>");
 #endif
     print_end_block( output, 0 );
 
@@ -88,6 +97,29 @@ int Write_ResourceMon_ConfigTemplate( FILE * output )
     print_line( output, 1, "# check status of previous purge operations on startup" );
     print_line( output, 1, "check_purge_status_on_startup = TRUE ;" );
 #endif
+    print_line( output, 1, "# When applying purge policies, recheck entries");
+    print_line( output, 1, "# that previously matched ignored classes.");
+    print_line( output, 1, "# Enable it after changing fileclass definitions");
+    print_line( output, 1, "# or if entries move from one class to another.");
+    print_line( output, 1, "# This can significantly slow down policy application.");
+    print_line( output, 1, "recheck_ignored_classes = TRUE;" );
+    fprintf( output, "\n" );
+
+#ifdef _TMP_FS_MGR
+    print_line(output, 1, "# By default, purge action is removing the entry");
+    print_line(output, 1, "# from the filesystem. You can define an alternative");
+    print_line(output, 1, "# action by specifying a script command.");
+    print_line(output, 1, "# The following parameters can be specified:");
+    print_line(output, 1, "#    {path}: posix path to the entry");
+#ifdef _LUSTRE
+#   ifdef _HAVE_FID
+    print_line(output, 1, "#    {fid}: fid of the entry");
+#   endif
+    print_line(output, 1, "#    {fsname}: Lustre fsname");
+#endif
+    print_line(output, 1, "#purge_command = =\"/usr/bin/move_to_trash.sh {path}\";");
+#endif
+    fprintf( output, "\n" );
 
     print_end_block( output, 0 );
 
@@ -456,16 +488,7 @@ static int parse_trigger_block( config_item_t config_blk, const char *block_name
         return ENOENT;
     }
 
-#if defined(_LUSTRE_HSM) || defined(HAVE_SHOOK)
-    /* count threshold as no sense for lustre HSM, because releasing file
-     * does not free inodes */
-    if ( (rc_hc == 0) || (rc_lc == 0) )
-    {
-       DisplayLog( LVL_MAJOR, RESMONCFG_TAG,
-                "Warning: threshold on entry count doesn't make sense for "
-                         PURPOSE_EXT" purpose" );
-    }
-#endif
+    /* NOTE: count threshold for HSM systems only match online files (not released)*/
 
     /* count threshold is only on global usage */
     if ( (p_trigger_item->type != TRIGGER_GLOBAL_USAGE)
@@ -542,7 +565,7 @@ static int parse_trigger_block( config_item_t config_blk, const char *block_name
     if ( rc == ENOENT )
         rc = GetBoolParam( config_blk, block_name, "alert_lw", 0,
                            &tmpval, NULL, NULL, msg_out );
-    
+
     if ( ( rc != 0 ) && ( rc != ENOENT ) )
         return rc;
     else if ( rc == 0 )
@@ -574,6 +597,10 @@ int Read_ResourceMon_Config( config_file_t config,
         "purge_queue_size", "db_result_size_max",
 #ifdef ATTR_INDEX_status
         "check_purge_status_on_startup",
+#endif
+        "recheck_ignored_classes",
+#ifdef _TMP_FS_MGR
+        "purge_command",
 #endif
         NULL
     };
@@ -625,14 +652,28 @@ int Read_ResourceMon_Config( config_file_t config,
         else if ( rc != ENOENT )
             conf->check_purge_status_on_startup = intval;
 #endif
+        rc = GetBoolParam( param_block, PURGE_PARAM_BLOCK, "recheck_ignored_classes",
+                           0, &intval, NULL, NULL, msg_out );
+        if ( ( rc != 0 ) && ( rc != ENOENT ) )
+            return rc;
+        else if ( rc != ENOENT )
+            conf->recheck_ignored_classes = intval;
 
         rc = GetBoolParam( param_block, PURGE_PARAM_BLOCK, "simulation_mode",
                            0, &intval, NULL, NULL, msg_out );
         if ( rc == 0 )
         {
-            DisplayLog( LVL_CRIT, RESMONCFG_TAG,    
+            DisplayLog( LVL_CRIT, RESMONCFG_TAG,
                 "WARNING: 'simulation_mode' parameter is deprecated. Use '--dry-run' option instead.");
         }
+
+#ifdef _TMP_FS_MGR
+        rc = GetStringParam(param_block, PURGE_PARAM_BLOCK, "purge_command",
+                         STR_PARAM_ABSOLUTE_PATH, /* can contain wildcards: {path}, {fid}, {fsname} */
+                         conf->purge_command, RBH_PATH_MAX, NULL, NULL, msg_out);
+        if ((rc != 0) && (rc != ENOENT))
+            return rc;
+#endif
 
         CheckUnknownParameters( param_block, PURGE_PARAM_BLOCK, purge_allowed );
 
@@ -874,15 +915,18 @@ int Reload_ResourceMon_Config( void *module_config )
     /* parameters that can't be modified dynamically */
 
     if ( resmon_config.nb_threads_purge != conf->nb_threads_purge )
-        DisplayLog( LVL_MAJOR, RESMONCFG_TAG,
-                    PURGE_PARAM_BLOCK
-                    "::nb_threads_purge changed in config file, but cannot be modified dynamically" );
+        DisplayLog( LVL_MAJOR, RESMONCFG_TAG, PURGE_PARAM_BLOCK
+                    "::nb_threads_purge changed in config file, but cannot be modified dynamically");
 
     if ( resmon_config.purge_queue_size != conf->purge_queue_size )
-        DisplayLog( LVL_MAJOR, RESMONCFG_TAG,
-                    PURGE_PARAM_BLOCK
-                    "::purge_queue_size changed in config file, but cannot be modified dynamically" );
+        DisplayLog( LVL_MAJOR, RESMONCFG_TAG, PURGE_PARAM_BLOCK
+                    "::purge_queue_size changed in config file, but cannot be modified dynamically");
 
+#ifdef _TMP_FS_MGR
+    if (strcmp(conf->purge_command, resmon_config.purge_command))
+        DisplayLog(LVL_MAJOR, RESMONCFG_TAG, PURGE_PARAM_BLOCK
+                   "::purge_command changed in config file, but cannot be modified dynamically");
+#endif
 
     /* dynamic parameters */
 
@@ -912,6 +956,14 @@ int Reload_ResourceMon_Config( void *module_config )
         resmon_config.check_purge_status_on_startup = conf->check_purge_status_on_startup;
     }
 #endif
+    if ( resmon_config.recheck_ignored_classes != conf->recheck_ignored_classes )
+    {
+        DisplayLog( LVL_EVENT, RESMONCFG_TAG, PURGE_PARAM_BLOCK
+                    "::recheck_ignored_classes updated: %u->%u",
+                    resmon_config.recheck_ignored_classes, conf->recheck_ignored_classes );
+        resmon_config.recheck_ignored_classes = conf->recheck_ignored_classes;
+    }
+
 
     update_triggers( conf->trigger_list, conf->trigger_count );
 
