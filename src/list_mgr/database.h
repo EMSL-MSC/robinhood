@@ -33,6 +33,9 @@
 #define ONE_PATH_FUNC       "one_path"
 #define THIS_PATH_FUNC      "this_path"
 
+/* for HSM flavors only */
+#define  RECOV_TABLE     "RECOVERY"
+
 /* name of sz fields */
 #define ACCT_SIZE_PREFIX "sz"
 static const __attribute__ ((__unused__))
@@ -53,9 +56,6 @@ char * sz_field[SZ_PROFIL_COUNT] =
 #define ACCT_SZ_VAL(_s) "FLOOR(LOG2("_s")/5)"
 
 
-#ifdef _HSM_LITE
-#   define  RECOV_TABLE     "RECOVERY"
-#endif
 
 extern lmgr_config_t lmgr_config;
 extern int     annex_table;                      /* are we using an annex table */
@@ -89,6 +89,9 @@ int            db_result_nb_records( db_conn_t * conn, result_handle_t * p_resul
 
 /* free result resources */
 int            db_result_free( db_conn_t * conn, result_handle_t * p_result );
+
+/* indicate if the error is retryable (transaction must be restarted) */
+int db_is_retryable(int db_err);
 
 typedef enum {DBOBJ_TABLE, DBOBJ_TRIGGER, DBOBJ_FUNCTION, DBOBJ_PROC } db_object_e;
 

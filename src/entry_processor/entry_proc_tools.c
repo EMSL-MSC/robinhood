@@ -41,7 +41,7 @@ static struct id_hash *id_constraint_hash;
 int id_constraint_init( void )
 {
     id_constraint_hash = id_hash_init(ID_HASH_SIZE, TRUE);
-    return id_constraint_hash == NULL;     /* TODO: this is not checked */
+    return (id_constraint_hash == NULL);     /* TODO: this is not checked */
 }
 
 /**
@@ -72,6 +72,7 @@ int id_constraint_register( entry_proc_op_t * p_op, int at_head )
     p_op->id_is_referenced = TRUE;
 
     V( slot->lock );
+
     return ID_OK;
 
 }
@@ -109,7 +110,7 @@ entry_proc_op_t *id_constraint_get_first_op( entry_id_t * p_id )
     {
 
         printf( "no registered operation on "DFID"?\n", PFID(p_id));
-        printf( "etat de la file %u:\n", hash_index );
+        printf("entries in %u:\n", hash_index);
         for ( p_curr = slot->id_list_first; p_curr != NULL; p_curr = p_curr->p_next )
             printf( DFID"\n", PFID(&p_curr->op_ptr->entry_id) );
     }
@@ -148,9 +149,14 @@ int id_constraint_unregister( entry_proc_op_t * p_op )
 }
 
 
-void id_constraint_dump( void )
+void id_constraint_stats(void)
 {
-    id_hash_dump(id_constraint_hash, "Id constraints count");
+    id_hash_stats(id_constraint_hash, "Id constraints count");
+}
+
+void id_constraint_dump(void)
+{
+    id_hash_dump(id_constraint_hash);
 }
 
 /* ------------ Config management functions --------------- */
@@ -164,8 +170,8 @@ int SetDefault_EntryProc_Config( void *module_config, char *msg_out )
     msg_out[0] = '\0';
 
     conf->nb_thread = 8;
-    conf->max_pending_operations = 5000;
-    conf->max_batch_size = 500;
+    conf->max_pending_operations = 10000; /* for efficient batching of 1000 ops */
+    conf->max_batch_size = 1000;
     conf->match_file_classes = TRUE;
 #ifdef HAVE_RMDIR_POLICY
     conf->match_dir_classes = TRUE;
@@ -185,18 +191,19 @@ int SetDefault_EntryProc_Config( void *module_config, char *msg_out )
     return 0;
 }
 
-int Write_EntryProc_ConfigDefault( FILE * output )
+int Write_EntryProc_ConfigDefault(FILE * output)
 {
-    print_begin_block( output, 0, ENTRYPROC_CONFIG_BLOCK, NULL );
-    print_line( output, 1, "nb_threads             :  8" );
-    print_line( output, 1, "max_pending_operations :  5000" );
-    print_line(output, 1, "max_batch_size         :  500");
-    print_line( output, 1, "match_classes          :  TRUE" );
+    print_begin_block(output, 0, ENTRYPROC_CONFIG_BLOCK, NULL);
+    print_line(output, 1, "# batching strategy");
+    print_line(output, 1, "nb_threads             :  8");
+    print_line(output, 1, "max_pending_operations :  10000");
+    print_line(output, 1, "max_batch_size         :  1000");
+    print_line(output, 1, "match_classes          :  TRUE");
 #ifdef ATTR_INDEX_creation_time
-    print_line( output, 1, "detect_fake_mtime      :  FALSE" );
+    print_line(output, 1, "detect_fake_mtime      :  FALSE");
 #endif
-    print_line( output, 1, "alert                  :  NONE" );
-    print_end_block( output, 0 );
+    print_line(output, 1, "alert                  :  NONE");
+    print_end_block(output, 0);
     return 0;
 }
 
@@ -232,6 +239,7 @@ static int std_pipeline_arg_names(char **list, char *buffer)
 
 
 static int load_pipeline_config(const pipeline_descr_t * descr, pipeline_stage_t * p,
+                                const entry_proc_config_t *conf,
                                 config_item_t  entryproc_block, char *msg_out)
 {
     int i, rc, tmpval;
@@ -249,15 +257,30 @@ static int load_pipeline_config(const pipeline_descr_t * descr, pipeline_stage_t
             return rc;
         else if ( ( rc != ENOENT ) && ( tmpval > 0 ) )  /* 0: keep default */
         {
-            if ( p[i].stage_flags & STAGE_FLAG_MAX_THREADS )
-                p[i].max_thread_count =
-                    MIN2( p[i].max_thread_count, tmpval );
-            else if ( p[i].stage_flags & STAGE_FLAG_PARALLEL )
+
+            if (p[i].stage_flags & STAGE_FLAG_PARALLEL)
             {
-                /* the stage is not parallel anymore, it has a limited number of threads */
+                /* the stage is no longer parallel, it has a limited number of threads */
                 p[i].stage_flags &= ~STAGE_FLAG_PARALLEL;
                 p[i].stage_flags |= STAGE_FLAG_MAX_THREADS;
-                p[i].max_thread_count = tmpval;
+                p[i].max_thread_count = conf->nb_thread;
+            }
+            if (p[i].stage_flags & STAGE_FLAG_MAX_THREADS)
+            {
+                /* if batching is enabled and tmpval > 1: ERROR */
+                if ((i == descr->DB_APPLY) && (conf->max_batch_size != 1) && (tmpval > 1))
+                {
+                    sprintf(msg_out, "Wrong value for '%s': Parallelizing batched DB operations is not allowed.\n"
+                            "Remove this tuning, or disable batching (max_batch_size=1) to parallelize this stage.", varname);
+                    return EINVAL;
+                }
+
+                if ((i == descr->DB_APPLY) && (conf->nb_thread > 1))
+                    /* don't starve other steps: max is nb_thread-1 (except if nb_thread = 1)*/
+                    p[i].max_thread_count = MIN2(conf->nb_thread - 1, tmpval);
+                else
+                    /* nb_thread at max */
+                    p[i].max_thread_count = MIN2(conf->nb_thread, tmpval);
             }
             else if ( ( p[i].stage_flags & STAGE_FLAG_SEQUENTIAL )
                       && ( tmpval != 1 ) )
@@ -268,7 +291,47 @@ static int load_pipeline_config(const pipeline_descr_t * descr, pipeline_stage_t
             }
         }
     }
+
     return 0;
+}
+
+static void set_default_pipeline_config(const pipeline_descr_t *descr,
+                                        pipeline_stage_t *p,
+                                        const entry_proc_config_t *conf)
+{
+        int i = descr->DB_APPLY;
+
+        if (p[i].stage_flags & STAGE_FLAG_PARALLEL)
+        {
+            p[i].stage_flags &= ~STAGE_FLAG_PARALLEL;
+            p[i].stage_flags |= STAGE_FLAG_MAX_THREADS;
+            /* if nb thread = 1 or 2 => set the limit to 1
+             *                3      =>                  2
+             *                4-7    =>                  n-2
+             *                7+     =>                  80%
+             */
+            if (conf->nb_thread < 4)
+                p[i].max_thread_count = MAX2(conf->nb_thread - 1, 1);
+            else if (conf->nb_thread < 8)
+                p[i].max_thread_count = conf->nb_thread - 2;
+            else
+                p[i].max_thread_count = (8*conf->nb_thread)/10;
+        }
+        else if (p[i].stage_flags & STAGE_FLAG_MAX_THREADS)
+        {
+            /* ensure DB_APPLY threads <= nbthread - 1 */
+            if (p[i].max_thread_count > conf->nb_thread - 1)
+                p[i].max_thread_count = conf->nb_thread - 1;
+        }
+
+        /* if batching is enabled, DB_APPLY_THREAD_MAX = 1 */
+        if (conf->max_batch_size != 1)
+        {
+            if (p[i].stage_flags & STAGE_FLAG_PARALLEL)
+                RBH_BUG("step should no big tagged as 'PARALLEL' at this point");
+            else if (p[i].stage_flags & STAGE_FLAG_MAX_THREADS)
+                p[i].max_thread_count = 1;
+        }
 }
 
 int Read_EntryProc_Config( config_file_t config, void *module_config,
@@ -292,6 +355,8 @@ int Read_EntryProc_Config( config_file_t config, void *module_config,
     if ( entryproc_block == NULL )
     {
         strcpy( msg_out, "Missing configuration block '" ENTRYPROC_CONFIG_BLOCK "'" );
+        /* set default pipeline config */
+        set_default_pipeline_config(&std_pipeline_descr, std_pipeline, conf);
         /* No error because no parameter is mandatory  */
         return 0;
     }
@@ -309,6 +374,9 @@ int Read_EntryProc_Config( config_file_t config, void *module_config,
                       ( int * ) &conf->nb_thread, NULL, NULL, msg_out );
     if ( ( rc != 0 ) && ( rc != ENOENT ) )
         return rc;
+    /* should have at least 2 threads! */
+    if (conf->nb_thread == 1)
+        DisplayLog(LVL_MAJOR, "EntryProc_Config", "WARNING: "ENTRYPROC_CONFIG_BLOCK" should have at least 2 threads to avoid pipeline step starvation!");
 
     rc = GetIntParam( entryproc_block, ENTRYPROC_CONFIG_BLOCK, "max_pending_operations",
                       INT_PARAM_POSITIVE | INT_PARAM_NOT_NULL,
@@ -342,14 +410,21 @@ int Read_EntryProc_Config( config_file_t config, void *module_config,
         conf->detect_fake_mtime = tmpval;
 #endif
 
-
     /* look for '<stage>_thread_max' parameters (for all pipelines) */
-    rc = load_pipeline_config(&std_pipeline_descr, std_pipeline, entryproc_block, msg_out);
-    if (rc)
-        return rc;
+    if (!for_reload)
+    {
+        /* set default pipeline config according to EntryProc config */
+        set_default_pipeline_config(&std_pipeline_descr, std_pipeline, conf);
 
-    // TODO load_pipeline_config(&diff_pipeline_descr, &diff_pipeline);
+        rc = load_pipeline_config(&std_pipeline_descr, std_pipeline, conf,
+                                  entryproc_block, msg_out);
+        if (rc)
+            return rc;
 
+        // TODO load_pipeline_config(&diff_pipeline_descr, &diff_pipeline);
+    }
+
+    /* TODO Check consistency of performance strategy: batching vs. multithread DB operations */
 
     /* Find and parse "Alert" blocks */
     for ( blc_index = 0; blc_index < rh_config_GetNbItems( entryproc_block ); blc_index++ )
@@ -380,7 +455,7 @@ int Read_EntryProc_Config( config_file_t config, void *module_config,
 
             alert_title = rh_config_GetBlockId( curr_item );
             if ( alert_title != NULL )
-                strncpy( conf->alert_list[conf->alert_count - 1].title,
+                rh_strncpy(conf->alert_list[conf->alert_count - 1].title,
                          alert_title, ALERT_TITLE_MAX );
             else
                 conf->alert_list[conf->alert_count - 1].title[0] = '\0';
@@ -584,7 +659,7 @@ int Write_EntryProc_ConfigTemplate( FILE * output )
     fprintf( output, "\n" );
 
     print_line( output, 1, "# nbr of worker threads for processing pipeline tasks" );
-    print_line( output, 1, "nb_threads = 8 ;" );
+    print_line( output, 1, "nb_threads = 4 ;" );
     fprintf( output, "\n" );
     print_line( output, 1, "# Max number of operations in the Entry Processor pipeline." );
     print_line( output, 1, "# If the number of pending operations exceeds this limit, " );
@@ -592,11 +667,11 @@ int Write_EntryProc_ConfigTemplate( FILE * output )
 #ifdef _SQLITE
     print_line( output, 1, "max_pending_operations = 500 ;" );
 #else
-    print_line( output, 1, "max_pending_operations = 5000 ;" );
+    print_line( output, 1, "max_pending_operations = 10000 ;" );
 #endif
     fprintf(output, "\n");
     print_line(output, 1, "# max batched DB operations (1=no batching)");
-    print_line(output, 1, "max_batch_size = 500;");
+    print_line(output, 1, "max_batch_size = 1000;");
     fprintf(output, "\n");
 
     print_line( output, 1,
@@ -604,9 +679,14 @@ int Write_EntryProc_ConfigTemplate( FILE * output )
     print_line( output, 1, "# <stagename>_threads_max = <n> (0: use default)" );
     for ( i = 0; i < std_pipeline_descr.stage_count; i++ )
     {
+        if (i == std_pipeline_descr.DB_APPLY)
+        {
+            print_line(output, 1, "# Disable batching (max_batch_size=1) to allow parallelizing the following step:");
+        }
+
         if ( std_pipeline[i].stage_flags & STAGE_FLAG_PARALLEL )
-            print_line( output, 1, "# %s_threads_max\t= 8 ;", std_pipeline[i].stage_name );
-        else if ( std_pipeline[i].stage_flags & STAGE_FLAG_MAX_THREADS )
+            print_line( output, 1, "# %s_threads_max\t= 4 ;", std_pipeline[i].stage_name );
+        else if (std_pipeline[i].stage_flags & STAGE_FLAG_MAX_THREADS)
             print_line( output, 1, "%s_threads_max\t= %u ;", std_pipeline[i].stage_name,
                         std_pipeline[i].max_thread_count );
     }
@@ -617,6 +697,7 @@ int Write_EntryProc_ConfigTemplate( FILE * output )
     print_line( output, 1, "match_classes = TRUE;");
 
 #ifdef ATTR_INDEX_creation_time
+    fprintf( output, "\n" );
     print_line( output, 1, "# Faking mtime to an old time causes the file to be migrated");
     print_line( output, 1, "# with top priority. Enabling this parameter detect this behavior");
     print_line( output, 1, "# and doesn't allow  mtime < creation_time");

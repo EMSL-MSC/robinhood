@@ -47,6 +47,7 @@ elif [[ $PURPOSE = "LUSTRE_HSM" ]]; then
 	FIND=$RBH_BINDIR/rbh-lhsm-find
 	DU=$RBH_BINDIR/rbh-lhsm-du
     DIFF=$RBH_BINDIR/rbh-lhsm-diff
+    UNDELETE=$RBH_BINDIR/rbh-lhsm-undo-rm
 	CMD=rbh-lhsm
 	PURPOSE="LUSTRE_HSM"
 	ARCH_STR="Start archiving"
@@ -62,13 +63,12 @@ elif [[ $PURPOSE = "BACKUP" ]]; then
 	IMPORT="$RBH_BINDIR/rbh-backup-import $RBH_OPT"
 	FIND=$RBH_BINDIR/rbh-backup-find
 	DU=$RBH_BINDIR/rbh-backup-du
-        DIFF=$RBH_BINDIR/rbh-backup-diff
+    DIFF=$RBH_BINDIR/rbh-backup-diff
+    UNDELETE=$RBH_BINDIR/rbh-backup-undo-rm
 	CMD=rbh-backup
 	ARCH_STR="Starting backup"
 	REL_STR="Purged"
-	if [ ! -d $BKROOT ]; then
-		mkdir -p $BKROOT
-	fi
+	mkdir -p $BKROOT
 elif [[ $PURPOSE = "SHOOK" ]]; then
 	is_lhsm=0
 	is_hsmlite=1
@@ -80,13 +80,12 @@ elif [[ $PURPOSE = "SHOOK" ]]; then
 	IMPORT="$RBH_BINDIR/rbh-shook-import $RBH_OPT"
 	FIND=$RBH_BINDIR/rbh-shook-find
 	DU=$RBH_BINDIR/rbh-shook-du
-        DIFF=$RBH_BINDIR/rbh-shook-diff
+    DIFF=$RBH_BINDIR/rbh-shook-diff
+    UNDELETE=$RBH_BINDIR/rbh-shook-undo-rm
 	CMD=rbh-shook
 	ARCH_STR="Starting backup"
 	REL_STR="Purged"
-	if [ ! -d $BKROOT ]; then
-		mkdir -p $BKROOT
-	fi
+	mkdir -p $BKROOT
 fi
 
 LVERSION=`rpm -qa "lustre[-_]*modules*" --qf "%{Version}"`
@@ -106,6 +105,19 @@ function clean_caches
     echo 3 > /proc/sys/vm/drop_caches
     lctl set_param ldlm.namespaces.lustre-*.lru_size=clear > /dev/null
 }
+
+function wait_stable_df
+{
+    $LFS df $ROOT > /tmp/lfsdf.1
+    while (( 1 )); do
+        sleep 5
+        $LFS df $ROOT > /tmp/lfsdf.2
+        diff /tmp/lfsdf.1 /tmp/lfsdf.2 > /dev/null && break
+        echo "waiting for df update..."
+        mv -f /tmp/lfsdf.2 /tmp/lfsdf.1
+    done
+}
+
 
 lustre_major=$(cat /proc/fs/lustre/version | grep "lustre:" | awk '{print $2}' | cut -d '.' -f 1)
 
@@ -157,6 +169,7 @@ function set_skipped
 
 function clean_logs
 {
+    local f
 	for f in $CLEAN; do
 		if [ -s $f ]; then
 			cp /dev/null $f
@@ -803,6 +816,13 @@ function test_suspend_on_error
 
 	echo "3-Applying migration policy ($policy_str)..."
 
+    # make the archive fail
+	if (( $is_lhsm != 0 )); then
+        for i in $(seq 1 ${nb_files_error}); do
+            $LFS hsm_set --noarchive $ROOT/file.$i.fail
+        done
+    fi
+
 	$RH -f ./cfg/$config_file --migrate -l DEBUG -L rh_migr.log  --once || error ""
 
     nb_fail_match=$(grep "hints='fail'" rh_migr.log | wc -l)
@@ -1201,6 +1221,10 @@ function test_custom_purge
 	for i in `seq 1 10`; do
 		dd if=/dev/zero of=$ROOT/file.$i bs=1M count=10 >/dev/null 2>/dev/null || error "writing file.$i"
 	done
+    # create malicious file names to test vulnerability
+    touch "$ROOT/foo1 \`pkill -9 $CMD\`" || error "couldn't create file"
+    touch "$ROOT/foo2 ; exit 1" || error "couldn't create file"
+    touch "$ROOT/foo3' ';' 'exit' '1'" || error "couldn't create file"
 
 	echo "Inital scan..."
 	$RH -f ./cfg/$config_file --scan --once -l DEBUG -L rh_scan.log
@@ -1216,6 +1240,11 @@ function test_custom_purge
 		for i in `seq 1 10`; do
 			fids[$i]=$($LFS path2fid $ROOT/file.$i)
         done
+        i=11
+        for f in  "$ROOT/foo1 \`pkill -9 $CMD\`" "$ROOT/foo2 ; exit 1" "$ROOT/foo3' ';' 'exit' '1'" ; do
+			fids[$i]=$($LFS path2fid "$f")
+            ((i=$i+1))
+        done
         [ "$DEBUG" = "1" ] && echo "fsname=$fsname, fids=${fids[*]}"
     fi
 
@@ -1224,13 +1253,13 @@ function test_custom_purge
 	check_db_error rh_purge.log
 
 	nb_purge=`grep "Purged" rh_purge.log | wc -l`
-	if (($nb_purge != 10)); then
-		error "********** TEST FAILED: 10 purge actions expected, $nb_purge done"
+	if (($nb_purge != 13)); then
+		error "********** TEST FAILED: 13 purge actions expected, $nb_purge done"
 	else
-		echo "OK: 10 actions done"
+		echo "OK: 13 actions done"
 	fi
 
-	# checking that the custom command was called for each
+	# checking that the custom command was called for each file
 	for  i in `seq 1 10`; do
 		line=$(grep "Executing " rh_purge.log | grep '/bin/rm' | grep $ROOT/file.$i)
         if [ -z "$line" ]; then
@@ -1238,7 +1267,7 @@ function test_custom_purge
             continue
         fi
         # split args
-        args=($(echo "$line" | sed -e "s/.*rm -f//"))
+        args=($(echo "$line" | sed -e "s/.*rm -f//" | tr -d "'"))
         fn=${args[0]}
         id=${args[1]}
         p=${args[2]}
@@ -1253,8 +1282,174 @@ function test_custom_purge
 
         [ -f $ROOT/file.$i ] && error "$ROOT/file.$i still exists after purge command"
 	done
+
+    # same test for special file names
+    i=11
+    for f in  "$ROOT/foo1 \`pkill -9 $CMD\`" "$ROOT/foo2 ; exit 1" "$ROOT/foo3' ';' 'exit' '1'" ; do
+        f0=$(echo "$f" | awk '{print $1}')
+		line=$(grep "Executing " rh_purge.log | grep '/bin/rm' | grep "$f0")
+        if [ -z "$line" ]; then
+            error "No action found on $f"
+            continue
+        fi
+        # split args
+        args=($(echo "$line" | sed -e "s/.*rm -f//" | tr -d "'" | tr -d '\\' | cut -d '>' -f 1))
+        fn=${args[0]}
+        id=${args[1]}
+        unset args[0]
+        unset args[1]
+        p=${args[@]}
+        [ "$DEBUG" = "1" ] && echo "action: fsname=$fn, fid=$id, path=$p"
+
+        [ $fn = $fsname ] || error "invalid fsname $fn != $fsname"
+        # only compare fids for lustre 2.x
+        if (( $no_log == 0 )); then
+            [ $id = ${fids[$i]} ] || error "invalid fid $id != ${fids[$i]}"
+        fi
+        f2=$(echo $f | tr -d "'")
+        [ "$p" = "$f2" ] || error "invalid path $p != $f2"
+
+        [ -f "$f" ] && error "$f still exists after purge command"
+        ((i=$i+1))
+    done
+
 	return 0
 }
+
+
+function test_default
+{
+	config_file=$1
+	policy_str="$2"
+
+	clean_logs
+
+    # matrix of files (m)igration/(p)urge:
+    #       *.A  *.B  *.C
+    #   X*        m
+    #   Y*   p    m/p   p
+    #   Z*        m
+    for pre in X Y Z; do
+        for suf in A B C; do
+            touch $ROOT/$pre.$suf || error "touch $ROOT/$pre.$suf"
+        done
+    done
+
+    # wait for entries to be eligible
+    sleep 1
+
+	# initial scan
+    $RH -f ./cfg/$config_file --scan --once -l DEBUG -L rh_chglogs.log || error "Initial scan"
+    check_db_error rh_chglogs.log
+
+	# archive the file (if applicable)
+	if (( $is_hsmlite + $is_lhsm != 0 )); then
+        $RH -f ./cfg/$config_file --sync -l DEBUG -L rh_migr.log || error "Migration"
+
+        # check archived files
+        # *.B files must be archived. other files should be.
+        nb_b=$(grep "$ARCH_STR" rh_migr.log | grep -E "$ROOT/[XYZ]\.B"| wc -l)
+        nb_ac=$(grep "$ARCH_STR" rh_migr.log | grep -E "$ROOT/[XYZ]\.[AC]"| wc -l)
+
+        [ "$DEBUG" = "1" ] && grep "$ARCH_STR" rh_migr.log
+
+        (( $nb_b != 3 )) && error "unexpected number of migrated *.B files: $nb_b != 3"
+        (( $nb_ac != 0 )) && error "unexpected number of migrated *.[AC] files: $nb_ac != 0"
+    fi
+    
+    # purge the files (if applicable)
+    if (( ($is_hsmlite == 0) || ($shook != 0) )); then
+
+        if (($is_lhsm != 0)); then
+    		wait_done 60 || error "Migration timeout"
+
+            # read changelogs to be aware of migration success
+            :> rh_chglogs.log
+            $RH -f ./cfg/$config_file --readlog --once  -l DEBUG -L rh_chglogs.log || error "reading changelog"
+            check_db_error rh_chglogs.log
+        fi
+
+        # wait for entries to be eligible
+        sleep 1
+
+        $RH -f ./cfg/$config_file --purge-fs=0 --once -l DEBUG -L rh_purge.log || error "Purge"
+
+        # check purged files
+        # tmpfs: all Y* files can be purged
+        # hsm: only archived files can be purged: Y.B
+	    if (( $is_lhsm + $shook != 0 )); then
+            nb_purge=1
+            purge_pat="Y.B"
+        else
+            nb_purge=3
+            purge_pat="Y*"
+        fi
+        other=$(( 9 - $nb_purge ))
+        
+        nbp=$(grep "$REL_STR" rh_purge.log | grep -E "$ROOT/$purge_pat"| wc -l)
+        nbnp=$(grep "$REL_STR" rh_purge.log | grep -vE "$ROOT/$purge_pat" | wc -l)
+
+        [ "$DEBUG" = "1" ] && grep "$REL_STR" rh_purge.log
+
+        (( $nbp != $nb_purge )) && error "unexpected number of purged files matching $purge_pat : $nbp != $nb_purge"
+        (( $nbnp != 0 )) && error "unexpected number of purged files matching $purge_pat: $nbnp != 0"
+    fi
+
+
+	# stop RH in background
+#	kill %1
+}
+
+function test_undelete
+{
+	config_file=$1
+	policy_str="$2"
+
+	clean_logs
+
+	if (( $is_hsmlite == 0 )); then
+		echo "No undelete for this flavor"
+		set_skipped
+		return 1
+    fi
+
+    FILES="$ROOT/dir1/file1 $ROOT/dir1/file2 $ROOT/dir2/file1 $ROOT/dir2/file2"
+
+    mkdir -p $ROOT/dir1 || error "mkdir"
+    mkdir -p $ROOT/dir2 || error "mkdir"
+    for f in $FILES ; do echo 123 > $f || error "write"; done
+    sz1=$(stat -c '%s' $ROOT/dir2/file1)
+
+    # initial scan + archive all
+    $RH -f ./cfg/$config_file --scan --once --sync -l DEBUG -L rh_chglogs.log || error "Initial scan and sync"
+    check_db_error rh_chglogs.log
+
+    # remove all and read the changelog
+    rm -rf $ROOT/dir1 $ROOT/dir2
+    start=$(date +%s)
+    $RH -f ./cfg/$config_file --readlog --once -l DEBUG -L rh_chglogs.log || error "Reading changelog"
+    check_db_error rh_chglogs.log
+
+    # list all deleted entries
+	$UNDELETE -f ./cfg/$config_file -L $ROOT | grep "Last known path" | awk '{print $(NF)}' > rh_report.log
+    (( $(wc -l rh_report.log | awk '{print $1}') == 4 )) || error "invalid file count in undelete list"
+    for f in $FILES; do grep $f rh_report.log || error "missing $f in undelete list"; done
+    # list all deleted entried from dir1
+	$UNDELETE -f ./cfg/$config_file -L $ROOT/dir1 | grep "Last known path" | awk '{print $(NF)}' > rh_report.log
+    (( $(wc -l rh_report.log | awk '{print $1}') == 2 )) || error "invalid file count in undelete list"
+    for f in dir1/file1 dir1/file2; do grep $f rh_report.log || error "missing $f in undelete list"; done
+    # recover all deleted entries from dir2
+	$UNDELETE -f ./cfg/$config_file -R $ROOT/dir2 | grep Restoring | cut -d "'" -f 2 > rh_report.log
+    (( $(wc -l rh_report.log | awk '{print $1}') == 2 )) || error "invalid undeleted file count"
+    for f in dir2/file1 dir2/file2; do grep $f rh_report.log || error "missing $f in undelete list"; done
+    [ ! -f $ROOT/dir2/file1 ] && error "Missing $ROOT/dir2/file1 in FS after undelete"
+    [ ! -f $ROOT/dir2/file2 ] && error "Missing $ROOT/dir2/file2 in FS after undelete"
+
+    # check final size
+    sz2=$(stat -c '%s' $ROOT/dir2/file1)
+    (( $sz1 == $sz2 )) || error "final size $sz2 doesn't match $sz1"
+}
+
 
 
 
@@ -1700,6 +1895,8 @@ function test_dircount_report
 			grep "$ROOT/empty.$i" report.out > /dev/null || error "$ROOT/empty.$i not found in top rmdir"
 		done
 	fi
+
+    rm -f report.out
 }
 
 # test report options: avg_size, by-count, count-min and reverse
@@ -1796,6 +1993,8 @@ function    test_sort_report
     $REPORT -f ./cfg/$config_file -l MAJOR --csv -q --top-user --count-min=10 > report.out || error "generating topuser with at least 10 entries"
     (( $(wc -l report.out | awk '{print$1}') == 2 )) || error "only 2 users expected with more than 10 entries"
     grep ${users[2]} report.out && error "${users[2]} is not expected to have more than 10 entries"
+
+    rm -f report.out
 }
 
 function path_test
@@ -2274,6 +2473,8 @@ function policy_check_migr
 
     (( $w1_arch == 0 )) && (( $i1_arch == 0 )) && (( $m1_arch == 1 )) \
     && (( $d1_arch == 1 )) && echo "OK: All expected files migrated"
+
+    rm -f report.out
 }
 
 function policy_check_purge
@@ -2390,6 +2591,8 @@ function policy_check_purge
 
     (( $w1_arch == 0 )) && (( $i1_arch == 0 )) && (( $p1_arch == 1 )) \
     && (( $d1_arch == 1 )) && echo "OK: All expected files released"
+
+    rm -f report.out
 
     # check that purge fileclasses are properly matched at scan time,
     # then at application time
@@ -2560,12 +2763,8 @@ function test_cnt_trigger
 
 	# initial inode count
 	empty_count=`df -i $ROOT/ | grep "$ROOT" | xargs | awk '{print $(NF-3)}'`
-	(( file_count=$file_count - $empty_count ))
-
-    if (( $file_count < 0 )) ; then
-        error "INODE COUNT FOR EMPTY FILESYSTEM IS ALREADY OVER HIGH THRESHOLD!"
-        return 1
-    fi
+    export high_cnt=$((file_count + $empty_count))
+    export low_cnt=$(($high_cnt - $exp_purge_count))
 
     [ "$DEBUG" = "1" ] && echo "Initial inode count $empty_count, creating additional $file_count files"
 
@@ -2619,6 +2818,9 @@ function test_ost_trigger
 	mb_l_threshold=$3
 	policy_str="$4"
 
+    export ost_high_vol="${mb_h_threshold}MB"
+    export ost_low_vol="${mb_l_threshold}MB"
+
 	if (( ($is_hsmlite != 0) && ($shook == 0) )); then
 		echo "No purge for backup purpose: skipped"
 		set_skipped
@@ -2626,15 +2828,21 @@ function test_ost_trigger
 	fi
 	clean_logs
 
-	empty_vol=`$LFS df  $ROOT | grep OST0000 | awk '{print $3}'`
+    # reset df values
+    clean_caches
+    wait_stable_df
+
+	empty_vol=`$LFS df $ROOT | grep OST0000 | awk '{print $3}'`
 	empty_vol=$(($empty_vol/1024))
 
     if (($empty_vol >= $mb_h_threshold)); then
-        error "FILESYSTEM IS ALREADY OVER HIGH THRESHOLD (cannot run test)"
+        error "OST IS ALREADY OVER HIGH THRESHOLD (cannot run test)"
         return 1
     fi
 
-	$LFS setstripe --count 2 --offset 0 $ROOT || error "setting stripe_count=2"
+    [ "$DEBUG" = "1" ] && echo "empty_vol OST0000: $empty_vol MB, HW: $mb_h_threshold MB"
+
+	$LFS setstripe --count 2 --offset 0 -s 1m $ROOT || echo "error setting stripe_count=2"
 
 	#create test tree of archived files (2M each=1MB/ost) until we reach high threshold
 	((count=$mb_h_threshold - $empty_vol + 1))
@@ -2655,7 +2863,8 @@ function test_ost_trigger
     fi
 
 	# wait for df sync
-	sync; sleep 1
+	sync; clean_caches
+    wait_stable_df
 
 	if (( $is_lhsm != 0 )); then
 		arch_count=`$LFS hsm_state $ROOT/file.* | grep "exists archived" | wc -l`
@@ -2676,14 +2885,18 @@ function test_ost_trigger
 	$REPORT -f ./cfg/$config_file -i
 
 	# apply purge trigger
-	$RH -f ./cfg/$config_file --purge --once -l DEBUG -L rh_purge.log
+	$RH -f ./cfg/$config_file --purge --once -l DEBUG -L rh_purge.log || error "applying purge policy"
 
-	grep summary rh_purge.log
+	grep summary rh_purge.log || error "No purge was done"
+    [ "$DEBUG" = "1" ] && cat rh_purge.log
+
 	stat_purge=`grep summary rh_purge.log | grep "OST #0" | awk '{print $(NF-9)" "$(NF-3)" "$(NF-2)}' | sed -e "s/[^0-9 ]//g"`
 
 	purged_ost=`echo $stat_purge | awk '{print $1}'`
 	purged_total=`echo $stat_purge | awk '{print $2}'`
 	needed_ost=`echo $stat_purge | awk '{print $3}'`
+
+    [ "$DEBUG" = "1" ] && echo "purged_ost=$purged_ost, total_purged=$purged_total, ost_purge_needed=$needed_ost"
 
 	# change blocks to MB (*512/1024/1024 == /2048)
 	((purged_ost=$purged_ost/2048))
@@ -2716,6 +2929,83 @@ function test_ost_trigger
 	# restore default striping
 	$LFS setstripe --count 2 --offset -1 $ROOT
 }
+
+function test_ost_order
+{
+	config_file=$1
+	policy_str="$2"
+	clean_logs
+
+    # reset df values
+    sync; clean_caches
+    wait_stable_df
+
+	if (( ($is_hsmlite != 0) && ($shook == 0) )); then
+		echo "No purge for backup purpose: skipped"
+		set_skipped
+		return 1
+	fi
+
+
+    # nb OSTs?
+    nbost=`$LFS df $ROOT | grep OST | wc -l`
+    maxidx=$((nbost -1))
+
+    # get low watermark = max current OST usage
+    local min_kb=0
+    for i in $(seq 0 $maxidx); do
+    	empty_vol=`$LFS df $ROOT | grep OST000$i | awk '{print $3}'`
+        (( $empty_vol > $min_kb )) && min_kb=$empty_vol
+    done
+
+    export ost_low_vol="${min_kb}KB"
+    local trig_kb=$(($min_kb + 1024 )) # low thresh. +1MB
+    export ost_high_vol="${trig_kb}KB"
+
+    [ "$DEBUG" = "1" ] && $LFS df $ROOT
+    echo "setting low threshold = $ost_low_vol, high_threshold = $ost_high_vol"
+
+    # create nothing on OST0000 (should not be purged)
+    # ensure OST1 usage is trig_kb + 1M
+    # ensure OST2 usage is trig_kb + 2M
+    # etc...
+    for i in $(seq 1 $maxidx); do
+        vol=`$LFS df $ROOT | grep OST000$i | awk '{print $3}'`
+        nbkb=$(($trig_kb + 1024*$i - $vol))
+        nbmb=$(($nbkb/1024+1))
+        for f in $(seq 1 $nbmb); do
+            lfs setstripe -c 1 -o $i $ROOT/test_ost_order.ost_$i.$f || error "lfs setstripe"
+            dd if=/dev/zero of=$ROOT/test_ost_order.ost_$i.$f bs=1M count=$nbmb || error "dd"
+        done
+    done
+
+    sync; clean_caches
+    wait_stable_df
+
+    # check thresholds only, then purge
+    for opt in "--check-thresholds" "--purge"; do
+        :> rh_purge.log
+        $RH -f ./cfg/$config_file $opt --once -l DEBUG -L rh_purge.log || error "command $opt error"
+        [ "$DEBUG" = "1" ] && cat rh_purge.log
+
+        # OSTs != 0 should be stated from the higher index to the lower
+        lastline=0
+        for i in $(seq 1 $maxidx); do
+            grep "High threshold reached on OST #$i" rh_purge.log || error "OST #$i should be reported over high threshold"
+            line=$(grep -n "High threshold reached on OST #$i" rh_purge.log | cut -d ':' -f 1)
+            if (( $lastline > 0 && $line > $lastline )); then
+                error "OST #$i: a lower OST idx has been reported in a previous line $lastline"
+            else
+                last_line=$line
+            fi
+        done
+
+        # OST0 should not be reported
+        grep "High threshold reached on OST #0" rh_purge.log && error "OST #0 should not be reported over threshold"
+    done
+
+}
+
 
 function test_trigger_check
 {
@@ -2791,6 +3081,7 @@ function test_trigger_check
 	# wait for df sync
 	sync
 	clean_caches
+	sync; clean_caches
 
 	if (( $is_hsmlite != 0 )); then
         # scan and sync
@@ -3088,6 +3379,7 @@ function test_info_collect
 		$RH -f ./cfg/$config_file --scan -l DEBUG -L rh_chglogs.log  --once || error ""
 		nb_cr=0
 	else
+        [ "$DEBUG" = "1" ] && $LFS changelog lustre
 		echo "1-Reading changelogs..."
 		#$RH -f ./cfg/$config_file --readlog -l DEBUG -L rh_chglogs.log  --once || error ""
 		$RH -f ./cfg/$config_file --readlog -l FULL -L rh_chglogs.log  --once || error ""
@@ -3101,7 +3393,7 @@ function test_info_collect
 
 	nb_create=`grep ChangeLog rh_chglogs.log | grep 01CREAT | wc -l`
 	nb_close=`grep ChangeLog rh_chglogs.log | grep 11CLOSE | wc -l`
-	nb_db_apply=`grep STAGE_DB_APPLY rh_chglogs.log | tail -1 | cut -d '|' -f 6 | cut -d ':' -f 2 |
+	nb_db_apply=`grep ': DB_APPLY' rh_chglogs.log | tail -1 | cut -d '|' -f 6 | cut -d ':' -f 2 |
                  cut -d ',' -f 1 | tr -d ' '`
 
     # (directories are always inserted since robinhood 2.4)
@@ -3115,8 +3407,11 @@ function test_info_collect
                 # CLOSE record is only expected since Lustre 2.2
                 # for previous versions, just display a warning
                 echo "warning: no close record (lustre version $LVERSION)"
-            else
+            elif [[ $LVERSION = 2.[234]* ]] ; then
+                # CLOSE is expected from 2.2 to 2.4
                 error ": unexpected number of close: $nb_close / 4"
+            else
+                echo "warning: no close record (lustre version $LVERSION)"
             fi
             return 1
         fi
@@ -3136,7 +3431,7 @@ function test_info_collect
 	check_db_error rh_chglogs.log
 
 	grep "DB query failed" rh_chglogs.log && error ": a DB query failed when scanning"
-	nb_db_apply=`grep STAGE_DB_APPLY rh_chglogs.log | tail -1 | cut -d '|' -f 6 | cut -d ':' -f 2 |
+	nb_db_apply=`grep ': DB_APPLY' rh_chglogs.log | tail -1 | cut -d '|' -f 6 | cut -d ':' -f 2 |
                  cut -d ',' -f 1 | tr -d ' '`
 
 	# 7 db operations expected (1 for each file and dir)
@@ -3148,9 +3443,10 @@ function test_info_collect
 	fi
 }
 
+
 function readlog_chk
 {
-	config_file=$1
+	local config_file=$1
 
 	echo "Reading changelogs..."
 	$RH -f ./cfg/$config_file --readlog -l FULL -L rh_chglogs.log  --once || error "reading logs"
@@ -3160,7 +3456,7 @@ function readlog_chk
 
 function scan_chk
 {
-	config_file=$1
+	local config_file=$1
 
 	echo "Scanning..."
         $RH -f ./cfg/$config_file --scan -l DEBUG -L rh_chglogs.log  --once || error "scanning filesystem"
@@ -3170,7 +3466,7 @@ function scan_chk
 
 function diff_chk
 {
-    config_file=$1
+    local config_file=$1
 
     echo "Scanning with rbh-diff..."
     $DIFF -f ./cfg/$config_file --apply=db -l DEBUG > rh_chglogs.log  2>&1 || error "scanning filesystem"
@@ -3235,6 +3531,470 @@ function test_info_collect2
 	fi
 }
 
+function get_db_info
+{
+    local config_file=$1
+    local field=$2
+    local entry=$3
+    
+    $REPORT -f ./cfg/$config_file -e $entry -c | egrep -E "^$field," | cut -d ',' -f 2 | sed -e 's/^ //g'
+}
+
+function test_root_changelog
+{
+	config_file=$1
+	clean_logs
+
+	if (( $no_log )); then
+    	echo "Changelogs not supported on this config: skipped"
+		set_skipped
+		return 1
+    fi
+
+    # create a directory and a file 
+    local d=$ROOT/subdir
+    local f=$ROOT/subdir/file
+    mkdir $d || error "creating directory $d"
+    id1=$(get_id $d)
+    touch $f || error "creating file $f"
+    id2=$(get_id $f)
+    idr=$(get_id $ROOT/.)
+
+    [ "$DEBUG" = "1" ] && echo -e "$ROOT: $idr\n$d: $id1\n$f: $id2"
+
+    # read the changelog
+    readlog_chk $config_file
+
+    # check the id, path and parent for $ROOT, $d and $f
+    idrb=$(get_db_info $config_file id $idr | tr -d '[]')
+    [ "$idr" = "$idrb" ] || error "id doesn't match: $idr != $idrb"
+    pathr=$(get_db_info $config_file path $idr)
+    # path must be empty or match $ROOT
+    [ "$pathr" = "" ] || [ "$pathr" = "$ROOT" ] || error "path doesn't match: $ROOT != $pathr"
+
+    # name and parent are supposed to be empty for ROOT
+    nr=$(get_db_info $config_file name $idr)
+    [ "$nr" = "" ] || error "name for $ROOT is not empty: '$nr'"
+    pr=$(get_db_info $config_file parent_id $idr)
+    [ "$pr" = "" ] || error "parent_id for $ROOT is not empty: '$pr'"
+
+    id1b=$(get_db_info $config_file id $id1 | tr -d '[]')
+    [ "$id1" = "$id1b" ] || error "id doesn't match: '$id1' != '$id1b'"
+    path1=$(get_db_info $config_file path $id1)
+    [ "$DEBUG" = "1" ] && echo "$d: path=$path1"
+    [ "$path1" = "$d" ] || error "path doesn't match: $d != $path1"
+    parent1=$(get_db_info $config_file parent_id $id1 | tr -d '[]')
+    [ "$DEBUG" = "1" ] && echo "$d: parent=$parent1"
+    [ "$parent1" = "$idr" ] || error "parent doesn't match: $idr != $parent1"
+
+    id2b=$(get_db_info $config_file id $id2 | tr -d '[]')
+    [ "$id2" = "$id2b" ] || error "id doesn't match: '$id2' != '$id2b'"
+    path2=$(get_db_info $config_file path $id2)
+    [ "$DEBUG" = "1" ] && echo "$f: path=$path2"
+    [ "$path2" = "$f" ] || error "path doesn't match: $f != $path2"
+    parent2=$(get_db_info $config_file parent_id $id2 | tr -d '[]')
+    [ "$DEBUG" = "1" ] && echo "$f: parent=$parent2"
+    [ "$parent2" = "$id1" ] || error "parent doesn't match: $id1 != $parent2"
+
+    # generate an event on $ROOT and do the checks again
+    touch $ROOT/.
+    sleep 1
+    # read the changelog
+    readlog_chk $config_file
+    
+    # check the id, path and parent for $ROOT, $d and $f
+    idrb=$(get_db_info $config_file id $idr | tr -d '[]')
+    [ "$idr" = "$idrb" ] || error "id doesn't match: $idr != $idrb"
+    pathr=$(get_db_info $config_file path $idr)
+    # path must be empty or match $ROOT
+    [ "$pathr" = "" ] || [ "$pathr" = "$ROOT" ] || error "path doesn't match: $ROOT != $pathr"
+
+    # name and parent are supposed to be empty for ROOT
+    nr=$(get_db_info $config_file name $idr)
+    [ "$nr" = "" ] || error "name for $ROOT is not empty: '$nr'"
+    pr=$(get_db_info $config_file parent_id $idr)
+    [ "$pr" = "" ] || error "parent_id for $ROOT is not empty: '$pr'"
+
+    id1b=$(get_db_info $config_file id $id1 | tr -d '[]')
+    [ "$id1" = "$id1b" ] || error "id doesn't match: '$id1' != '$id1b'"
+    path1=$(get_db_info $config_file path $id1)
+    [ "$DEBUG" = "1" ] && echo "$d: path=$path1"
+    [ "$path1" = "$d" ] || error "path doesn't match: $d != $path1"
+    parent1=$(get_db_info $config_file parent_id $id1 | tr -d '[]')
+    [ "$DEBUG" = "1" ] && echo "$d: parent=$parent1"
+    [ "$parent1" = "$idr" ] || error "parent doesn't match: $idr != $parent1"
+
+    id2b=$(get_db_info $config_file id $id2 | tr -d '[]')
+    [ "$id2" = "$id2b" ] || error "id doesn't match: '$id2' != '$id2b'"
+    path2=$(get_db_info $config_file path $id2)
+    [ "$DEBUG" = "1" ] && echo "$f: path=$path2"
+    [ "$path2" = "$f" ] || error "path doesn't match: $f != $path2"
+    parent2=$(get_db_info $config_file parent_id $id2 | tr -d '[]')
+    [ "$DEBUG" = "1" ] && echo "$f: parent=$parent2"
+    [ "$parent2" = "$id1" ] || error "parent doesn't match: $id1 != $parent2"
+}
+
+function partial_paths
+{
+	config_file=$1
+	clean_logs
+
+    # create a tree
+    mkdir -p $ROOT/dir1/dir2
+    mkdir -p $ROOT/dir3
+    touch $ROOT/file1
+    touch $ROOT/dir1/file2
+    touch $ROOT/dir1/dir2/file3
+    touch $ROOT/dir3/file4
+
+    # initial scan
+    $RH -f ./cfg/$config_file --scan --once -l EVENT -L rh_scan.log  || error "performing inital scan"
+    check_db_error rh_scan.log
+
+    # remove a path component from the DB
+    id=$(get_id $ROOT/dir1/dir2)
+    [ -z $id ] && error "could not get id"
+    # FIXEME only for Lustre 2.x
+    mysql robinhood_lustre -e "DELETE FROM NAMES WHERE id='$id'" || error "DELETE request"
+
+	if (( $is_hsmlite + $is_lhsm > 0 )); then
+        # check how a child entry is archived
+        $RH -f ./cfg/$config_file --sync -l DEBUG -L rh_migr.log
+        check_db_error rh_migr.log
+        if (( $is_hsmlite > 0 )); then
+            name=$(find $BKROOT -type f -name "file3__*")
+            cnt=$(echo $name | wc -w)
+            (( $cnt == 1 )) || error "1 file expected to match file 3 in backend, $cnt found"
+            echo "file3 archived as $name"
+        fi
+    fi
+
+    # check what --dump reports
+    f3=$($REPORT -f ./cfg/$config_file --dump --csv -q | grep "file3" | awk '{print $(NF)}')
+    echo "file3 reported with path $f3"
+    [[ $f3 = /* ]] && [[ $f3 != $ROOT/dir1/dir2/file3 ]] && error "$f3 : invalid fullpath"
+    
+    # check filter path behavior
+    # should report at least file2 (and optionnally file3 : must check its path is valid)
+    f2=$($REPORT -f ./cfg/$config_file --dump --csv -q -P "$ROOT/dir1" | grep file2 | awk '{print $(NF)}')
+    [[ -n $f2 ]] && echo "file2 reported with path $f2"
+    [[ $f2 != $ROOT/dir1/file2 ]] && error "wrong path reported for file2: $f2"
+
+    f3=$($REPORT -f ./cfg/$config_file --dump --csv -q -P "$ROOT/dir1" | grep file3 | awk '{print $(NF)}')
+    [[ -n $f3 ]] && echo "file3 reported with path $f3"
+    [[ $f3 = /* ]] && [[ $f3 != $ROOT/dir1/dir2/file3 ]] && error "$f3 : invalid fullpath"
+
+    f3=$($REPORT -f ./cfg/$config_file --dump --csv -q -P "$ROOT/dir1/dir2" | grep file)
+    [[ -n $f3 ]] && echo "file3 reported with path $f3"
+    [[ $f3 = /* ]] && [[ $f3 != $ROOT/dir1/dir2/file3 ]] && error "$f3 : invalid fullpath"
+
+    # check find behavior
+    # find cannot go into dir2
+    $FIND -f ./cfg/$config_file $ROOT/dir1 | grep dir2 && echo "$ROOT/dir1/dir2 reported?!"
+    # starting from dir2 fid, it can list file3 in it
+    f3=$($FIND -f ./cfg/$config_file $ROOT/dir1/dir2 | grep file3)
+    echo "find: $f3"
+    [[ $f3 = $ROOT/dir1/dir2/file3 ]] || error "$f3 : invalid fullpath"
+
+    # like find, should count file3
+    fc=$($DU -d -f ./cfg/$config_file $ROOT/dir1/dir2 | grep "file count" | cut -d ':' -f 2 | cut -d ',' -f 1)
+    [[ $fc = 1 ]] || error "expected filecount in $ROOT/dir1/dir2: 1 (got $fc)"
+
+    # check -e report
+    # dir2 should be in DB, even with no path
+    $REPORT -f ./cfg/$config_file --csv -e "$ROOT/dir1/dir2" | grep "md updt" || error "$ROOT/dir1/dir2 should have a DB entry"
+
+    $REPORT -f ./cfg/$config_file --csv -e "$ROOT/dir1/dir2/file3"  > report.log || error "report error for $ROOT/dir1/dir2/file3"
+    grep "md updt" report.log || error "$ROOT/dir1/dir2/file3 should have a DB entry"
+    f3=$(egrep "^path," report.log)
+    [[ $f3 = /* ]] && [[ $f3 != $ROOT/dir1/dir2/file3 ]] && error "$f3 : invalid fullpath"
+	if (( $is_hsmlite > 0 )); then
+        b3=$(grep "backend_path," report.log | cut -d ',' -f 2)
+        # b3 should be in 'dir2' or in '__unknown_path'
+        echo $b3 | egrep "dir1/dir2|unknown_path" || error "unexpected backend path $b3"
+    fi
+
+    # check what rm does (+undelete)
+	if (( $no_log==0 )); then
+	   $LFS changelog_clear lustre-MDT0000 cl1 0
+
+        rm -f $ROOT/dir1/dir2/file3
+        readlog_chk $config_file 
+
+	    if (( $is_lhsm + $is_hsmlite > 0 )); then
+            $REPORT -f ./cfg/$config_file -Rcq > report.log
+            nb=$(cat report.log | grep file3 | wc -l)
+            (($nb == 1)) || error "file3 not reported in remove-pending list"
+            f3=$(cut -d "," -f 3 report.log)
+            [[ $f3 = /* ]] && [[ $f3 != $ROOT/dir1/dir2/file3 ]] && error "$f3 : invalid fullpath"
+        fi
+
+        if (( $is_hsmlite > 0 )); then
+            b3=$(cut -d "," -f 6 report.log)
+            echo $b3 | egrep "dir1/dir2|unknown_path" || error "unexpected backend path $b3"
+
+            b3=$($UNDELETE -f ./cfg/$config_file -L '*/file3' | grep "Backend path" | cut -d ':' -f 2- | tr -d ' ')
+            echo $b3 | egrep "dir1/dir2|unknown_path" || error "unexpected backend path $b3"
+
+            $UNDELETE -f ./cfg/$config_file -R '*/file3' -l DEBUG || error "undeleting file3"
+            find $ROOT -name "file3" -ls | tee report.log
+            (( $(wc -l report.log | awk '{print $1}') == 1 )) || error "file3 not restored"
+        fi
+	fi
+    
+    # TODO check disaster recovery
+    
+    rm -f report.log
+}
+
+function test_mnt_point
+{
+	config_file=$1
+	clean_logs
+
+    export fs_path=$ROOT/subdir # retrieved from env when parsing config file
+
+    local dir_rel="dir1 dir2"
+    local file_rel="dir1/file.1 dir1/file.2 dir2/file.3 file.4"
+
+    for d in $dir_rel; do
+        mkdir -p $fs_path/$d || error mkdir
+    done
+    for f in $file_rel; do
+        touch $fs_path/$f || error touch
+    done
+
+    # scan the filesystem
+    $RH -f ./cfg/$config_file --scan --once -l EVENT -L rh_scan.log  || error "performing inital scan"
+    check_db_error rh_scan.log
+
+    # check that rbh-find output is correct (2 methods)
+    for opt in "-nobulk $fs_path" "$fs_path" "-nobulk" ""; do
+        echo "checking output for rbh-find $opt..."
+        $FIND -f ./cfg/$config_file $opt > rh_report.log
+        for e in $dir_rel $file_rel; do
+            egrep -E "^$fs_path/$e$" rh_report.log || error "$e not found in rbh-find output"
+        done
+    done
+
+    # check that rbh-report output is correct
+    $REPORT -f ./cfg/$config_file -q --dump | awk '{print $(NF)}'> rh_report.log
+    [ "$DEBUG" = "1" ] && cat rh_report.log
+    for e in $dir_rel $file_rel; do
+        egrep -E "^$fs_path/$e$" rh_report.log || error "$e not found in report output"
+    done
+
+    # backup: check that backend path is correct
+    if (( $is_hsmlite > 0 )); then
+        # wait atime > 1s
+        sleep 1
+        $RH -f ./cfg/$config_file --sync -l DEBUG -L rh_migr.log
+        check_db_error rh_migr.log
+
+        for e in $file_rel; do
+            ls -d $BKROOT/${e}__* || error "$BKROOT/$e* not found in backend"
+        done
+    fi
+}
+
+function check_status_count
+{
+    report=$1
+    status=$2
+    count=$3
+
+    nst=$(grep -E "^$status" $report | cut -d ',' -f 3 | tr -d ' ')
+    [ -z "$nst" ] && nst=0
+
+    [ "$DEBUG" = "1" ] && echo "$status: $nst"
+    [ "$nst" = "$count" ] || error "Expected $count $status, got $nst"
+}
+
+function test_compress
+{
+	config_file=$1
+	clean_logs
+
+	if (( $is_hsmlite == 0 )); then
+    	echo "compression is only available with backup mode"
+		set_skipped
+		return 1
+    fi
+
+    local dir_rel="dir1 dir2"
+    local file_rel="dir1/file.1 dir1/file.2 dir2/file.3 file.4"
+    local file_rel_mod="dir1/file.1 file.4"
+    local file_rel_new="dir1/file.5 dir1/file.6 dir2/file.7"
+
+    src_file="/etc/hosts"
+
+    # populate the filesystem
+    for d in $dir_rel; do
+        mkdir -p $ROOT/$d || error mkdir
+    done
+    for f in $file_rel; do
+        /bin/cp $src_file $ROOT/$f || error cp
+    done
+
+    # scan the filesystem (compress=no)
+    export compress=no
+    $RH -f ./cfg/$config_file --scan --once -l EVENT -L rh_scan.log  || error "performing inital scan"
+    check_db_error rh_scan.log
+
+    # check file status
+    $REPORT -f ./cfg/$config_file -i -q | grep 'file,' > report.out
+    check_status_count report.out new 4
+
+    # check how a child entries is archived
+    $RH -f ./cfg/$config_file --sync -l DEBUG -L rh_migr.log
+    check_db_error rh_migr.log
+
+    # check file status
+    $REPORT -f ./cfg/$config_file -i -q | grep 'file,' > report.out
+    check_status_count report.out synchro 4
+
+    # no compressed file names expected xxxx__<fid>z
+    name_comp=$(find $BKROOT -type f -name "*z" | wc -l)
+    name_ncomp=$(find $BKROOT -type f -name "*[0-9]" | wc -l)
+    type_comp=$(find $BKROOT -type f -exec file {} \; | grep "gzip compressed data" | wc -l)
+    type_ncomp=$(find $BKROOT -type f -exec file {} \; | grep "ASCII" | wc -l)
+
+    (( $name_comp == 0 )) || error "No compressed file name expected in backend: found $name_comp"
+    (( $type_comp == 0 )) || error "No compressed file data expected in backend: found $type_comp"
+    (( $name_ncomp == 4 )) || error "4 non-compressed file names expected in backend: found $name_ncomp"
+    (( $type_ncomp == 4 )) || error "4 ASCII file data expected in backend: found $type_ncomp"
+    
+    # turn compression on
+    export compress=yes
+
+    # modify some files, create new files
+    for f in $file_rel_mod; do
+        cat $src_file >> $ROOT/$f || error "appending $f"
+    done
+    for f in $file_rel_new; do
+        /bin/cp $src_file $ROOT/$f || error "creating $f"
+    done
+
+    # scan the file system and check file status
+    $RH -f ./cfg/$config_file --scan --once -l EVENT -L rh_scan.log  || error "performing 2nd scan"
+    check_db_error rh_scan.log
+
+    # check file status
+    $REPORT -f ./cfg/$config_file -i -q | grep 'file,' > report.out
+    check_status_count report.out synchro 2
+    check_status_count report.out modified 2
+    check_status_count report.out new 3
+
+    # archive all dirty data and check status
+    $RH -f ./cfg/$config_file --sync -l DEBUG -L rh_migr.log
+    check_db_error rh_migr.log
+
+    # check file status
+    $REPORT -f ./cfg/$config_file -i -q | grep 'file,' > report.out
+    check_status_count report.out synchro 7
+
+    # check backend files
+    name_comp=$(find $BKROOT -type f -name "*z" | wc -l)
+    name_ncomp=$(find $BKROOT -type f -name "*[0-9]" | wc -l)
+    type_comp=$(find $BKROOT -type f -exec file {} \; | grep "gzip compressed data" | wc -l)
+    type_ncomp=$(find $BKROOT -type f -exec file {} \; | grep "ASCII" | wc -l)
+
+    # 2 already archived: uncompresssed
+    # 2 modified: compressed
+    # 3 new: compressed
+    (( $name_comp == 5 )) || error "5 compressed file names expected in backend: found $name_comp"
+    (( $type_comp == 5 )) || error "5 compressed file data expected in backend: found $type_comp"
+    (( $name_ncomp == 2 )) || error "2 non-compressed file names expected in backend: found $name_ncomp"
+    (( $type_ncomp == 2 )) || error "2 ASCII file data expected in backend: found $type_ncomp"
+
+    # turn compression off compression, make some changes and check status again
+    for f in $file_rel_mod; do
+        cat $src_file >> $ROOT/$f || error "appending $f"
+    done
+
+    export compress=no
+    $RH -f ./cfg/$config_file --scan --once -l EVENT -L rh_scan.log  || error "performing inital scan"
+    check_db_error rh_scan.log
+
+    # check file status
+    $REPORT -f ./cfg/$config_file -i -q | grep 'file,' > report.out
+    check_status_count report.out synchro 5
+    check_status_count report.out modified 2
+
+    $RH -f ./cfg/$config_file --sync -l DEBUG -L rh_migr.log
+    check_db_error rh_migr.log
+
+    # check backend files
+    name_comp=$(find $BKROOT -type f -name "*z" | wc -l)
+    name_ncomp=$(find $BKROOT -type f -name "*[0-9]" | wc -l)
+    type_comp=$(find $BKROOT -type f -exec file {} \; | grep "gzip compressed data" | wc -l)
+    type_ncomp=$(find $BKROOT -type f -exec file {} \; | grep "ASCII" | wc -l)
+
+    # 2 archived at first: uncompresssed
+    # 2 modified: uncompressed
+    # 3 archived at step 2: compressed
+    (( $name_comp == 3 )) || error "3 compressed file names expected in backend: found $name_comp"
+    (( $type_comp == 3 )) || error "3 compressed file data expected in backend: found $type_comp"
+    (( $name_ncomp == 4 )) || error "4 non-compressed file names expected in backend: found $name_ncomp"
+    (( $type_ncomp == 4 )) || error "4 ASCII file data expected in backend: found $type_ncomp"
+
+    # check file status
+    $REPORT -f ./cfg/$config_file -i -q | grep 'file,' > report.out
+    check_status_count report.out synchro 7
+
+    # test disaster recovery with compressed files
+    local before=/tmp/before.$$
+    local after=/tmp/after.$$
+    local diff=/tmp/diff.$$
+    # shots before disaster (time is only significant for files)
+    find $ROOT -type f -printf "%n %m %T@ %g %u %s %p %l\n" > $before
+    find $ROOT -type d -printf "%n %m %g %u %s %p %l\n" >> $before
+    find $ROOT -type l -printf "%n %m %g %u %s %p %l\n" >> $before
+
+    # perform 2 disaster recovery with compress=yes and compress=no
+    for c in yes no; do
+        export compress=$c
+        # FS disaster
+        if [[ -n "$ROOT" ]]; then
+            echo "Disaster: all FS content is lost"
+            rm  -rf $ROOT/*
+        fi
+
+        # perform the recovery
+        echo "Performing recovery (compress=$c)..."
+        cp /dev/null recov.log
+        $RECOV -f ./cfg/$config_file --start -l DEBUG >> recov.log 2>&1 || error "Error starting recovery"
+        $RECOV -f ./cfg/$config_file --resume -l DEBUG >> recov.log 2>&1 || error "Error performing recovery"
+        $RECOV -f ./cfg/$config_file --complete -l DEBUG >> recov.log 2>&1 || error "Error completing recovery"
+
+        find $ROOT -type f -printf "%n %m %T@ %g %u %s %p %l\n" > $after
+        find $ROOT -type d -printf "%n %m %g %u %s %p %l\n" >> $after
+        find $ROOT -type l -printf "%n %m %g %u %s %p %l\n" >> $after
+
+        diff  $before $after > /tmp/diff.$$ || error "unexpected differences between initial and final state"
+        [ "$DEBUG" = "1" ] && cat /tmp/diff.$$
+
+        # check that no file in Lustre is restored as compressed file
+        lucomp=$(find $ROOT -type f -exec file {} \; | grep "gzip compressed data" | wc -l)
+        (( $lucomp == 0 )) || error "No compressed file expected in Lustre"
+
+        # check backend files
+        # check all *z files are compressed
+        type_comp=$(find $BKROOT -type f -name "*z" -exec file {} \; | grep -v "gzip compressed data" | wc -l)
+        (( $type_comp == 0 )) || error "Some __<fid>z files are not compressed data"
+        # check all *0x0 files are uncompressed
+        type_ncomp=$(find $BKROOT -type f -name "*[0-9]" -exec file {} \; | grep "gzip compressed data" | wc -l)
+        (( $type_ncomp == 0 )) || error "Some __<fid> files are actually compressed data"
+        # check counts
+        name_comp=$(find $BKROOT -type f -name "*z" | wc -l)
+        name_ncomp=$(find $BKROOT -type f -name "*[0-9]" | wc -l)
+        (( $name_comp == 3 )) || error "3 compressed file names expected in backend: found $name_comp"
+        (( $name_ncomp == 4 )) || error "4 non-compressed file names expected in backend: found $name_ncomp"
+    done
+
+    rm -f report.out $before $after $diff
+}
+
 function test_enoent
 {
 	config_file=$1
@@ -3267,6 +4027,7 @@ function test_enoent
 
 	$REPORT -f ./cfg/$config_file --dump-all -cq > report.out || error "report cmd failed"
     lines=$(cat report.out | wc -l)
+    [ "$DEBUG" = "1" ] && cat report.out
     (($lines == 0)) || error "no entries expected after create/rm"
     rm -f report.out
 
@@ -3569,7 +4330,7 @@ function test_rename
     $REPORT -f ./cfg/$config_file --dump-all -q > report.out || error "$REPORT"
     [ "$DEBUG" = "1" ] && cat report.out
 
-    $FIND -f ./cfg/$config_file $ROOT -ls > find.out || error "$FIND"
+    $FIND -f ./cfg/$config_file $ROOT -ls -nobulk > find.out || error "$FIND"
     [ "$DEBUG" = "1" ] && cat find.out
 
     # checking all objects in reports
@@ -3636,7 +4397,7 @@ function test_rename
     $REPORT -f ./cfg/$config_file --dump-all -q > report.out || error "$REPORT"
     [ "$DEBUG" = "1" ] && cat report.out
 
-    $FIND -f ./cfg/$config_file $ROOT -ls > find.out || error "$FIND"
+    $FIND -f ./cfg/$config_file $ROOT -nobulk -ls > find.out || error "$FIND"
     [ "$DEBUG" = "1" ] && cat find.out
 
     # checking all objects in reports
@@ -3670,8 +4431,8 @@ function test_rename
     [ -z "$count_nb_final" ] && count_nb_final=$(wc -l report.out | awk '{print $1}')
     count_path_final=$(wc -l find.out | awk '{print $1}')
 
-    (( $count_nb_final == $count_nb_init - 1)) || error "1 entry should have been removed (rename target)"
-    (( $count_path_final == $count_path_init - 2)) || error "2 paths should have been removed (rename target)"
+    (( $count_nb_final == $count_nb_init - 1)) || error "1 entry should have been removed (rename target), got $(($count_nb_init - $count_nb_final))"
+    (( $count_path_final == $count_path_init - 2)) || error "2 paths should have been removed (rename target), got $(( $count_path_init - $count_path_final ))"
 
     rm -f report.out find.out
 }
@@ -3695,28 +4456,28 @@ function test_unlink
 
 	# Check nlink == 2
     $RH -f ./cfg/$config_file --readlog --once -l DEBUG -L rh_scan.log || error "reading changelog"
-	$FIND -f ./cfg/$config_file $ROOT/foo1 -l > report.out || error "$REPORT"
+	$FIND -f ./cfg/$config_file $ROOT/foo1 -nobulk -ls > report.out || error "$REPORT"
 	nlink=$( cat report.out | awk '{ print $4; }' )
 	(( $nlink == 2 )) || error "nlink should be 2 instead of $nlink"
 
 	# Remove one file and check nlink == 1
 	rm "$ROOT/foo2"
     $RH -f ./cfg/$config_file --readlog --once -l DEBUG -L rh_scan.log || error "reading changelog"
-	$FIND -f ./cfg/$config_file $ROOT/foo1 -l > report.out || error "$REPORT"
+	$FIND -f ./cfg/$config_file $ROOT/foo1 -nobulk -ls > report.out || error "$REPORT"
 	nlink=$( cat report.out | awk '{ print $4; }' )
 	(( $nlink == 1 )) || error "nlink should be 1 instead of $nlink"
 
 	# Add a new hard link and check nlink == 2
 	ln "$ROOT/foo1" "$ROOT/foo3"
     $RH -f ./cfg/$config_file --readlog --once -l DEBUG -L rh_scan.log || error "reading changelog"
-	$FIND -f ./cfg/$config_file $ROOT/foo1 -l > report.out || error "$REPORT"
+	$FIND -f ./cfg/$config_file $ROOT/foo1 -nobulk -ls > report.out || error "$REPORT"
 	nlink=$( cat report.out | awk '{ print $4; }' )
 	(( $nlink == 2 )) || error "nlink should be 1 instead of $nlink"
 
 	# Remove one file and check nlink == 1
 	rm "$ROOT/foo3"
     $RH -f ./cfg/$config_file --readlog --once -l DEBUG -L rh_scan.log || error "reading changelog"
-	$FIND -f ./cfg/$config_file $ROOT/foo1 -l > report.out || error "$REPORT"
+	$FIND -f ./cfg/$config_file $ROOT/foo1 -nobulk -ls > report.out || error "$REPORT"
 	nlink=$( cat report.out | awk '{ print $4; }' )
 	(( $nlink == 1 )) || error "nlink should be 1 instead of $nlink"
 
@@ -3725,7 +4486,7 @@ function test_unlink
 	rm "$ROOT/foo2"
 	# check nlink == 1
 	$RH -f ./cfg/$config_file --readlog --once -l DEBUG -L rh_scan.log || error "reading changelog"
-	$FIND -f ./cfg/$config_file $ROOT/foo1 -l > report.out || error "$REPORT"
+	$FIND -f ./cfg/$config_file $ROOT/foo1 -nobulk -ls > report.out || error "$REPORT"
 	nlink=$( cat report.out | awk '{ print $4; }' )
 	(( $nlink == 1 )) || error "nlink should be 1 instead of $nlink"
 
@@ -3852,7 +4613,7 @@ function test_hardlinks
     $REPORT -f ./cfg/$config_file --dump-all -q > report.out || error "$REPORT"
     [ "$DEBUG" = "1" ] && cat report.out
 
-    $FIND -f ./cfg/$config_file $ROOT -ls > find.out || error "$FIND"
+    $FIND -f ./cfg/$config_file $ROOT -nobulk -ls > find.out || error "$FIND"
     [ "$DEBUG" = "1" ] && cat find.out
 
     # checking all objects in reports
@@ -3944,7 +4705,7 @@ function test_hardlinks
     $REPORT -f ./cfg/$config_file --dump-all -q > report.out || error "$REPORT"
     [ "$DEBUG" = "1" ] && cat report.out
 
-    $FIND -f ./cfg/$config_file $ROOT -ls > find.out || error "$FIND"
+    $FIND -f ./cfg/$config_file $ROOT -nobulk -ls > find.out || error "$FIND"
     [ "$DEBUG" = "1" ] && cat find.out
 
 
@@ -4038,9 +4799,9 @@ function test_hl_count
     #   dump report with path filter (3 entries)
     (($($REPORT -f ./cfg/$config_file -D -q -P $ROOT/dir.1 | wc -l) == $ino_subdir )) || error "wrong count in 'rbh-report -D -P <path>' output"
     #   dump find output (whole FS) (10 entries, incl. root)
-    (($($FIND -f ./cfg/$config_file | wc -l) == $ino + 1))  || error "wrong count in 'rbh-find' output"
+    (($($FIND -f ./cfg/$config_file -nobulk | wc -l) == $ino + 1))  || error "wrong count in 'rbh-find' output"
     #   dump find output (subdir: 3 entries)
-    (($($FIND -f ./cfg/$config_file $ROOT/dir.1 | wc -l) == $ino_subdir )) || error "wrong count in 'rbh-find <path>' output"
+    (($($FIND -f ./cfg/$config_file $ROOT/dir.1 -nobulk | wc -l) == $ino_subdir )) || error "wrong count in 'rbh-find <path>' output"
 
     #   dump summary (9 entries)
     $REPORT -f ./cfg/$config_file -icq > report.out
@@ -4080,9 +4841,9 @@ function test_hl_count
     #   dump report with path filter (still 3 entries)
     (($($REPORT -f ./cfg/$config_file -D -q -P $ROOT/dir.1 | wc -l) == $ino_subdir )) || error "wrong count in 'rbh-report -D -P <path>' output"
     #   dump find output (whole FS) (
-    (($($FIND -f ./cfg/$config_file | wc -l) == $paths + 1 ))  || error "wrong count in 'rbh-find' output"
+    (($($FIND -f ./cfg/$config_file -nobulk | wc -l) == $paths + 1 ))  || error "wrong count in 'rbh-find' output"
     #   dump find output (subdir: 3 entries)
-    (($($FIND -f ./cfg/$config_file $ROOT/dir.1 | wc -l) == $paths_subdir )) || error "wrong count in 'rbh-find <path>' output"
+    (($($FIND -f ./cfg/$config_file $ROOT/dir.1 -nobulk | wc -l) == $paths_subdir )) || error "wrong count in 'rbh-find <path>' output"
 
     #   dump summary (9 entries)
     $REPORT -f ./cfg/$config_file -icq > report.out
@@ -4374,13 +5135,25 @@ function test_logs
             # wait for syslog to flush logs to disk
             sync; sleep 2
 			tail -n +"$init_msg_idx" /var/log/messages | grep $CMD > /tmp/extract_all
+            
 			egrep -v 'ALERT' /tmp/extract_all | grep  ': [A-Za-Z0-9_ ]* \|' > /tmp/extract_log
 			egrep -v 'ALERT|: [A-Za-Z0-9_ ]* \|' /tmp/extract_all > /tmp/extract_report
 			grep 'ALERT' /tmp/extract_all > /tmp/extract_alert
+
+            if [ "$DEBUG" = "1" ]; then
+                echo "----- syslog alerts:" ; cat /tmp/extract_alert
+                echo "----- syslog actions:" ; cat /tmp/extract_report
+                echo "----- syslog traces:" ; cat /tmp/extract_log
+            fi
 		elif (( $stdio )); then
 			grep ALERT /tmp/rbh.stdout > /tmp/extract_alert
-			# grep 'robinhood\[' => don't select lines with no headers
-			grep -v ALERT /tmp/rbh.stdout | grep "$CMD[^ ]*\[" > /tmp/extract_report
+			# grep [22909/8] => don't select lines with no headers
+			grep -v ALERT /tmp/rbh.stdout | grep "\[[0-9]*/[0-9]*\]" > /tmp/extract_report
+            if [ "$DEBUG" = "1" ]; then
+                echo "----- stdio alerts:" ; cat /tmp/extract_alert
+                echo "----- stdio actions:" ; cat /tmp/extract_report
+                echo "----- stdio (all):" ; cat /tmp/rbh.stdout
+            fi
 		fi
 
 		# check that there is something written in the log
@@ -5197,7 +5970,7 @@ function test_find
 	clean_logs
 
     # by default stripe all files on 0 and 1
-	$LFS setstripe --count 2 --offset 0 $ROOT || error "setting stripe on root"
+	$LFS setstripe --count 2 --offset 0 $ROOT || echo "error setting stripe on root"
     # 1) create a FS tree with several levels:
     #   root
     #       file.1
@@ -7974,7 +8747,9 @@ function TEST_OTHER_PARAMETERS_3
     # 1 file out of 5 must remain in the backend
     local countRemainFile=0
 	for i in ${rmd[*]}; do
-	    local found=`find $BKROOT -type f -name "$i" | wc -l`
+        bi=$(basename $i)
+        [ "$DEBUG" = "1" ] && find $BKROOT -type f -name "${bi}__*"
+	    local found=`find $BKROOT -type f -name "${bi}__*" | wc -l`
         (( $found != 0 )) && echo "$i remains in backend"
         ((countRemainFile+=$found))
 	done
@@ -7995,7 +8770,9 @@ function TEST_OTHER_PARAMETERS_3
     # no file must remain in the backend
     countRemainFile=0
 	for i in ${rmd[*]}; do
-	    local found=`find $BKROOT -type f -name "$i" | wc -l`
+        bi=$(basename $i)
+        [ "$DEBUG" = "1" ] && find $BKROOT -type f -name "${bi}__*"
+	    local found=`find $BKROOT -type f -name "${bi}__*" | wc -l`
         (( $found != 0 )) && echo "$i remains in backend"
         ((countRemainFile+=$found))
 	done
@@ -8221,6 +8998,9 @@ run_test 110     test_unlink info_collect.conf "unlink (readlog)"
 run_test 111     test_layout info_collect.conf "layout changes"
 run_test 112     test_hl_count info_collect.conf "reports with hardlinks"
 run_test 113     test_diff_apply_fs info_collect2.conf  "diff"  "rbh-diff --apply=fs"
+run_test 114     test_root_changelog info_collect.conf "changelog record on root entry"
+run_test 115     partial_paths info_collect.conf "test behavior when handling partial paths"
+run_test 116     test_mnt_point  test_mnt_point.conf "test with mount point != fs_path"
 
 #### policy matching tests  ####
 
@@ -8250,7 +9030,6 @@ run_test 216   test_maint_mode test_maintenance.conf 30 45 "pre-maintenance mode
 run_test 217	migrate_symlink test1.conf 31 		"symlink migration"
 run_test 218	test_rmdir 	rmdir.conf 16 		"rmdir policies"
 run_test 219    test_rmdir_mix RemovingDir_Mixed.conf 11 "mixed rmdir policies"
-
 # test sort order by last_archive, last_mod, creation
 # check order of application
 # check request splitting, optimizations, ...
@@ -8260,9 +9039,11 @@ run_test 220c test_lru_policy lru_sort_mod_2pass.conf "" "0 1 2 3 4 5 6 7 8 9" 3
 run_test 220d test_lru_policy lru_sort_access.conf "" "0 2 3 6 8 9" 20 "lru sort on last_access"
 run_test 220e test_lru_policy lru_sort_archive.conf "0 1 2 3 4 5 6 7 8 9" "" 15 "lru sort on last_archive"
 run_test 220f test_lru_policy lru_sort_creat_last_arch.conf "0 1 2 3" "4 5 6 7 8 9" 10 "lru sort on creation and last_archive==0"
-
 run_test 221  test_suspend_on_error migr_fail.conf  2 "suspend migration if too many errors"
 run_test 222  test_custom_purge test_custom_purge.conf 2 "custom purge command"
+run_test 223  test_default test_default_case.conf "ignore entries if no default case is specified"
+run_test 224  test_undelete test_rm1.conf   "undelete"
+run_test 225  test_compress compress.conf "compressed archived files"
 
 #### triggers ####
 
@@ -8270,6 +9051,7 @@ run_test 300	test_cnt_trigger test_trig.conf 151 21 "trigger on file count"
 run_test 301    test_ost_trigger test_trig2.conf 150 110 "trigger on OST usage"
 run_test 302	test_trigger_check test_trig3.conf 60 110 "triggers check only" 40 80 5 10 40
 run_test 303    test_periodic_trigger test_trig4.conf 35 "periodic trigger"
+run_test 304    test_ost_order test_trig2.conf "OST purge order"
 
 
 #### reporting ####

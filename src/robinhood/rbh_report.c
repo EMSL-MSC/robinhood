@@ -186,32 +186,32 @@ static struct option option_tab[] = {
 static const char *help_string =
     _B "Usage:" B_ " %s [options]\n"
     "\n"
-    _B "Stats switches:" B_ "\n"
+    _B "Available stats:" B_ "\n"
     "    " _B "--activity" B_ ", " _B "-a" B_ "\n"
-    "        Display stats abount daemon's activity.\n"
+    "        Display stats about daemon activity.\n"
     "    " _B "--fs-info" B_ ", " _B "-i" B_ "\n"
-    "        Display filesystem content statistics.\n"
-    "    " _B "--class-info" B_ " [=" _U "fileclass" U_ "]\n"
-    "        Display Fileclasses summary. Use optional parameter " _U "fileclass" U_ "\n"
+    "        Display statistics about filesystem contents.\n"
+    "    " _B "--class-info" B_ "[=" _U "class_expr" U_ "]\n"
+    "        Display Fileclasses summary. Use optional parameter " _U "class_expr" U_ "\n"
     "        for retrieving stats about matching fileclasses.\n"
     "    " _B "--entry-info"B_ " "_U "path"U_"|"_U"id"U_", "
            _B "-e" B_ " "_U "path"U_"|"_U"id"U_"\n"
-    "        Display all information about entry.\n"
-    "    " _B "--user-info" B_ " [=" _U "user" U_ "], " _B "-u" B_ " " _U "user" U_ "\n"
-    "        Display user statistics. Use optional parameter " _U "user" U_ " for retrieving stats about a single user.\n"
-    "    " _B "--group-info" B_ " [=" _U "group" U_ "], " _B "-g" B_ " " _U "group" U_ "\n"
-    "        Display group statistics. Use optional parameter " _U "group" U_ " for retrieving stats about a single group.\n"
-    "    " _B "--top-dirs" B_ " [=" _U "count" U_ "], " _B "-d" B_ " " _U "count" U_ "\n"
+    "        Display all information about the given entry.\n"
+    "    " _B "--user-info" B_ "[=" _U "username" U_ "], " _B "-u" B_ " " _U "username" U_ "\n"
+    "        Display user statistics. Use optional parameter " _U "username" U_ " for retrieving stats about a single user.\n"
+    "    " _B "--group-info" B_ "[=" _U "groupname" U_ "], " _B "-g" B_ " " _U "groupname" U_ "\n"
+    "        Display group statistics. Use optional parameter " _U "groupname" U_ " for retrieving stats about a single group.\n"
+    "    " _B "--top-dirs" B_ "[=" _U "cnt" U_ "], " _B "-d" B_ " " _U "cnt" U_ "\n"
     "        Display largest directories. Optional argument indicates the number of directories to be returned (default: 20).\n"
-    "    " _B "--top-size" B_ " [=" _U "count" U_ "], " _B "-s" B_ " " _U "count" U_ "\n"
+    "    " _B "--top-size" B_ "[=" _U "cnt" U_ "], " _B "-s" B_ " " _U "cnt" U_ "\n"
     "        Display largest files. Optional argument indicates the number of files to be returned (default: 20).\n"
-    "    " _B "--top-purge" B_ " [=" _U "count" U_ "], " _B "-p" B_ " " _U "count" U_ "\n"
+    "    " _B "--top-purge" B_ "[=" _U "cnt" U_ "], " _B "-p" B_ " " _U "cnt" U_ "\n"
     "        Display oldest entries eligible for purge. Optional argument indicates the number of entries to be returned (default: 20).\n"
 #ifdef HAVE_RMDIR_POLICY
-    "    " _B "--top-rmdir" B_ " [=" _U "count" U_ "]\n"
+    "    " _B "--top-rmdir" B_ "[=" _U "cnt" U_ "]\n"
     "        Display oldest empty directories eligible for rmdir. Optional argument indicates the number of dirs to be returned (default: 20).\n"
 #endif
-    "    " _B "--top-users" B_ " [=" _U "count" U_ "], " _B "-U" B_ " " _U "count" U_ "\n"
+    "    " _B "--top-users" B_ "[=" _U "cnt" U_ "], " _B "-U" B_ " " _U "cnt" U_ "\n"
     "        Display top disk space consumers. Optional argument indicates the number of users to be returned (default: 20).\n"
 #ifdef HAVE_RM_POLICY
     "    " _B "--deferred-rm" B_ ", " _B "-R" B_ "\n"
@@ -219,9 +219,9 @@ static const char *help_string =
 #endif
     "    "  _B "--dump" B_ ", " _B "-D" B_ "\n"
     "        Dump all filesystem entries.\n"
-    "    "  _B "--dump-user" B_ " " _U "user" U_ "\n"
+    "    "  _B "--dump-user" B_ " " _U "username" U_ "\n"
     "        Dump all entries for the given user.\n"
-    "    "  _B "--dump-group" B_ " " _U "group" U_ "\n"
+    "    "  _B "--dump-group" B_ " " _U "groupname" U_ "\n"
     "        Dump all entries for the given group.\n"
 #ifdef _LUSTRE
     "    "  _B "--dump-ost" B_ " " _U "ost_index" U_ "|" _U "ost_set" U_"\n"
@@ -232,23 +232,23 @@ static const char *help_string =
     "        Dump all entries with the given status (%s).\n"
 #endif
     "\n"
+#ifdef HAVE_MIGR_POLICY
+    _B "Maintenance scheduling:" B_ "\n"
+    "    " _B "--next-maintenance[="B_ _U"date_time"U_"]\n"
+    "        Set/display time of the next maintenance.\n"
+    "        Expected "_U"date_time"U_" format is yyyymmddHHMM[SS].\n"
+    "    " _B "--cancel-maintenance"B_"\n"
+    "        Cancel the next scheduled maintenance.\n\n"
+#endif
     _B "Filter options:" B_ "\n"
-    "The following filters can be specified for reports:\n"
+    "    The following filters can be specified for reports:\n"
     "    " _B "-P" B_ " " _U "path" U_ ", " _B "--filter-path" B_ " " _U "path" U_ "\n"
     "        Display the report only for objects in the given path.\n"
-    "    " _B "-C" B_ " " _U "class" U_ ", " _B "--filter-class" B_ " " _U "class" U_ "\n"
-    "        Report only entries in the given FileClass.\n"
+    "    " _B "-C" B_ " " _U "class_expr" U_ ", " _B "--filter-class" B_ " " _U "class_expr" U_ "\n"
+    "        Only report entries in the matching fileclasses.\n"
     "    " _B "--count-min" B_ " "_U"cnt"U_"\n"
     "        Display only topuser/userinfo with at least "_U"cnt"U_" entries\n\n"
     "\n"
-#ifdef HAVE_MIGR_POLICY
-    _B "Pre-maintenance commands:" B_ "\n"
-    "    " _B "--next-maintenance[="B_ _U"date_time"U_"]\n"
-    "        Set/display time of next maintenance.\n"
-    "        Expected "_U"date_time"U_" format is yyyymmddHHMM[SS].\n"
-    "    " _B "--cancel-maintenance"B_"\n"
-    "        Cancel next maintenance.\n\n"
-#endif
     _B "Accounting report options:" B_ "\n"
     "    " _B "--size-profile" B_ ", "_B "--szprof" B_ "\n"
     "        Display size profile statistics\n"
@@ -284,7 +284,7 @@ static const char *help_string =
     "    " _B "-F" B_ ", " _B "--force-no-acct" B_ "\n"
     "        Generate the report without using accounting table (slower)\n\n"
     _B "Config file options:" B_ "\n"
-    "    " _B "-f" B_ " " _U "file" U_ ", " _B "--config-file=" B_ _U "file" U_ "\n"
+    "    " _B "-f" B_ " " _U "cfg_file" U_ ", " _B "--config-file=" B_ _U "cfg_file" U_ "\n"
     "        Path to configuration file (or short name).\n"
     "\n"
     _B "Output format options:" B_ "\n"
@@ -294,7 +294,7 @@ static const char *help_string =
     "        Don't display column headers/footers\n"
     "\n"
     _B "Miscellaneous options:" B_ "\n"
-    "    " _B "-l" B_ " " _U "level" U_ ", " _B "--log-level=" B_ _U "level" U_ "\n"
+    "    " _B "-l" B_ " " _U "loglevel" U_ ", " _B "--log-level=" B_ _U "loglevel" U_ "\n"
     "        Force the log verbosity level (overides configuration value).\n"
     "        Allowed values: CRIT, MAJOR, EVENT, VERB, DEBUG, FULL.\n"
     "    " _B "-h" B_ ", " _B "--help" B_ "\n"
@@ -1284,8 +1284,8 @@ static inline const char * attrindex2name(unsigned int index)
 #ifdef ATTR_INDEX_last_restore
         case ATTR_INDEX_last_restore: return "last_restore";
 #endif
-#ifdef ATTR_INDEX_backend_path
-        case ATTR_INDEX_backend_path: return "backend_path";
+#ifdef ATTR_INDEX_backendpath
+        case ATTR_INDEX_backendpath: return "backend_path";
 #endif
 
 
@@ -1343,8 +1343,8 @@ static inline unsigned int attrindex2len(unsigned int index, int csv)
 #ifdef ATTR_INDEX_last_restore
         case ATTR_INDEX_last_restore: return 20;
 #endif
-#ifdef ATTR_INDEX_backend_path
-        case ATTR_INDEX_backend_path: return 40;
+#ifdef ATTR_INDEX_backendpath
+        case ATTR_INDEX_backendpath: return 40;
 #endif
 
         case ATTR_INDEX_link: return 20;
@@ -1580,9 +1580,9 @@ static const char * attr2str(attr_set_t * attrs, const entry_id_t * id,
             strftime(out, 128, "%Y/%m/%d %T", localtime_r(&tt, &stm));
             return out;
 #endif
-#ifdef ATTR_INDEX_backend_path
-        case ATTR_INDEX_backend_path:
-            return ATTR(attrs, backend_path);
+#ifdef ATTR_INDEX_backendpath
+        case ATTR_INDEX_backendpath:
+            return ATTR(attrs, backendpath);
 #endif
 
 #ifdef _LUSTRE
@@ -2146,6 +2146,12 @@ static int report_entry(const char *entry, int flags)
     if (sscanf(entry, SFID, RFID(&id)) != FID_SCAN_CNT)
     {
         is_id = FALSE;
+
+        if ((rc = InitFS()) != 0)
+            fprintf(stderr, "Warning: cannot access the filesystem to get entry id: %s\n",
+                    strerror(-rc));
+            /* try to continue anyway */
+
         /* try it as a path */
         if ((rc = Path2Id(entry, &id)) != 0)
         {
@@ -3336,7 +3342,7 @@ int main( int argc, char **argv )
             }
             else
             {
-                strncpy( path_filter, optarg, RBH_PATH_MAX );
+                rh_strncpy(path_filter, optarg, RBH_PATH_MAX);
             }
             break;
 
@@ -3352,11 +3358,11 @@ int main( int argc, char **argv )
                 break;
             }
             if (!strcasecmp( optarg, "default"))
-                strncpy( class_filter, CLASS_DEFAULT, 1024 );
+                rh_strncpy(class_filter, CLASS_DEFAULT, 1024);
             else if ( !strcasecmp( optarg, "ignored"))
-                strncpy( class_filter, CLASS_IGNORED, 1024 );
+                rh_strncpy(class_filter, CLASS_IGNORED, 1024);
             else
-                strncpy( class_filter, optarg, 1024 );
+                rh_strncpy(class_filter, optarg, 1024);
             break;
 
         case OPT_CLASS_INFO:
@@ -3371,11 +3377,11 @@ int main( int argc, char **argv )
             if ( optarg )
             {
                 if (!strcasecmp( optarg, "default"))
-                    strncpy( class_filter, CLASS_DEFAULT, 1024 );
+                    rh_strncpy(class_filter, CLASS_DEFAULT, 1024);
                 else if ( !strcasecmp( optarg, "ignored"))
-                    strncpy( class_filter, CLASS_IGNORED, 1024 );
+                    rh_strncpy(class_filter, CLASS_IGNORED, 1024);
                 else
-                    strncpy( class_filter, optarg, 1024 );
+                    rh_strncpy(class_filter, optarg, 1024);
             }
             break;
 
@@ -3385,19 +3391,19 @@ int main( int argc, char **argv )
 
         case 'e':
             entry_info = TRUE;
-            strncpy(entry_path, optarg, RBH_PATH_MAX);
+            rh_strncpy(entry_path, optarg, RBH_PATH_MAX);
             break;
 
         case 'u':
             user_info = TRUE;
             if ( optarg )
-                strncpy( user_name, optarg, 256 );
+                rh_strncpy(user_name, optarg, 256);
             break;
 
         case 'g':
             group_info = TRUE;
             if ( optarg )
-                strncpy( group_name, optarg, 256 );
+                rh_strncpy(group_name, optarg, 256);
             break;
 
         case 'D':
@@ -3411,7 +3417,7 @@ int main( int argc, char **argv )
                 fprintf(stderr, "Missing mandatory argument <username> for --dump-user\n");
                 exit(1);
             }
-            strncpy( dump_user_name, optarg, 256 );
+            rh_strncpy(dump_user_name, optarg, 256);
             break;
 
         case OPT_DUMP_GROUP:
@@ -3421,7 +3427,7 @@ int main( int argc, char **argv )
                 fprintf(stderr, "Missing mandatory argument <groupname> for --dump-group\n");
                 exit(1);
             }
-            strncpy( dump_group_name, optarg, 256 );
+            rh_strncpy(dump_group_name, optarg, 256);
             break;
 
 #ifdef _LUSTRE
@@ -3441,7 +3447,7 @@ int main( int argc, char **argv )
                 exit( 1 );
             }
             /* copy arg to display it */
-            strncpy(ost_set_str, optarg, sizeof(ost_set_str));
+            rh_strncpy(ost_set_str, optarg, sizeof(ost_set_str));
             break;
 #endif
 
@@ -3577,7 +3583,7 @@ int main( int argc, char **argv )
 #endif
 
         case 'f':
-            strncpy( config_file, optarg, MAX_OPT_LEN );
+            rh_strncpy(config_file, optarg, MAX_OPT_LEN);
             break;
         case 'l':
             force_log_level = TRUE;
@@ -3683,7 +3689,7 @@ int main( int argc, char **argv )
     }
 
     /* get default config file, if not specified */
-    if ( SearchConfig( config_file, config_file, &chgd, badcfg ) != 0 )
+    if (SearchConfig(config_file, config_file, &chgd, badcfg, MAX_OPT_LEN) != 0)
     {
         fprintf(stderr, "No config file (or too many) found matching %s\n", badcfg);
         exit(2);
@@ -3726,6 +3732,10 @@ int main( int argc, char **argv )
                  rc, errno, strerror( errno ) );
         exit( rc );
     }
+
+    if ((rc = InitFS()) != 0)
+            fprintf(stderr, "Warning: cannot access filesystem %s (%s), some reports may be incomplete or not available.\n",
+                    global_config.fs_path, strerror(abs(rc)));
 
     /* Initialize list manager */
     rc = ListMgr_Init( &config.lmgr_config, TRUE );

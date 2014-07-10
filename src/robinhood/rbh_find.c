@@ -43,6 +43,8 @@ static struct option option_tab[] =
 {
     {"user", required_argument, NULL, 'u'},
     {"group", required_argument, NULL, 'g'},
+    {"nouser", no_argument, NULL, 'U'},
+    {"nogroup", no_argument, NULL, 'G'},
     {"type", required_argument, NULL, 't'},
     {"size", required_argument, NULL, 's'},
     {"name", required_argument, NULL, 'n'},
@@ -54,15 +56,20 @@ static struct option option_tab[] =
     {"amin", required_argument, NULL, 'a'},
 #ifdef _LUSTRE
     {"ost", required_argument, NULL, 'o'},
+    {"pool", required_argument, NULL, 'P'},
+    {"lsost", no_argument, NULL, 'O'},
 #endif
 #ifdef ATTR_INDEX_status
     {"status", required_argument, NULL, 'S'},
 #endif
     {"ls", no_argument, NULL, 'l'},
+    {"print", no_argument, NULL, 'p'},
+    {"exec", required_argument, NULL, 'E'},
+    /* TODO dry-run mode for exec */
 
     /* query options */
     {"not", no_argument, NULL, '!'},
-    {"bulk", no_argument, NULL, 'b'},
+    {"nobulk", no_argument, NULL, 'b'},
 
     /* config file options */
     {"config-file", required_argument, NULL, 'f'},
@@ -78,7 +85,7 @@ static struct option option_tab[] =
 
 };
 
-#define SHORT_OPT_STRING    "lu:g:t:s:n:S:o:A:M:m:z:f:d:hV!b"
+#define SHORT_OPT_STRING    "lpOu:g:t:s:n:S:o:P:E:A:M:m:z:f:d:hV!bUG"
 
 #define TYPE_HELP "'f' (file), 'd' (dir), 'l' (symlink), 'b' (block), 'c' (char), 'p' (named pipe/FIFO), 's' (socket)"
 #define SIZE_HELP "[-|+]<val>[K|M|G|T]"
@@ -100,6 +107,7 @@ struct find_opt
     uint64_t            sz_val;
     const char * name;
     unsigned int ost_idx;
+    const char * pool;
 
     // crtime cond: gt/eq/lt <time>
     compare_direction_t crt_compar;
@@ -117,8 +125,19 @@ struct find_opt
     file_status_t status;
 #endif
 
+    const char * exec_cmd;
+
+    /* query option */
+    enum { bulk_unspec = 0,
+           force_bulk,
+           force_nobulk
+    } bulk;
+
+
     /* output flags */
     unsigned int ls:1;
+    unsigned int lsost:1;
+    unsigned int print:1;
     /* condition flags */
     unsigned int match_user:1;
     unsigned int match_group:1;
@@ -130,6 +149,7 @@ struct find_opt
     unsigned int match_atime:1;
 #ifdef _LUSTRE
     unsigned int match_ost:1;
+    unsigned int match_pool:1;
 #endif
 #ifdef ATTR_INDEX_status
     unsigned int match_status:1;
@@ -141,36 +161,42 @@ struct find_opt
     unsigned int groupneg:1;
     unsigned int nameneg:1;
 
-    /* query option */
-    unsigned int bulk:1;
-
     /* behavior flags */
     unsigned int no_dir:1; /* if -t != dir => no dir to be displayed */
     unsigned int dir_only:1; /* if -t dir => only display dir */
 
+    /* actions */
+    unsigned int exec:1;
+
 } prog_options = {
     .user = NULL, .group = NULL, .type = NULL, .name = NULL,
+#ifdef _LUSTRE
+    .match_ost = 0, .match_pool = 0,
+#endif
 #ifdef ATTR_INDEX_status
     .status = STATUS_UNKNOWN,
 #endif
-    .ls = 0, .match_user = 0, .match_group = 0,
+    .bulk = bulk_unspec,
+    .ls = 0, .lsost = 0, .print = 1,
+    .match_user = 0, .match_group = 0,
     .match_type = 0, .match_size = 0, .match_name = 0,
     .match_crtime = 0, .match_mtime = 0, .match_atime = 0,
-    .bulk = 0,
 #ifdef ATTR_INDEX_status
     .match_status = 0, .statusneg = 0,
 #endif
     .userneg = 0 , .groupneg = 0, .nameneg = 0,
-    .no_dir = 0, .dir_only = 0
+    .no_dir = 0, .dir_only = 0, .exec = 0
 };
 
 #ifdef ATTR_INDEX_status
-#define DISPLAY_MASK (ATTR_MASK_type | ATTR_MASK_nlink | ATTR_MASK_mode | ATTR_MASK_owner |\
+#define LS_DISPLAY_MASK (ATTR_MASK_type | ATTR_MASK_nlink | ATTR_MASK_mode | ATTR_MASK_owner |\
                       ATTR_MASK_gr_name | ATTR_MASK_size | ATTR_MASK_last_mod | ATTR_MASK_link | ATTR_MASK_status)
 #else
-#define DISPLAY_MASK (ATTR_MASK_type | ATTR_MASK_nlink | ATTR_MASK_mode | ATTR_MASK_owner |\
+#define LS_DISPLAY_MASK (ATTR_MASK_type | ATTR_MASK_nlink | ATTR_MASK_mode | ATTR_MASK_owner |\
                       ATTR_MASK_gr_name | ATTR_MASK_size | ATTR_MASK_last_mod | ATTR_MASK_link )
 #endif
+#define LSOST_DISPLAY_MASK (ATTR_MASK_type | ATTR_MASK_size | ATTR_MASK_stripe_items)
+
 static int disp_mask = ATTR_MASK_type;
 static int query_mask = 0;
 
@@ -300,6 +326,18 @@ static int mkfilters(int exclude_dirs)
         is_expr = 1;
         query_mask |= ATTR_MASK_stripe_items;
     }
+
+    if (prog_options.match_pool)
+    {
+        compare_value_t val;
+        strcpy(val.str, prog_options.pool);
+        if (!is_expr)
+            CreateBoolCond(&match_expr, COMP_LIKE, CRITERIA_POOL, val);
+        else
+            AppendBoolCond(&match_expr, COMP_LIKE, CRITERIA_POOL, val);
+        is_expr = 1;
+        query_mask |= ATTR_MASK_stripe_info;
+    }
 #endif
 
     /* create DB filters */
@@ -352,6 +390,8 @@ static int mkfilters(int exclude_dirs)
         lmgr_simple_filter_add( &entry_filter, ATTR_INDEX_name, LIKE, fv, 0 );
     }
 
+    /* TODO what about pool? */
+
     if (is_expr)
     {
         char expr[RBH_PATH_MAX];
@@ -372,6 +412,8 @@ static const char *help_string =
     _B "Filters:" B_ "\n"
     "    " _B "-user" B_ " " _U "user" U_ "\n"
     "    " _B "-group" B_ " " _U "group" U_ "\n"
+    "    " _B "-nouser" B_ "\n"
+    "    " _B "-nogroup" B_ "\n"
     "    " _B "-type" B_ " " _U "type" U_ "\n"
     "       "TYPE_HELP"\n"
     "    " _B "-size" B_ " " _U "size_crit" U_ "\n"
@@ -391,17 +433,35 @@ static const char *help_string =
     "       "TIME_HELP"\n"
 #ifdef _LUSTRE
     "    " _B "-ost" B_ " " _U "ost_index" U_ "\n"
+    "    " _B "-pool" B_ " " _U "ost_pool" U_ "\n"
 #endif
 #ifdef ATTR_INDEX_status
     "    " _B "-status" B_ " " _U "status" U_ "\n"
     "       %s\n"
 #endif
     "\n"
-    "    " _B "-not" B_ ", "_B"-!"B_"\n"
-    "        negate next argument\n"
+    "    " _B "-not" B_ ", "_B"-!"B_" \t Negate next argument\n"
     "\n"
     _B "Output options:" B_ "\n"
-    "    " _B "-ls" B_" \t: display attributes\n"
+    "    " _B "-ls" B_" \t Display attributes\n"
+#ifdef _LUSTRE
+    "    " _B "-lsost" B_" \t Display OST information\n"
+#endif
+    "    " _B "-print" B_" \t Display the fullpath of matching entries (this is the default, unless -ls, -lsost or -exec are used).\n"
+    "\n"
+    _B "Actions:" B_ "\n"
+    "    " _B "-exec" B_" "_U "\"cmd\"" U_ "\n"
+    "       Execute the given command for each matching entry. Unlike classical 'find',\n"
+    "       cmd must be a single (quoted) shell param, not necessarily terminated with ';'.\n"
+    "       '{}' is replaced by the entry path. Example: -exec 'md5sum {}'\n"
+    "\n"
+    _B "Behavior:"B_"\n"
+    "    " _B "-nobulk" B_ "\n"
+    "       When running rbh-find on the filesystem root, rbh-find automatically switches\n"
+    "       to bulk DB request instead of browsing the namespace from the DB.\n"
+    "       This speeds up the query, but this may result in an arbitrary output ordering,\n"
+    "       and a single path may be displayed in case of multiple hardlinks.\n"
+    "       Use -nobulk to disable this optimization.\n"
     "\n"
     _B "Program options:" B_ "\n"
     "    " _B "-f" B_ " " _U "config_file" U_ "\n"
@@ -412,12 +472,12 @@ static const char *help_string =
     "    " _B "-V" B_ ", " _B "--version" B_ "\n"
     "        Display version info\n";
 
-static inline void display_help( char *bin_name )
+static inline void display_help(char *bin_name)
 {
 #ifdef ATTR_INDEX_status
-    printf( help_string, bin_name, allowed_status() );
+    printf(help_string, bin_name, allowed_status());
 #else
-    printf( help_string, bin_name );
+    printf(help_string, bin_name);
 #endif
 }
 
@@ -691,6 +751,8 @@ static int set_time_filter(char * str, unsigned int multiplier, int allow_suffix
 
 static inline void print_entry(const wagon_t *id, const attr_set_t * attrs)
 {
+    char ostbuf[24576] = "";
+
 #ifdef ATTR_INDEX_status
     if (prog_options.match_status)
     {
@@ -699,6 +761,17 @@ static inline void print_entry(const wagon_t *id, const attr_set_t * attrs)
             /* no match -> no display */
             return;
         }
+    }
+#endif
+
+#ifdef _LUSTRE
+    /* prepare OST display buffer */
+    if (prog_options.lsost && ATTR_MASK_TEST(attrs, stripe_items)
+        && (ATTR(attrs, stripe_items).count > 0))
+    {
+        /* leave a space as first char */
+        ostbuf[0] = ' ';
+        FormatStripeList(ostbuf+1, sizeof(ostbuf)-2, &ATTR(attrs, stripe_items), TRUE);
     }
 #endif
 
@@ -748,18 +821,47 @@ static inline void print_entry(const wagon_t *id, const attr_set_t * attrs)
                    ATTR(attrs, size), date_str, id->fullname, ATTR(attrs,link));
         else
             /* display all: id, type, mode, nlink, (status,) owner, group, size, mtime, path */
-            printf(DFID" %-4s %s %3u  "STATUS_FORMAT"%-10s %-10s %15"PRIu64" %20s %s\n",
+            printf(DFID" %-4s %s %3u  "STATUS_FORMAT"%-10s %-10s %15"PRIu64" %20s %s%s\n",
                    PFID(&id->id), type, mode_str, ATTR(attrs, nlink) STATUS_VAL,
                    ATTR(attrs, owner), ATTR(attrs, gr_name),
-                   ATTR(attrs, size), date_str, id->fullname);
+                   ATTR(attrs, size), date_str, id->fullname, ostbuf);
     }
-    else
+    else if (prog_options.lsost) /* lsost without -ls */
+    {
+        const char * type;
+
+        /* type2char */
+        if (!ATTR_MASK_TEST(attrs, type))
+            type = "?";
+        else
+            type = type2char(ATTR(attrs, type));
+
+        /* display: id, type, size, path */
+        printf(DFID" %-4s %15"PRIu64" %s%s\n",
+               PFID(&id->id), type, ATTR(attrs, size), id->fullname, ostbuf);
+
+    }
+    else if (prog_options.print)
     {
         /* just display name */
         if (id->fullname)
-            printf("%s\n", id->fullname);
+            printf("%s%s\n", id->fullname, ostbuf);
         else
-            printf(DFID"\n", PFID(&id->id));
+            printf(DFID"%s\n", PFID(&id->id), ostbuf);
+    }
+
+    if (prog_options.exec)
+    {
+        const char *vars[] = {
+            "", id->fullname,
+            NULL, NULL
+        };
+        char * cmd = replace_cmd_parameters(prog_options.exec_cmd, vars);
+        if (cmd)
+        {
+            execute_shell_command(FALSE, cmd, 0);
+            free(cmd);
+        }
     }
 
 }
@@ -780,7 +882,7 @@ static int dircb(wagon_t * id_list, attr_set_t * attr_list,
 
         /* match condition on dirs parent */
         if (!is_expr || (EntryMatches(&id_list[i].id, &attr_list[i],
-                         &match_expr, NULL) == POLICY_MATCH))
+                                      &match_expr, NULL) == POLICY_MATCH))
         {
             /* don't display dirs if no_dir is specified */
             if (! (prog_options.no_dir && ATTR_MASK_TEST(&attr_list[i], type)
@@ -804,6 +906,8 @@ static int dircb(wagon_t * id_list, attr_set_t * attr_list,
                 if (!is_expr || (EntryMatches(&chids[j].id, &chattrs[j],
                                  &match_expr, NULL) == POLICY_MATCH))
                     print_entry(&chids[j], &chattrs[j]);
+
+                ListMgr_FreeAttrs(&chattrs[j]);
             }
 
             free_wagon(chids, 0, chcount);
@@ -817,109 +921,13 @@ static int dircb(wagon_t * id_list, attr_set_t * attr_list,
 /**
  *  Get id of root dir
  */
-static int get_root_id(entry_id_t * root_id)
+static int retrieve_root_id(entry_id_t * root_id)
 {
     int rc;
     rc = Path2Id(config.global_config.fs_path, root_id);
     if (rc)
         DisplayLog(LVL_MAJOR, FIND_TAG, "Can't access filesystem's root %s: %s",
                    config.global_config.fs_path, strerror(-rc));
-    return rc;
-}
-
-/**
- * List the content of the given id/path list
- */
-static int list_content(char ** id_list, int id_count)
-{
-    wagon_t *ids;
-    int i, rc;
-    attr_set_t root_attrs;
-    entry_id_t root_id;
-    int is_id;
-
-    rc = get_root_id(&root_id);
-    if (rc)
-        return rc;
-
-    ids = MemCalloc(id_count, sizeof(wagon_t));
-    if (!ids)
-        return -ENOMEM;
-
-    for (i = 0; i < id_count; i++)
-    {
-        is_id = TRUE;
-        /* is it a path or fid? */
-        if (sscanf(id_list[i], SFID, RFID(&ids[i].id)) != FID_SCAN_CNT)
-        {
-            is_id = FALSE;
-            /* take it as a path */
-            rc = Path2Id(id_list[i], &ids[i].id);
-            if (!rc) {
-                ids[i].fullname = id_list[i];
-                if (FINAL_SLASH(ids[i].fullname))
-                    REMOVE_FINAL_SLASH(ids[i].fullname);
-            }
-        } else {
-#if _HAVE_FID
-            /* Take it as an FID. */
-            char path[RBH_PATH_MAX];
-            rc = Lustre_GetFullPath( &ids[i].id, path, sizeof(path));
-            if (!rc)
-                ids[i].fullname = strdup(path);
-#endif
-        }
-
-        if (rc) {
-            DisplayLog(LVL_MAJOR, FIND_TAG, "Invalid parameter: %s: %s",
-                       id_list[i], strerror(-rc));
-            goto out;
-        }
-
-        /* get root attrs to print it (if it matches program options) */
-        root_attrs.attr_mask = disp_mask | query_mask;
-        rc = ListMgr_Get(&lmgr, &ids[i].id, &root_attrs);
-        if (rc == 0)
-            dircb(&ids[i], &root_attrs, 1, NULL);
-        else
-        {
-            DisplayLog(LVL_VERB, FIND_TAG, "Notice: no attrs in DB for %s", id_list[i]);
-
-            if (!is_id)
-            {
-                struct stat st;
-                ATTR_MASK_SET(&root_attrs, fullpath);
-                strcpy(ATTR(&root_attrs, fullpath), id_list[i]);
-
-                if (lstat(ATTR(&root_attrs, fullpath ), &st) == 0)
-                {
-                    PosixStat2EntryAttr(&st, &root_attrs, TRUE);
-                    ListMgr_GenerateFields( &root_attrs, disp_mask | query_mask);
-                }
-            }
-            else if (entry_id_equal(&ids[i].id, &root_id))
-            {
-                /* this is root id */
-                struct stat st;
-                ATTR_MASK_SET(&root_attrs, fullpath);
-                strcpy(ATTR(&root_attrs, fullpath), config.global_config.fs_path);
-
-                if (lstat(ATTR(&root_attrs, fullpath ), &st) == 0)
-                {
-                    PosixStat2EntryAttr(&st, &root_attrs, TRUE);
-                    ListMgr_GenerateFields( &root_attrs, disp_mask | query_mask);
-                }
-            }
-
-            dircb(&ids[i], &root_attrs, 1, NULL);
-        }
-
-        rc = rbh_scrub(&lmgr, &ids[i], 1, disp_mask | query_mask, dircb, NULL);
-    }
-
-out:
-    /* ids have been processed, free them */
-    MemFree(ids);
     return rc;
 }
 
@@ -941,7 +949,7 @@ static int list_bulk(void)
 
     ATTR_MASK_INIT(&root_attrs);
 
-    rc = get_root_id(&root_id);
+    rc = retrieve_root_id(&root_id);
     if (rc)
         return rc;
 
@@ -1017,6 +1025,113 @@ static int list_bulk(void)
     return 0;
 }
 
+/**
+ * List contents of the given id/path list
+ */
+static int list_contents(char ** id_list, int id_count)
+{
+    wagon_t *ids;
+    int i, rc;
+    attr_set_t root_attrs;
+    entry_id_t root_id;
+    int is_id;
+
+    rc = retrieve_root_id(&root_id);
+    if (rc)
+        return rc;
+
+    ids = MemCalloc(id_count, sizeof(wagon_t));
+    if (!ids)
+        return -ENOMEM;
+
+    for (i = 0; i < id_count; i++)
+    {
+        is_id = TRUE;
+        /* is it a path or fid? */
+        if (sscanf(id_list[i], SFID, RFID(&ids[i].id)) != FID_SCAN_CNT)
+        {
+            is_id = FALSE;
+            /* take it as a path */
+            rc = Path2Id(id_list[i], &ids[i].id);
+            if (!rc) {
+                ids[i].fullname = id_list[i];
+                if (FINAL_SLASH(ids[i].fullname))
+                    REMOVE_FINAL_SLASH(ids[i].fullname);
+            }
+        } else {
+#if _HAVE_FID
+            /* Take it as an FID. */
+            char path[RBH_PATH_MAX];
+            rc = Lustre_GetFullPath( &ids[i].id, path, sizeof(path));
+            if (!rc)
+                ids[i].fullname = strdup(path);
+#endif
+        }
+
+        if (rc) {
+            DisplayLog(LVL_MAJOR, FIND_TAG, "Invalid parameter: %s: %s",
+                       id_list[i], strerror(-rc));
+            goto out;
+        }
+
+        if ((prog_options.bulk != force_nobulk) &&
+            (id_count == 1) && entry_id_equal(&ids[i].id, &root_id))
+        {
+            /* the ID is FS root: use list_bulk instead */
+            DisplayLog(LVL_DEBUG, FIND_TAG, "Optimization: switching to bulk DB request mode");
+            mkfilters(FALSE); /* keep dirs */
+            MemFree(ids);
+            return list_bulk();
+        }
+
+        /* get root attrs to print it (if it matches program options) */
+        root_attrs.attr_mask = disp_mask | query_mask;
+        rc = ListMgr_Get(&lmgr, &ids[i].id, &root_attrs);
+        if (rc == 0)
+            dircb(&ids[i], &root_attrs, 1, NULL);
+        else
+        {
+            DisplayLog(LVL_VERB, FIND_TAG, "Notice: no attrs in DB for %s", id_list[i]);
+
+            if (!is_id)
+            {
+                struct stat st;
+                ATTR_MASK_SET(&root_attrs, fullpath);
+                strcpy(ATTR(&root_attrs, fullpath), id_list[i]);
+
+                if (lstat(ATTR(&root_attrs, fullpath ), &st) == 0)
+                {
+                    PosixStat2EntryAttr(&st, &root_attrs, TRUE);
+                    ListMgr_GenerateFields( &root_attrs, disp_mask | query_mask);
+                }
+            }
+            else if (entry_id_equal(&ids[i].id, &root_id))
+            {
+                /* this is root id */
+                struct stat st;
+                ATTR_MASK_SET(&root_attrs, fullpath);
+                strcpy(ATTR(&root_attrs, fullpath), config.global_config.fs_path);
+
+                if (lstat(ATTR(&root_attrs, fullpath ), &st) == 0)
+                {
+                    PosixStat2EntryAttr(&st, &root_attrs, TRUE);
+                    ListMgr_GenerateFields( &root_attrs, disp_mask | query_mask);
+                }
+            }
+
+            dircb(&ids[i], &root_attrs, 1, NULL);
+        }
+
+        rc = rbh_scrub(&lmgr, &ids[i], 1, disp_mask | query_mask, dircb, NULL);
+    }
+
+out:
+    /* ids have been processed, free them */
+    MemFree(ids);
+    return rc;
+}
+
+
 #define toggle_option(_opt, _name)              \
             do {                                \
                 if (prog_options. _opt )        \
@@ -1066,6 +1181,18 @@ int main( int argc, char **argv )
             prog_options.groupneg = neg;
             neg = 0;
             break;
+        case 'U': /* match numerical (non resolved) users */
+            toggle_option(match_user, "user");
+            prog_options.user = "[0-9]*";
+            prog_options.userneg = neg;
+            neg = 0;
+            break;
+        case 'G': /* match numerical (non resolved) groups */
+            toggle_option(match_group, "group");
+            prog_options.group = "[0-9]*";
+            prog_options.groupneg = neg;
+            neg = 0;
+            break;
         case 'n':
             toggle_option(match_name, "name");
             prog_options.name = optarg;
@@ -1083,6 +1210,19 @@ int main( int argc, char **argv )
             }
             if (neg) {
                 fprintf(stderr, "! () is not supported for ost criteria\n");
+                exit(1);
+            }
+            break;
+        case 'P':
+            toggle_option(match_pool, "pool");
+            prog_options.pool = optarg;
+            break;
+        case 'O':
+            prog_options.lsost = 1;
+            prog_options.print = 0;
+            disp_mask |= LSOST_DISPLAY_MASK;
+            if (neg) {
+                fprintf(stderr, "! (-not) unexpected before -lsost option\n");
                 exit(1);
             }
             break;
@@ -1187,14 +1327,29 @@ int main( int argc, char **argv )
 #endif
         case 'l':
             prog_options.ls = 1;
-            disp_mask = DISPLAY_MASK;
+            prog_options.print = 0;
+            disp_mask |= LS_DISPLAY_MASK;
             if (neg) {
-                fprintf(stderr, "! (-not) unexpected before -l option\n");
+                fprintf(stderr, "! (-not) unexpected before -ls option\n");
                 exit(1);
             }
             break;
+        case 'p':
+            prog_options.print = 1;
+            disp_mask |= LS_DISPLAY_MASK;
+            if (neg) {
+                fprintf(stderr, "! (-not) unexpected before -ls option\n");
+                exit(1);
+            }
+            break;
+
+        case 'E':
+            toggle_option(exec, "exec");
+            prog_options.exec_cmd = optarg;
+            prog_options.print = 0;
+            break;
         case 'f':
-            strncpy( config_file, optarg, MAX_OPT_LEN );
+            rh_strncpy(config_file, optarg, MAX_OPT_LEN);
             if (neg) {
                 fprintf(stderr, "! (-not) unexpected before -f option\n");
                 exit(1);
@@ -1216,7 +1371,7 @@ int main( int argc, char **argv )
             }
             break;
         case 'b':
-            prog_options.bulk = 1;
+            prog_options.bulk = force_nobulk;
             break;
         case 'h':
             display_help( bin );
@@ -1236,7 +1391,7 @@ int main( int argc, char **argv )
     }
 
     /* get default config file, if not specified */
-    if ( SearchConfig( config_file, config_file, &chgd, badcfg ) != 0 )
+    if (SearchConfig(config_file, config_file, &chgd, badcfg, MAX_OPT_LEN) != 0)
     {
         fprintf(stderr, "No config file (or too many) found matching %s\n", badcfg);
         exit(2);
@@ -1308,9 +1463,12 @@ int main( int argc, char **argv )
 
     if (argc == optind)
     {
-        if (prog_options.bulk)
+        /* no argument: default is root
+         * => switch to bulk mode (unless nobulk is specified)
+         */
+        if (prog_options.bulk != force_nobulk)
         {
-            DisplayLog(LVL_DEBUG, FIND_TAG, "Performing bulk request on DB");
+            DisplayLog(LVL_DEBUG, FIND_TAG, "Optimization: switching to bulk DB request mode");
             mkfilters(FALSE); /* keep dirs */
             return list_bulk();
         }
@@ -1319,20 +1477,16 @@ int main( int argc, char **argv )
             char *id = config.global_config.fs_path;
             mkfilters(TRUE); /* exclude dirs */
             /* no path specified, list all entries */
-            rc = list_content(&id, 1);
+            rc = list_contents(&id, 1);
         }
     }
     else
     {
-        if (prog_options.bulk)
-            fprintf(stderr, "No path argument expected with '-bulk' option. Option ignored.\n");
-
         mkfilters(TRUE); /* exclude dirs */
-        rc = list_content(argv+optind, argc-optind);
+        rc = list_contents(argv+optind, argc-optind);
     }
 
     ListMgr_CloseAccess( &lmgr );
 
     return rc;
-
 }

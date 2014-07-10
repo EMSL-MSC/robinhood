@@ -218,7 +218,7 @@ static int is_fid_filter(entry_id_t * id)
     lustre_fid  fid;
     if ( !EMPTY_STRING( path_filter ) )
     {
-        if (sscanf(path_filter, SFID, RFID(&fid)) != 3)
+        if (sscanf(path_filter, SFID, RFID(&fid)) != FID_SCAN_CNT)
             return FALSE;
         else {
             if (id)
@@ -388,6 +388,8 @@ static inline void undo_rm_helper( entry_id_t * id, const char *last_known_path,
         /* discard entry from remove list */
         if ( ListMgr_SoftRemove_Discard(&lmgr, id) != 0 )
             fprintf(stderr, "Error: could not remove previous id "DFID" from database\n", PFID(id) );
+        /* clean read-only attrs */
+        new_attrs.attr_mask &= ~readonly_attr_set;
         /* insert or update it in the db */
         rc = ListMgr_Insert( &lmgr, &new_id, &new_attrs, TRUE );
         if ( rc == 0 )
@@ -516,7 +518,7 @@ int main( int argc, char **argv )
             action = ACTION_RESTORE;
             break;
         case 'f':
-            strncpy( config_file, optarg, MAX_OPT_LEN );
+            rh_strncpy(config_file, optarg, MAX_OPT_LEN);
             break;
         case 'l':
             force_log_level = TRUE;
@@ -552,10 +554,10 @@ int main( int argc, char **argv )
         fprintf( stderr, "Error: missing mandatory argument on command line: <path|fid>\n" );
         exit( 1 );
     }
-    strncpy( path_filter, argv[optind], RBH_PATH_MAX );
+    rh_strncpy(path_filter, argv[optind], RBH_PATH_MAX);
 
     /* get default config file, if not specified */
-    if ( SearchConfig( config_file, config_file, &chgd, badcfg ) != 0 )
+    if (SearchConfig(config_file, config_file, &chgd, badcfg, MAX_OPT_LEN) != 0)
     {
         fprintf(stderr, "No config file (or too many) found matching %s\n", badcfg);
         exit(2);

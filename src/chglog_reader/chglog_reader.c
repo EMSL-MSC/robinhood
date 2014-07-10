@@ -83,6 +83,9 @@ typedef struct reader_thr_info_t
     /** last record id cleared with changelog */
     unsigned long long last_cleared_record;
 
+    /** last record pushed to the pipeline */
+    unsigned long long last_pushed;
+
     /* number of times the changelog has been reopened */
     unsigned int nb_reopen;
 
@@ -253,21 +256,35 @@ static int log_record_callback( lmgr_t *lmgr, struct entry_proc_op_t * pop, void
      * do nothing in all other cases:
      */
     if ((chglog_reader_config.batch_ack_count > 1)
-         && (logrec->cr_index < p_info->last_read_record)
+         && (logrec->cr_index < p_info->last_pushed)
          && ((logrec->cr_index - p_info->last_cleared_record)
              < chglog_reader_config.batch_ack_count))
     {
-        DisplayLog(LVL_FULL, CHGLOG_TAG, "callback - %s %llu %llu\n",
+        DisplayLog(LVL_FULL, CHGLOG_TAG, "callback - %s cl_record: %llu, last_cleared: %llu, last_pushed: %llu\n",
                    p_info->mdtdevice, logrec->cr_index,
-                   p_info->last_cleared_record);
+                   p_info->last_cleared_record,
+                   p_info->last_pushed);
         /* do nothing, don't clear log now */
         return 0;
     }
 
     rc = clear_changelog_records(p_info);
 
-    return rc;
+    if ((rc == 0) &&  (p_info->last_committed_record != 0))
+    {
+        char var_tmp[256];
+        char val_tmp[256];
+        /* save the last committed record, so we don't get old records from
+         * other registrated readers when restarting */
+        sprintf(var_tmp, "%s_%s", CL_LAST_COMMITTED,
+                chglog_reader_config.mdt_def[p_info->thr_index].mdt_name);
+        sprintf(val_tmp, "%llu", p_info->last_committed_record);
+        if (ListMgr_SetVar(lmgr, var_tmp, val_tmp))
+            DisplayLog(LVL_MAJOR, CHGLOG_TAG, "Failed to save last committed record for %s",
+                       chglog_reader_config.mdt_def[p_info->thr_index].mdt_name);
+    }
 
+    return rc;
 }
 
 #ifdef _LUSTRE_HSM
@@ -354,20 +371,26 @@ static void process_op_queue(reader_thr_info_t *p_info, const int push_all)
 {
     time_t oldest = time(NULL) - chglog_reader_config.queue_max_age;
 
+    DisplayLog(LVL_FULL, CHGLOG_TAG, "processing changelog queue");
+
     while(!rh_list_empty(&p_info->op_queue)) {
         entry_proc_op_t *op = rh_list_first_entry(&p_info->op_queue, entry_proc_op_t, list);
 
         /* Stop when the queue is below our limit, and when the oldest
          * element is still new enough. */
-        if (push_all == FALSE &&
-            p_info->op_queue_count < chglog_reader_config.queue_max_size &&
-            op->changelog_inserted > oldest)
+        if (!push_all &&
+            (p_info->op_queue_count < chglog_reader_config.queue_max_size) &&
+            (op->changelog_inserted > oldest))
             break;
 
         rh_list_del(&op->list);
         rh_list_del(&op->hash_list);
 
+        DisplayLog(LVL_FULL, CHGLOG_TAG, "pushing cl record #%Lu: age=%ld",
+                   op->extra_info.log_record.p_log_rec->cr_index,
+                   time(NULL) - op->changelog_inserted);
         /* Push the entry to the pipeline */
+        p_info->last_pushed = op->extra_info.log_record.p_log_rec->cr_index;
         EntryProcessor_Push( op );
 
         p_info->op_queue_count --;
@@ -409,7 +432,9 @@ static int insert_into_hash( reader_thr_info_t * p_info, CL_REC_TYPE * p_rec, un
     else
         op->extra_info_free_func = free_extra_info;
 
-    op->check_if_last_entry = !!(flags & CHECK_IF_LAST_ENTRY);
+    /* if the unlink record is not tagged as last unlink,
+     * always check the previous value of nlink in DB */
+    op->check_if_last_entry = (p_rec->cr_type == CL_UNLINK) && !(p_rec->cr_flags & CLF_UNLINK_LAST);
     op->get_fid_from_db = !!(flags & GET_FID_FROM_DB);
 
     /* set callback function + args */
@@ -568,10 +593,10 @@ static CL_REC_TYPE * create_fake_unlink_record(const reader_thr_info_t *p_info,
         rec->cr_type = CL_UNLINK;
         rec->cr_index = rec_in->cr_index - 1;
 
-        DisplayLog( LVL_DEBUG, CHGLOG_TAG,
-                    "Unlink: object="DFID", name=%.*s",
-                    PFID(&rec->cr_tfid), rec->cr_namelen,
-                    rec->cr_name );
+        DisplayLog(LVL_DEBUG, CHGLOG_TAG,
+                   "Unlink: object="DFID", name=%.*s, flags=%#x",
+                   PFID(&rec->cr_tfid), rec->cr_namelen,
+                   rec->cr_name, rec->cr_flags);
     }
 
     return rec;
@@ -674,8 +699,7 @@ static int process_log_rec( reader_thr_info_t * p_info, CL_REC_TYPE * p_rec )
              * and LU-1331. */
             if (!chglog_reader_config.mds_has_lu543 ||
                 !chglog_reader_config.mds_has_lu1331) {
-                DisplayLog( LVL_EVENT, CHGLOG_TAG,
-                            "Detected LU-1331." );
+                DisplayLog(LVL_EVENT, CHGLOG_TAG, "Detected fix for LU-1331.");
 
                 chglog_reader_config.mds_has_lu543 = 1;
                 chglog_reader_config.mds_has_lu1331 = 1;
@@ -743,8 +767,7 @@ static int process_log_rec( reader_thr_info_t * p_info, CL_REC_TYPE * p_rec )
              !entry_id_equal(&p_info->cl_rename->cr_tfid, &p_rec->cr_tfid))) {
             /* tfid if 0, or the two fids are different, so we have LU-543. */
             chglog_reader_config.mds_has_lu543 = 1;
-            DisplayLog( LVL_EVENT, CHGLOG_TAG,
-                        "Detected LU-543." );
+            DisplayLog(LVL_EVENT, CHGLOG_TAG, "Detected fix for LU-543.");
         }
 
         /* We now have a CL_RENAME and a CL_EXT. */
@@ -1031,6 +1054,13 @@ int            ChgLogRdr_Start(chglog_reader_config_t *p_config,
 
     Alert_StartBatching();
 
+    // need a connection to get last committed record
+    lmgr_t lmgr;
+    int dbget = 1;
+    rc = ListMgr_InitAccess(&lmgr);
+    if (rc)
+        dbget = 0;
+
     /* create one reader per MDT */
     for ( i = 0; i < p_config->mdt_count ; i++ )
     {
@@ -1052,14 +1082,31 @@ int            ChgLogRdr_Start(chglog_reader_config_t *p_config,
         info->flags = ((one_shot || p_config->force_polling)?0:CHANGELOG_FLAG_FOLLOW)
             | CHANGELOG_FLAG_BLOCK;
 
-        DisplayLog( LVL_DEBUG, CHGLOG_TAG, "Opening chglog for %s", mdtdevice );
+        if (dbget)
+        {
+            char lastcl_var[256];
+            char val_str[1024];
+            sprintf(lastcl_var, "%s_%s", CL_LAST_COMMITTED,
+                    p_config->mdt_def[i].mdt_name);
+            if (ListMgr_GetVar(&lmgr, lastcl_var, val_str) == DB_SUCCESS)
+            {
+                  last_rec = str2bigint(val_str);
+                  if (last_rec == -1LL)
+                      last_rec = 0;
+                  else
+                      /* start rec = last rec + 1 */
+                      last_rec ++;
+            }
+        }
+        DisplayLog(LVL_DEBUG, CHGLOG_TAG, "Opening chglog for %s (start_rec=%llu)",
+                   mdtdevice, last_rec);
 
         /* open the changelog (if we are in one_shot mode,
          * don't use the CHANGELOG_FLAG_FOLLOW flag)
          */
-        rc = llapi_changelog_start( &info->chglog_hdlr,
-                                    info->flags,
-                                    info->mdtdevice, last_rec );
+        rc = llapi_changelog_start(&info->chglog_hdlr,
+                                   info->flags,
+                                   info->mdtdevice, last_rec);
 
         if ( rc )
         {
@@ -1080,6 +1127,9 @@ int            ChgLogRdr_Start(chglog_reader_config_t *p_config,
         }
 
     }
+
+    if (dbget)
+        ListMgr_CloseAccess(&lmgr);
 
     return 0;
 }
@@ -1188,6 +1238,8 @@ int            ChgLogRdr_DumpStats( void )
 
             DisplayLog( LVL_MAJOR, "STATS", "   last read record id      = %llu",
                         reader_info[i].last_read_record );
+            DisplayLog( LVL_MAJOR, "STATS", "   last pushed record id    = %llu",
+                        reader_info[i].last_pushed );
             DisplayLog( LVL_MAJOR, "STATS", "   last committed record id = %llu",
                         reader_info[i].last_committed_record );
             DisplayLog( LVL_MAJOR, "STATS", "   last cleared record id   = %llu",

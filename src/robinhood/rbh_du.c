@@ -127,7 +127,7 @@ static lmgr_filter_t    parent_filter; /* same as entry_filter + condition on pa
 static bool_node_t      match_expr;
 static int              is_expr = 0; /* is it set? */
 
-static int disp_mask = ATTR_MASK_fullpath | ATTR_MASK_type | ATTR_MASK_blocks | ATTR_MASK_size;
+static int disp_mask = ATTR_MASK_type | ATTR_MASK_blocks | ATTR_MASK_size;
 static int query_mask = 0;
 
 typedef struct stats_du_t
@@ -442,7 +442,7 @@ static const char * opt2type(const char * type_opt)
 /**
  *  Get id of root dir
  */
-static int get_root_id(entry_id_t * root_id)
+static int retrieve_root_id(entry_id_t * root_id)
 {
     int rc;
     rc = Path2Id(config.global_config.fs_path, root_id);
@@ -523,7 +523,7 @@ static int list_all(stats_du_t * stats, int display_stats)
 
     ATTR_MASK_INIT( &root_attrs );
 
-    rc = get_root_id(&root_id);
+    rc = retrieve_root_id(&root_id);
     if (rc)
         return rc;
 
@@ -585,7 +585,7 @@ static int list_content(char ** id_list, int id_count)
     if (prog_options.sum)
         reset_stats(stats);
 
-    rc = get_root_id(&root_id);
+    rc = retrieve_root_id(&root_id);
     if (rc)
         return rc;
 
@@ -630,7 +630,7 @@ static int list_content(char ** id_list, int id_count)
             DisplayLog(LVL_DEBUG, DU_TAG, "Optimization: command argument is filesystem's root: performing bulk sum in DB");
             rc = list_all(stats, !prog_options.sum);
             if (rc)
-                return rc;
+                goto out;
             continue;
         }
 
@@ -688,9 +688,9 @@ static int list_content(char ** id_list, int id_count)
             rc = rbh_scrub(&lmgr, &ids[i], 1, disp_mask, dircb, stats);
 
             if (rc)
-                return rc;
+                goto out;
 
-            print_stats(ATTR(&root_attrs, fullpath), stats);
+            print_stats(ids[i].fullname, stats);
         }
     }
 
@@ -698,7 +698,7 @@ static int list_content(char ** id_list, int id_count)
     {
         rc = rbh_scrub(&lmgr, ids, id_count, disp_mask, dircb, stats);
         if (rc)
-            return rc;
+            goto out;
         print_stats("total", stats);
     }
 
@@ -793,7 +793,7 @@ int main( int argc, char **argv )
                 break;
 #endif
             case 'f':
-                strncpy( config_file, optarg, MAX_OPT_LEN );
+                rh_strncpy(config_file, optarg, MAX_OPT_LEN);
                 break;
             case 'l':
                 force_log_level = TRUE;
@@ -825,7 +825,7 @@ int main( int argc, char **argv )
 
 
     /* get default config file, if not specified */
-    if ( SearchConfig( config_file, config_file, &chgd, badcfg ) != 0 )
+    if (SearchConfig(config_file, config_file, &chgd, badcfg, MAX_OPT_LEN) != 0)
     {
         fprintf(stderr, "No config file (or too many) found matching %s\n", badcfg);
         exit(2);

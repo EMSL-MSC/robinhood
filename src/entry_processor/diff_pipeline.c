@@ -67,7 +67,8 @@ const pipeline_descr_t diff_pipeline_descr =
     .GET_ID         = STAGE_GET_FID,
     .GET_INFO_DB    = STAGE_GET_INFO_DB,
     .GET_INFO_FS    = STAGE_GET_INFO_FS,
-    .GC_OLDENT      = STAGE_REPORT_RM
+    .GC_OLDENT      = STAGE_REPORT_RM,
+    .DB_APPLY       = STAGE_APPLY
 };
 
 /** pipeline stages definition */
@@ -89,74 +90,6 @@ pipeline_stage_t diff_pipeline[] = {
     {STAGE_REPORT_RM, "STAGE_REPORT_RM", EntryProc_report_rm, NULL, NULL,
      STAGE_FLAG_SEQUENTIAL | STAGE_FLAG_SYNC, 1}
 };
-
-#ifdef HAVE_SHOOK
-static int shook_special_obj( struct entry_proc_op_t *p_op )
-{
-    if (ATTR_FSorDB_TEST( p_op, fullpath )
-        && ATTR_FSorDB_TEST( p_op, type))
-    {
-        if ( !strcmp(STR_TYPE_FILE, ATTR_FSorDB(p_op, type)) )
-        {
-            /* is it a lock file? */
-            if (!fnmatch("*/"LOCK_DIR"/"SHOOK_LOCK_PREFIX"*", ATTR_FSorDB(p_op, fullpath ), 0))
-            {
-                /* skip the entry */
-                DisplayLog(LVL_DEBUG, ENTRYPROC_TAG, "%s is a shook lock",
-                           ATTR_FSorDB(p_op, fullpath));
-                /** XXX raise special event for the file: LOCK/UNLOCK? */
-                return TRUE;
-            }
-        }
-        else if (!strcmp(STR_TYPE_DIR, ATTR_FSorDB(p_op, type)))
-        {
-            if (!fnmatch("*/"LOCK_DIR, ATTR_FSorDB(p_op, fullpath ), 0))
-            {
-                /* skip the entry */
-                DisplayLog(LVL_DEBUG, ENTRYPROC_TAG, "%s is a shook lock dir",
-                           ATTR_FSorDB(p_op, fullpath));
-                return TRUE;
-            }
-            else if (!fnmatch("*/"RESTRIPE_DIR, ATTR_FSorDB(p_op, fullpath ), 0))
-            {
-                /* skip the entry */
-                DisplayLog(LVL_DEBUG, ENTRYPROC_TAG, "%s is a shook restripe dir",
-                           ATTR_FSorDB(p_op, fullpath));
-                return TRUE;
-            }
-        }
-    }
-
-    /* also match '.shook' directory */
-    if (p_op && ATTR_FSorDB_TEST( p_op, name )
-        && ATTR_FSorDB_TEST( p_op, type))
-    {
-        if ( !strcmp(STR_TYPE_DIR, ATTR_FSorDB(p_op, type)) &&
-             !strcmp(SHOOK_DIR, ATTR_FSorDB(p_op, name)) )
-        {
-            /* skip the entry */
-            DisplayLog(LVL_DEBUG, ENTRYPROC_TAG, "\"%s\" is a shook dir",
-                       ATTR_FSorDB(p_op, name));
-            return TRUE;
-        }
-    }
-
-    return FALSE;
-}
-
-#define SKIP_SPECIAL_OBJ(_pop, _goto) do {                              \
-        if (shook_special_obj( _pop )) {                                \
-                    DisplayLog( LVL_DEBUG, ENTRYPROC_TAG,               \
-                        "Shook special file or dir '%s', skipped",      \
-                        (ATTR_FSorDB_TEST( _pop, fullpath )?            \
-                         ATTR_FSorDB(_pop, fullpath):                   \
-                         ATTR_FSorDB(_pop, name)) );                    \
-            goto _goto;                                                 \
-        }                                                               \
-    } while(0)
-#else
-#define SKIP_SPECIAL_OBJ(_pop, _goto) /* do nothing */
-#endif
 
 /**
  * For entries from FS scan, we must get the associated entry ID.
@@ -318,9 +251,9 @@ int EntryProc_get_info_db( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
         else
         {
             /* ERROR */
-            DisplayLog( LVL_CRIT, ENTRYPROC_TAG,
-                        "Error %d retrieving entry "DFID" from DB", rc,
-                        PFID(&p_op->entry_id) );
+            DisplayLog(LVL_CRIT, ENTRYPROC_TAG,
+                       "Error %d retrieving entry "DFID" from DB: %s.", rc,
+                       PFID(&p_op->entry_id), lmgr_err2str(rc));
             p_op->db_exists = FALSE;
             ATTR_MASK_INIT( &p_op->db_attrs );
         }
@@ -527,9 +460,6 @@ int EntryProc_get_info_fs( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
     }
 #endif
 
-    /* early check using DB info */
-    SKIP_SPECIAL_OBJ(p_op, skip_record);
-
     DisplayLog( LVL_FULL, ENTRYPROC_TAG,
         DFID": Getattr=%u, Getpath=%u, Readlink=%u"
 #ifdef ATTR_INDEX_status
@@ -551,23 +481,7 @@ int EntryProc_get_info_fs( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
 #if defined( _LUSTRE ) && defined( _HAVE_FID )
     /* may be needed if parent information is missing */
     if (NEED_GETPATH(p_op))
-    {
-        /* get parent_id and name (FIXME, just retrieve one for now).  */
-        rc = Lustre_GetNameParent(path, 0, &ATTR(&p_op->fs_attrs, parent_id),
-                                  ATTR(&p_op->fs_attrs, name), RBH_NAME_MAX);
-        if (rc == 0)
-        {
-            ATTR_MASK_SET(&p_op->fs_attrs, parent_id);
-            ATTR_MASK_SET(&p_op->fs_attrs, name);
-            ATTR_MASK_SET(&p_op->fs_attrs, path_update);
-            ATTR(&p_op->fs_attrs, path_update) = time(NULL);
-        }
-        else if (!ERR_MISSING(-rc))
-        {
-            DisplayLog(LVL_MAJOR, ENTRYPROC_TAG, "Failed to get parent+name for "DFID": %s",
-                       PFID(&p_op->entry_id), strerror(-rc));
-        }
-    } /* getpath needed */
+        path_check_update(&p_op->entry_id, path, &p_op->fs_attrs, p_op->fs_attr_need);
 #endif
 
 #ifdef ATTR_INDEX_creation_time
@@ -713,8 +627,28 @@ int EntryProc_get_info_fs( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
             DisplayLog(LVL_MAJOR, ENTRYPROC_TAG, "readlink failed on %s: %s", path, strerror(errno));
     }
 
-    /* later check using DB+FS info */
-    SKIP_SPECIAL_OBJ(p_op, skip_record);
+    /* check if the entry must be ignored */
+    #ifdef _HSM_LITE
+    {
+        attr_set_t merged_attrs; /* attrs from FS+DB */
+        ATTR_MASK_INIT(&merged_attrs);
+
+        ListMgr_MergeAttrSets(&merged_attrs, &p_op->fs_attrs, 1);
+        ListMgr_MergeAttrSets(&merged_attrs, &p_op->db_attrs, 0);
+
+        /* ignored entries will always go there, as they are considered as new */
+        /* use the same merged attributes to check the ignore condition */
+        if (rbhext_ignore(&p_op->entry_id, &merged_attrs))
+        {
+            DisplayLog(LVL_DEBUG, ENTRYPROC_TAG,
+                       "Special file or dir '%s' skipped",
+                       (ATTR_FSorDB_TEST(p_op, fullpath )?
+                        ATTR_FSorDB(p_op, fullpath):
+                        ATTR_FSorDB(p_op, name)));
+            goto skip_record;
+        }
+    }
+    #endif
 
     /* print diff */
     rc = EntryProcessor_Acknowledge( p_op, STAGE_REPORT_DIFF, FALSE );
@@ -739,9 +673,6 @@ int EntryProc_report_diff( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
 {
     const pipeline_stage_t *stage_info = &entry_proc_pipeline[p_op->pipeline_stage];
     int rc;
-
-    /* final check before displaying diff */
-    SKIP_SPECIAL_OBJ(p_op, skip_record);
 
 #ifdef ATTR_INDEX_creation_time
     /* once set, never change creation time */
@@ -864,16 +795,6 @@ int EntryProc_report_diff( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
         DisplayLog( LVL_CRIT, ENTRYPROC_TAG, "Error acknowledging stage %s",
                     stage_info->stage_name );
     return rc;
-
-#ifdef HAVE_SHOOK
-skip_record:
-    /* remove the operation from pipeline */
-    rc = EntryProcessor_Acknowledge( p_op, -1, TRUE );
-
-    if ( rc )
-        DisplayLog( LVL_CRIT, ENTRYPROC_TAG, "Error %d acknowledging stage.", rc );
-    return rc;
-#endif
 }
 
 /* forward declaration to check batchable operations for db_apply stage */
@@ -966,14 +887,16 @@ int EntryProc_apply( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
         }
 
         if ( rc )
-            DisplayLog( LVL_CRIT, ENTRYPROC_TAG, "Error %d performing database operation.", rc );
+            DisplayLog(LVL_CRIT, ENTRYPROC_TAG, "Error %d performing database operation: %s.",
+                       rc, lmgr_err2str(rc));
     }
     else if (diff_arg->db_tag)
     {
         /* tag the entry in the DB */
         rc = ListMgr_TagEntry(lmgr, diff_arg->db_tag, &p_op->entry_id);
         if ( rc )
-            DisplayLog( LVL_CRIT, ENTRYPROC_TAG, "Error %d performing database operation.", rc );
+            DisplayLog(LVL_CRIT, ENTRYPROC_TAG, "Error %d performing database operation: %s.",
+                       rc, lmgr_err2str(rc));
     }
 
     if (diff_arg->apply == APPLY_FS)
@@ -1110,7 +1033,8 @@ int EntryProc_batch_apply(struct entry_proc_op_t **ops, int count,
     }
 
     if (rc)
-        DisplayLog(LVL_CRIT, ENTRYPROC_TAG, "Error %d performing batch database operation.", rc);
+        DisplayLog(LVL_CRIT, ENTRYPROC_TAG, "Error %d performing batch database operation: %s.",
+                   rc, lmgr_err2str(rc));
 
     rc = EntryProcessor_AcknowledgeBatch(ops, count, -1, TRUE);
     if (rc)

@@ -1384,7 +1384,7 @@ static int hints_mask(  char * hints )
         }
 
         memset( varname, 0, sizeof(varname) );
-        strncpy( varname, begin_var+1, end_var-begin_var-1 );
+        strncpy(varname, begin_var+1, end_var-begin_var-1);
 
         if (!strcasecmp( varname, "path" ) )
            mask |= ATTR_MASK_fullpath;
@@ -1489,7 +1489,7 @@ static int read_filesets( config_file_t config, fileset_list_t * fileset_list,
                 }
             }
 
-            strncpy( fileset_list->fileset_list[i].fileset_id, fsname, FILESET_ID_LEN );
+            rh_strncpy(fileset_list->fileset_list[i].fileset_id, fsname, FILESET_ID_LEN);
 
             /* read file class block content */
             for ( j = 0; j < rh_config_GetNbItems( curr_class ); j++ )
@@ -1832,7 +1832,7 @@ static int parse_policy_block( config_item_t config_item,
     is_default = !strcasecmp( polname, "default" );
 
     /* save policy id */
-    strncpy( output_policy->policy_id, polname, POLICY_ID_LEN );
+    rh_strncpy(output_policy->policy_id, polname, POLICY_ID_LEN);
 
     /* read file block content */
     for ( i = 0; i < rh_config_GetNbItems( config_item ); i++ )
@@ -2111,7 +2111,6 @@ static int read_policy( config_file_t config, policies_t * policies, char *msg_o
     policy_list_t *policy_list;
     config_item_t  section;
     char          *section_name;
-    int default_found = FALSE;
 
 /* macros for cleaner code */
 #define curr_ign        policy_list->whitelist_count
@@ -2196,9 +2195,6 @@ static int read_policy( config_file_t config, policies_t * policies, char *msg_o
                                          policy_type, msg_out );
                 if ( rc )
                     goto free_policy;
-
-                if ( !strcasecmp( policy_list->policy_list[curr_pol].policy_id, "default" ))
-                    default_found = TRUE;
 
                 policy_list->global_attr_mask |= policy_list->policy_list[curr_pol].attr_mask;
                 curr_pol++;
@@ -2313,10 +2309,6 @@ static int read_policy( config_file_t config, policies_t * policies, char *msg_o
         }                       /* end of vars */
 
     }                           /* end of section content */
-
-    /* check that the policy has a default case */
-    if ( !default_found )
-        DisplayLog( LVL_MAJOR, "PolicyCheck", "WARNING: no default policy found in section '%s'", section_name );
 
     return 0;
 

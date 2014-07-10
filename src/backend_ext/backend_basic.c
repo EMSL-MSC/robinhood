@@ -39,6 +39,8 @@
 #include <pwd.h>
 #include <grp.h>
 #include <ctype.h>
+#include <fnmatch.h>
+#include <zlib.h>
 
 
 #ifdef HAVE_PURGE_POLICY
@@ -94,6 +96,11 @@ static void clean_bad_chars(char * path)
     }
 }
 
+#ifdef HAVE_SHOOK
+static char lock_dirname[RBH_NAME_MAX] = "";
+static char restripe_dirname[RBH_NAME_MAX] = "";
+#endif
+
 /**
  * Initialize the extension module.
  * \param[in] config_string specific config string (e.g path to config file...)
@@ -121,6 +128,9 @@ int rbhext_init( const backend_config_t * conf,
                     rc );
         return rc;
     }
+
+    strcpy(lock_dirname, basename(LOCK_DIR));
+    strcpy(restripe_dirname, basename(RESTRIPE_DIR));
 #endif
 
     /* check that backend filesystem is mounted */
@@ -130,6 +140,106 @@ int rbhext_init( const backend_config_t * conf,
         return -rc;
 
     return 0;
+}
+
+
+/* return the mask of needed attributes to know if an entry is to be ignored */
+int rbhext_ignore_need()
+{
+    return ATTR_MASK_fullpath | ATTR_MASK_name | ATTR_MASK_parent_id | ATTR_MASK_type;
+}
+
+int rbhext_ignore(const entry_id_t *p_id, attr_set_t *p_attrs)
+{
+#ifndef HAVE_SHOOK
+    return 0;
+#else
+    /* if we don't know the full path, but the name looks like
+     * an ignored entry, get the path */
+    if (!ATTR_MASK_TEST(p_attrs, fullpath)
+        && ATTR_MASK_TEST(p_attrs, name))
+    {
+        if (!strcmp(ATTR(p_attrs, name), SHOOK_DIR)
+            || !strcmp(ATTR(p_attrs, name), lock_dirname)
+            || !strcmp(ATTR(p_attrs, name), restripe_dirname)
+            || !strncmp(SHOOK_LOCK_PREFIX, ATTR(p_attrs, name), strlen(SHOOK_LOCK_PREFIX))
+            || !strncmp(RESTRIPE_SRC_PREFIX, ATTR(p_attrs, name), strlen(RESTRIPE_SRC_PREFIX))
+            || !strncmp(RESTRIPE_TGT_PREFIX, ATTR(p_attrs, name), strlen(RESTRIPE_TGT_PREFIX)))
+        {
+            if (Lustre_GetFullPath(p_id, ATTR(p_attrs,fullpath), RBH_PATH_MAX) != 0)
+                /* ignore, by default */
+                return TRUE;
+            else
+                /* continue with path checking */
+                ATTR_MASK_SET(p_attrs, fullpath);
+        }
+        else /* no possible match */
+            return FALSE;
+    }
+
+    if (ATTR_MASK_TEST(p_attrs, fullpath))
+    {
+        /* check lock file */
+        if (!fnmatch("*/"LOCK_DIR"/"SHOOK_LOCK_PREFIX"*", ATTR(p_attrs, fullpath ), 0))
+        {
+            /* skip the entry */
+            DisplayLog(LVL_DEBUG, RBHEXT_TAG, "%s is a shook lock",
+                       ATTR(p_attrs, fullpath));
+            /** @TODO raise special event for the file: LOCK/UNLOCK */
+            return TRUE;
+        }
+        /* check lock dir */
+        else if (!fnmatch("*/"LOCK_DIR, ATTR(p_attrs, fullpath ), 0))
+        {
+            /* skip the entry */
+            DisplayLog(LVL_DEBUG, RBHEXT_TAG, "%s is a shook lock dir",
+                       ATTR(p_attrs, fullpath));
+            return TRUE;
+        }
+        /* check restripe dir */
+        else if (!fnmatch("*/"RESTRIPE_DIR, ATTR(p_attrs, fullpath ), 0))
+        {
+            /* skip the entry */
+            DisplayLog(LVL_DEBUG, RBHEXT_TAG, "%s is a shook restripe dir",
+                       ATTR(p_attrs, fullpath));
+            return TRUE;
+        }
+    }
+
+    /* match '.shook' directory */
+    if (p_attrs && ATTR_MASK_TEST( p_attrs, name )
+        && ATTR_MASK_TEST( p_attrs, type ))
+    {
+        if ( !strcmp(STR_TYPE_DIR, ATTR(p_attrs, type)) &&
+             !strcmp(SHOOK_DIR, ATTR(p_attrs, name)) )
+        {
+            /* skip the entry */
+            DisplayLog(LVL_DEBUG, RBHEXT_TAG, "\"%s\" is a shook dir",
+                       ATTR(p_attrs, name));
+            return TRUE;
+        }
+    }
+
+    /* if the removed entry is a restripe source,
+     * we MUST NOT remove the backend entry
+     * as it will be linked to the restripe target
+     */
+    if ( (ATTR_MASK_TEST(p_attrs, fullpath)
+               && !fnmatch("*/"RESTRIPE_DIR"/"RESTRIPE_SRC_PREFIX"*",
+                     ATTR(p_attrs, fullpath), 0))
+        ||
+        (ATTR_MASK_TEST(p_attrs, name)
+         && !strncmp(RESTRIPE_SRC_PREFIX, ATTR(p_attrs, name),
+                     strlen(RESTRIPE_SRC_PREFIX))))
+    {
+        DisplayLog( LVL_DEBUG, RBHEXT_TAG, "Removing shook stripe source %s: no removal in backend!",
+                    ATTR_MASK_TEST(p_attrs, fullpath)?
+                    ATTR(p_attrs, fullpath) : ATTR(p_attrs, name));
+        return TRUE;
+    }
+
+    return FALSE;
+#endif
 }
 
 /**
@@ -205,7 +315,8 @@ typedef enum {
 static void entry2backend_path( const entry_id_t * p_id,
                                const attr_set_t * p_attrs_in,
                                what_for_e what_for,
-                               char * backend_path )
+                               char * backend_path,
+                               int allow_compress)
 {
     int pathlen;
     char rel_path[RBH_PATH_MAX];
@@ -220,6 +331,7 @@ static void entry2backend_path( const entry_id_t * p_id,
              !strcasecmp(ATTR(p_attrs_in, type), STR_TYPE_DIR))
     {
         if (ATTR_MASK_TEST(p_attrs_in, fullpath) &&
+            ATTR(p_attrs_in, fullpath)[0] == '/' &&
             relative_path(ATTR(p_attrs_in, fullpath), global_config.fs_path,
                           rel_path ) == 0)
         {
@@ -235,7 +347,16 @@ static void entry2backend_path( const entry_id_t * p_id,
         {
             const char * fname;
 
-            if ( ATTR_MASK_TEST(p_attrs_in, name) )
+            /* There is something in the fullpath, but it is not under FS root
+             * or it is relative */
+            if (ATTR_MASK_TEST(p_attrs_in, fullpath))
+            {
+                if (ATTR(p_attrs_in, fullpath)[0] == '/')
+                    fname = ATTR(p_attrs_in, fullpath) + 1;
+                else
+                    fname = ATTR(p_attrs_in, fullpath);
+            }
+            else if (ATTR_MASK_TEST(p_attrs_in, name))
                 fname = ATTR(p_attrs_in, name);
             else
                 fname = UNK_NAME;
@@ -275,6 +396,7 @@ static void entry2backend_path( const entry_id_t * p_id,
     {
         /* if the fullpath is available, build human readable path */
         if ( ATTR_MASK_TEST(p_attrs_in, fullpath) &&
+             ATTR(p_attrs_in, fullpath)[0] == '/' &&
              relative_path( ATTR(p_attrs_in, fullpath), global_config.fs_path,
                             rel_path ) == 0 )
         {
@@ -285,11 +407,20 @@ static void entry2backend_path( const entry_id_t * p_id,
             else
                 sprintf(backend_path, "%s/%s", config.root, rel_path);
         }
-        else /* we don't have fullpath available */
+        else /* we don't have fullpath available (or not in FS root, or relative) */
         {
             const char * fname;
 
-            if ( ATTR_MASK_TEST(p_attrs_in, name) )
+            /* There is something in the fullpath, but it is not under FS root
+             * or it is relative */
+            if (ATTR_MASK_TEST(p_attrs_in, fullpath))
+            {
+                if (ATTR(p_attrs_in, fullpath)[0] == '/')
+                    fname = ATTR(p_attrs_in, fullpath) + 1;
+                else
+                    fname = ATTR(p_attrs_in, fullpath);
+            }
+            else if (ATTR_MASK_TEST(p_attrs_in, name))
                 fname = ATTR(p_attrs_in, name);
             else
                 fname = UNK_NAME;
@@ -313,6 +444,12 @@ static void entry2backend_path( const entry_id_t * p_id,
                  (unsigned long long)p_id->device,
                  (unsigned long long)p_id->inode );
 #endif
+        /* check if compression is enabled and if the entry is a file */
+        if (allow_compress && !strcasecmp(ATTR(p_attrs_in, type), STR_TYPE_FILE))
+        {
+            /* append z in this case */
+            strcat(backend_path, "z");
+        }
     }
     return;
 }
@@ -440,6 +577,49 @@ static int check_running_copy(const char * bkpath)
     return 0;
 }
 
+/* get entry info from the backend (like lstat), but also check if the entry is compressed.
+ * prioritarily check the entry with the selected compression on/off.
+ */
+static int bk_lstat(const char *bkpath, struct stat *bkmd, int check_compressed, int *compressed)
+{
+    char tmp[RBH_PATH_MAX];
+    int len = strlen(bkpath);
+    *compressed = (bkpath[len - 1] == 'z');
+
+    if (!check_compressed) /* not a file, call standard lstat() */
+        return lstat(bkpath, bkmd);
+
+    if (!lstat(bkpath, bkmd))
+        return 0;
+
+    if ((errno == ENOENT) || (errno == ESTALE))
+    {
+        if (*compressed)
+        {
+            /* try without compression */
+            strcpy(tmp, bkpath);
+            tmp[len - 1] = '\0';
+
+            if (lstat(tmp, bkmd) == 0)
+            {
+                *compressed = 0;
+                return 0;
+            }
+        }
+        else if (!(*compressed))
+        {
+            /* try with compression */
+            sprintf(tmp, "%sz", bkpath);
+            if (lstat(tmp, bkmd) == 0)
+            {
+                *compressed = 1;
+                return 0;
+            }
+        }
+    }
+    return -1;
+}
+
 
 /**
  * Get the status for an entry.
@@ -455,6 +635,7 @@ int rbhext_get_status( const entry_id_t * p_id,
     struct stat bkmd;
     obj_type_t entry_type;
     char bkpath[RBH_PATH_MAX];
+    int compressed = 0;
 
     /* check if mtime is provided (mandatory) */
     if ( !ATTR_MASK_TEST(p_attrs_in, last_mod) || !ATTR_MASK_TEST(p_attrs_in, type) )
@@ -464,7 +645,7 @@ int rbhext_get_status( const entry_id_t * p_id,
     }
 
     /* path to lookup the entry in the backend */
-    entry2backend_path( p_id, p_attrs_in, FOR_LOOKUP, bkpath );
+    entry2backend_path(p_id, p_attrs_in, FOR_LOOKUP, bkpath, config.compress);
 
     /* is the entry has a supported type? */
     entry_type = ListMgr2PolicyType(ATTR(p_attrs_in, type));
@@ -545,7 +726,7 @@ int rbhext_get_status( const entry_id_t * p_id,
     }
 
     /* get entry info */
-    if ( lstat( bkpath, &bkmd ) != 0 )
+    if (bk_lstat(bkpath, &bkmd, entry_type == TYPE_FILE, &compressed) != 0)
     {
         rc = -errno;
         if ( (rc != -ENOENT) && (rc != -ESTALE) )
@@ -584,7 +765,7 @@ int rbhext_get_status( const entry_id_t * p_id,
         /* compare mtime and size to check if the entry changed */
         /* XXX consider it modified this even if mtime is smaller */
         if ( (ATTR( p_attrs_in, last_mod ) != bkmd.st_mtime )
-             || (ATTR( p_attrs_in, size ) != bkmd.st_size ) )
+             || ((ATTR( p_attrs_in, size ) != bkmd.st_size) && !compressed) )
         {
                 /* display a warning if last_mod in FS < mtime in backend */
                 if (ATTR( p_attrs_in, last_mod ) < bkmd.st_mtime)
@@ -765,10 +946,10 @@ static int mkdir_recurse_clone_attrs( const char * full_path, mode_t default_mod
     /* to backend or the other way? */
     if ( target == TO_BACKEND )
     {
-        if ( strncmp(config.root,full_path, strlen(config.root)) != 0 )
+        if (strncmp(config.root,full_path, strlen(config.root)) != 0)
         {
-            DisplayLog( LVL_MAJOR, RBHEXT_TAG, "Error: '%s' in not under backend root '%s'",
-                        full_path, config.root );
+            DisplayLog(LVL_MAJOR, RBHEXT_TAG, "Error: '%s' is not under backend root '%s'",
+                       full_path, config.root);
             return -EINVAL;
         }
         /* skip backend root */
@@ -776,27 +957,34 @@ static int mkdir_recurse_clone_attrs( const char * full_path, mode_t default_mod
     }
     else
     {
-        if ( strncmp(global_config.fs_path,full_path, strlen(global_config.fs_path)) != 0 )
+        /* is it relative? */
+        if (!EMPTY_STRING(full_path) && (full_path[0] != '/'))
         {
-            DisplayLog( LVL_MAJOR, RBHEXT_TAG, "Error: '%s' in not under filesystem root '%s'",
-                        full_path, global_config.fs_path );
+            curr = full_path;
+            goto relative;
+        }
+        else if (strncmp(global_config.fs_path,full_path, strlen(global_config.fs_path)) != 0)
+        {
+            DisplayLog(LVL_MAJOR, RBHEXT_TAG, "Error: '%s' is not under filesystem root '%s'",
+                       full_path, global_config.fs_path);
             return -EINVAL;
         }
         /* skip fs root */
         curr = full_path + strlen(global_config.fs_path);
     }
 
-    if ( *curr == '\0' ) /* full_path is root dir */
+    if (*curr == '\0') /* full_path is root dir */
         return 0;
-    else if ( *curr != '/' ) /* slash expected */
+    else if (*curr != '/') /* slash expected */
     {
-        DisplayLog( LVL_MAJOR, RBHEXT_TAG, "Error: '%s' in not under backend root '%s'",
-                    full_path, (target == TO_BACKEND)?config.root:global_config.fs_path );
+        DisplayLog(LVL_MAJOR, RBHEXT_TAG, "Error: '%s' is not under backend root '%s'",
+                   full_path, (target == TO_BACKEND)?config.root:global_config.fs_path);
         return -EINVAL;
     }
 
     /* skip first slash */
     curr ++;
+relative:
 
     while( (curr = strchr( curr, '/' )) != NULL )
     {
@@ -808,7 +996,7 @@ static int mkdir_recurse_clone_attrs( const char * full_path, mode_t default_mod
         int path_len = curr - full_path;
 
         /* extract directory name */
-        strncpy( path_copy, full_path, path_len );
+        strncpy(path_copy, full_path, path_len);
         path_copy[path_len]='\0';
 
         /* stat dir */
@@ -909,80 +1097,136 @@ static int file_clone_attrs(const char *tgt, const struct stat *st)
     return 0;
 }
 
-static int builtin_copy(const char *src, const char *dst, int dst_flags,
-                        int save_attrs)
-{
 /* log tag for built-in copy */
 #define CP_TAG "cp"
+
+#define COMPRESSED_SRC  (1 << 0)
+#define COMPRESS_DEST   (1 << 1)
+#define USE_SENDFILE    (1 << 2)
+
+struct copy_info {
+    const char  *src;
+    const char  *dst;
+    int          src_fd;
+    int          dst_fd;
+    struct stat  src_st;
+};
+
+static int flush_data(int srcfd, int dstfd)
+{
+    posix_fadvise(srcfd, 0, 0, POSIX_FADV_DONTNEED);
+    if (config.sync_archive_data)
+    {
+        if (fdatasync(dstfd) < 0)
+            return -errno;
+    }
+    posix_fadvise(dstfd, 0, 0, POSIX_FADV_DONTNEED);
+    return 0;
+}
+
+static int builtin_copy_standard(const struct copy_info *cp_nfo, int flags)
+{
     int srcfd, dstfd;
-    struct stat st_src, st_dst;
+    struct stat dst_st;
     int rc = 0;
     size_t  io_size;
     ssize_t r = 0, w = 0;
     char *io_buff = NULL;
+    gzFile gz = NULL;
+    int gzerr, err_close = 0;
 
-    srcfd = open(src, O_RDONLY | O_NOATIME);
-    if (srcfd < 0)
+    if ((flags & COMPRESSED_SRC) && (flags & COMPRESS_DEST))
     {
-        rc = -errno;
-        DisplayLog(LVL_MAJOR, CP_TAG, "Can't open %s for read: %s",
-                   src, strerror(-rc));
-        return rc;
+        DisplayLog(LVL_MAJOR, CP_TAG, "Copy function doesn't handle "
+                   "compression for both source and destination");
+        return -EINVAL;
     }
 
-    /* get src attrs */
-    if (fstat(srcfd, &st_src))
+    if (flags & COMPRESSED_SRC)
+    {
+        srcfd = dup(cp_nfo->src_fd);
+        dstfd = cp_nfo->dst_fd;
+
+        gz = gzdopen(srcfd, "rb");
+        if (gz == NULL)
+        {
+            DisplayLog(LVL_MAJOR, CP_TAG,
+                       "Failed to initialize decompression stream");
+            close(srcfd);
+            return -EIO;
+        }
+    }
+    else if (flags & COMPRESS_DEST)
+    {
+        srcfd = cp_nfo->src_fd;
+        dstfd = dup(cp_nfo->dst_fd);
+
+        gz = gzdopen(dstfd, "wb");
+        if (gz == NULL)
+        {
+            DisplayLog(LVL_MAJOR, CP_TAG,
+                       "Failed to initialize decompression stream");
+            close(dstfd);
+            return -EIO;
+        }
+    }
+    else
+    {
+        /* Uncompressed regular copy */
+        srcfd = cp_nfo->src_fd;
+        dstfd = cp_nfo->dst_fd;
+    }
+
+    /* needed to get the biggest IO size of source and destination. */
+    if (fstat(dstfd, &dst_st))
     {
         rc = -errno;
         DisplayLog(LVL_MAJOR, CP_TAG, "Failed to stat %s: %s",
-                   src, strerror(-rc));
-        goto close_src;
+                   cp_nfo->dst, strerror(-rc));
+        goto out_close;
     }
 
-    dstfd = open(dst, dst_flags, st_src.st_mode & 07777);
-    if (dstfd < 0)
-    {
-        rc = -errno;
-        DisplayLog(LVL_MAJOR, CP_TAG, "Can't open %s for write: %s",
-                   src, strerror(-rc));
-        goto close_src;
-    }
-
-    /* needed to get the biggest IO size of source and destination.  */
-    if (fstat(dstfd, &st_dst))
-    {
-        rc = -errno;
-        DisplayLog(LVL_MAJOR, CP_TAG, "Failed to stat %s: %s",
-                   dst, strerror(-rc));
-        goto close_dst;
-    }
-    io_size = MAX2(st_src.st_blksize, st_dst.st_blksize);
+    io_size = MAX2(cp_nfo->src_st.st_blksize, dst_st.st_blksize);
     DisplayLog(LVL_DEBUG, CP_TAG, "using IO size = %"PRI_SZ, io_size);
+
     io_buff = MemAlloc(io_size);
     if (!io_buff)
     {
         rc = -ENOMEM;
-        goto close_dst;
+        goto out_close;
     }
 
-    /* do the copy */
-    while ((r = read(srcfd, io_buff, io_size)) > 0)
+    /* Do the copy */
+    do
     {
-        w = write(dstfd, io_buff, r);
+        if (flags & COMPRESSED_SRC)
+            r = gzread(gz, io_buff, io_size);
+        else
+            r = read(srcfd, io_buff, io_size);
+
+        if (r <= 0)
+            break;
+
+        if (flags & COMPRESS_DEST)
+            w = gzwrite(gz, io_buff, r);
+        else
+            w = write(dstfd, io_buff, r);
+
         if (w < 0)
         {
             rc = -errno;
             DisplayLog(LVL_MAJOR, CP_TAG, "Copy error (%s -> %s): %s",
-                       src, dst, strerror(-rc));
+                       cp_nfo->src, cp_nfo->dst, strerror(-rc));
             goto out_free;
         }
         else if (w < r)
         {
-            DisplayLog(LVL_MAJOR, CP_TAG, "Short write on %s, aborting copy", dst);
+            DisplayLog(LVL_MAJOR, CP_TAG, "Short write on %s, aborting copy",
+                       cp_nfo->dst);
             rc = -EAGAIN;
             goto out_free;
         }
-    }
+    } while (r > 0);
 
     if (r < 0) /* error */
     {
@@ -991,25 +1235,136 @@ static int builtin_copy(const char *src, const char *dst, int dst_flags,
     }
     /* else (r == 0): EOF */
 
+    /* need to flush the compression buffer before system sync */
+    if (flags & COMPRESS_DEST)
+    {
+        if (gzflush(gz, Z_FINISH) != Z_OK)
+        {
+            DisplayLog(LVL_MAJOR, CP_TAG, "compression error for %s: %s",
+                       cp_nfo->dst, gzerror(gz, &gzerr));
+            rc = -EIO;
+            goto out_free;
+        }
+    }
+
+    /* Free the kernel buffer cache as we don't expect to read the files again.
+     * This can be done immediatly for the read file.
+     * For the written file, we need to flush it to disk to ensure
+     * that it is correctly archived and to allow freeing the buffer cache. */
+    rc = flush_data(srcfd, dstfd);
+    if (rc)
+        goto out_free;
+
 out_free:
     MemFree(io_buff);
-close_dst:
-    if ((close(dstfd) < 0) && (rc == 0))
+
+out_close:
+    if (flags & (COMPRESSED_SRC | COMPRESS_DEST))
+        err_close = (gzclose(gz) != Z_OK);
+
+    if (err_close && rc == 0)
+    {
+        rc = errno ? -errno : -EIO;
+        DisplayLog(LVL_MAJOR, CP_TAG, "close failed on %s: %s",
+                   cp_nfo->src, "error closing compression stream");
+    }
+
+    return rc;
+}
+
+static int builtin_copy_sendfile(const struct copy_info *cp_nfo, int flags)
+{
+    int rc;
+    int srcfd = cp_nfo->src_fd;
+    int dstfd = cp_nfo->dst_fd;
+    size_t fsize = cp_nfo->src_st.st_size;
+
+#if HAVE_FALLOCATE
+    rc = fallocate(dstfd, 0, 0, fsize);
+    if (rc)
     {
         rc = -errno;
+        DisplayLog(LVL_MAJOR, CP_TAG, "Failed to fallocate %s: %s",
+                   cp_nfo->dst, strerror(-rc));
+        goto out;
+    }
+#endif
+
+    rc = sendfile(dstfd, srcfd, NULL, fsize);
+    if (rc)
+    {
+        rc = -errno;
+        DisplayLog(LVL_MAJOR, CP_TAG, "Failed to sendfile(%s->%s): %s",
+                   cp_nfo->src, cp_nfo->dst, strerror(-rc));
+        goto out;
+    }
+
+    rc = flush_data(srcfd, dstfd);
+    if (rc)
+        goto out;
+
+out:
+    return rc;
+}
+
+static int builtin_copy(const char *src, const char *dst, int dst_flags,
+                        int save_attrs, int flags)
+{
+    struct copy_info cp_nfo;
+    int rc, err_close = 0;
+
+    cp_nfo.src = src;
+    cp_nfo.dst = dst;
+
+    cp_nfo.src_fd = open(src, O_RDONLY | O_NOATIME);
+    if (cp_nfo.src_fd < 0)
+    {
+        rc = -errno;
+        DisplayLog(LVL_MAJOR, CP_TAG, "Can't open %s for read: %s", src,
+                   strerror(-rc));
+        return rc;
+    }
+
+    if (fstat(cp_nfo.src_fd, &cp_nfo.src_st))
+    {
+        rc = -errno;
+        DisplayLog(LVL_MAJOR, CP_TAG, "Failed to stat %s: %s", src,
+                   strerror(-rc));
+        goto close_src;
+    }
+
+    cp_nfo.dst_fd = open(dst, dst_flags, cp_nfo.src_st.st_mode & 07777);
+    if (cp_nfo.dst_fd < 0)
+    {
+        rc = -errno;
+        DisplayLog(LVL_MAJOR, CP_TAG, "Can't open %s for write: %s",
+                   dst, strerror(-rc));
+        goto close_src;
+    }
+
+    if (flags & (COMPRESSED_SRC | COMPRESS_DEST))
+        rc = builtin_copy_standard(&cp_nfo, flags);
+    else if (flags & USE_SENDFILE)
+        rc = builtin_copy_sendfile(&cp_nfo, flags);
+    else
+        rc = builtin_copy_standard(&cp_nfo, flags);
+
+    err_close = close(cp_nfo.dst_fd);
+    if (err_close && (rc == 0))
+    {
+        rc = errno ? -errno : -EIO;
         DisplayLog(LVL_MAJOR, CP_TAG, "close failed on %s: %s",
                    dst, strerror(-rc));
     }
 
 close_src:
-    close(srcfd);
+    close(cp_nfo.src_fd);
 
-    /* save attributes if the copy was sucessfull, and if asked */
-    if (rc == 0)
-        rc = file_clone_attrs(dst, &st_src);
+    if (rc == 0 && save_attrs)
+        rc = file_clone_attrs(dst, &cp_nfo.src_st);
 
     return rc;
-} /* builtin_copy */
+}
 
 
 /**
@@ -1069,7 +1424,7 @@ int rbhext_archive( rbhext_arch_meth arch_meth,
     }
 
     /* compute path for target file */
-    entry2backend_path( p_id, p_attrs, FOR_NEW_COPY, bkpath );
+    entry2backend_path(p_id, p_attrs, FOR_NEW_COPY, bkpath, config.compress);
 
     /* check the status */
     if ( ATTR(p_attrs, status) == STATUS_NEW )
@@ -1086,7 +1441,7 @@ int rbhext_archive( rbhext_arch_meth arch_meth,
     else if ( ATTR(p_attrs, status) == STATUS_MODIFIED
              || ATTR(p_attrs, status) == STATUS_ARCHIVE_RUNNING ) /* for timed out copies.. or ourselves! */
      {
-        /* chexck if somebody else is about to copy */
+        /* check if somebody else is about to copy */
         rc = check_running_copy(bkpath);
         if (rc < 0)
             return rc;
@@ -1101,8 +1456,9 @@ int rbhext_archive( rbhext_arch_meth arch_meth,
             if ( lstat(ATTR(p_attrs,backendpath), &void_stat) != 0 )
             {
                 rc = -errno;
-                DisplayLog( LVL_MAJOR, RBHEXT_TAG, "Warning: previous copy %s not found in backend (errno=%d, %s): archiving anyway.",
-                            ATTR(p_attrs,backendpath) , -rc, strerror(-rc) );
+                DisplayLog(LVL_MAJOR, RBHEXT_TAG, "Warning: previous copy %s not found in backend (errno=%d, %s): "
+                           "entry will be archived again as %s.",
+                           ATTR(p_attrs,backendpath), -rc, strerror(-rc), bkpath);
             }
         }
     }
@@ -1159,13 +1515,15 @@ int rbhext_archive( rbhext_arch_meth arch_meth,
 
         /* execute the archive command (or built-in, if not set) */
         if (EMPTY_STRING(config.action_cmd))
-            rc = builtin_copy(fspath, tmp, O_WRONLY | O_CREAT | O_TRUNC, TRUE);
+            rc = builtin_copy(fspath, tmp, O_WRONLY | O_CREAT | O_TRUNC, TRUE,
+                              (config.compress?COMPRESS_DEST:0) |
+                              (config.sendfile?USE_SENDFILE:0));
         else
         {
             if (hints)
-                rc = execute_shell_command(config.action_cmd, 4, "ARCHIVE", fspath, tmp, hints);
+                rc = execute_shell_command(TRUE, config.action_cmd, 4, "ARCHIVE", fspath, tmp, hints);
             else
-                rc = execute_shell_command(config.action_cmd, 3, "ARCHIVE", fspath, tmp);
+                rc = execute_shell_command(TRUE, config.action_cmd, 3, "ARCHIVE", fspath, tmp);
         }
 
         if (rc)
@@ -1410,6 +1768,8 @@ static inline int create_parent_of_clone_attrs(const char * child_path, entry_id
     return 0;
 }
 
+#define IS_ZIP_NAME(_n) (_n[strlen(_n) - 1] == 'z')
+
 /** recover a file from the backend after formatting FS
  * \retval recovery status
  */
@@ -1421,6 +1781,7 @@ recov_status_t rbhext_recover( const entry_id_t * p_old_id,
 {
     char bkpath[RBH_PATH_MAX] = "";
     char link[RBH_PATH_MAX] = "";
+    char buff[RBH_PATH_MAX] = "";
     const char * backend_path = NULL;
     const char * fspath;
     int rc;
@@ -1435,13 +1796,30 @@ recov_status_t rbhext_recover( const entry_id_t * p_old_id,
     int set_mode = FALSE;
     int stat_done = FALSE;
     int no_copy = FALSE;
+    int compressed = 0;
 
-    if ( !ATTR_MASK_TEST( p_attrs_old, fullpath ) )
+    if (!ATTR_MASK_TEST(p_attrs_old, fullpath) || EMPTY_STRING(ATTR(p_attrs_old, fullpath)))
     {
         DisplayLog( LVL_MAJOR, RBHEXT_TAG, "Missing mandatory attribute 'fullpath' for restoring entry "DFID, PFID(p_old_id) );
         return RS_ERROR;
     }
-    fspath = ATTR( p_attrs_old, fullpath );
+    fspath = ATTR(p_attrs_old, fullpath);
+    /* if FS path is not absolute, get the relative backend path and append to FS root */
+    if (fspath[0] != '/')
+    {
+        char tmp[RBH_PATH_MAX];
+        if (ATTR_MASK_TEST(p_attrs_old, backendpath))
+        {
+            relative_path(ATTR(p_attrs_old, backendpath), config.root, tmp);
+            sprintf(buff, "%s/%s/%s",global_config.fs_path, dirname(tmp), strrchr(fspath, '/') + 1);
+            fspath = buff;
+        }
+        else /* use the given relative path */
+        {
+            sprintf(buff, "%s/%s", global_config.fs_path, ATTR(p_attrs_old, fullpath));
+            fspath = buff;
+        }
+    }
 
     if ( ATTR_MASK_TEST( p_attrs_old, backendpath) )
         backend_path = ATTR( p_attrs_old, backendpath );
@@ -1454,7 +1832,7 @@ recov_status_t rbhext_recover( const entry_id_t * p_old_id,
             lvl_log = LVL_EVENT;
         else
             lvl_log = LVL_VERB;
-        entry2backend_path( p_old_id, p_attrs_old, FOR_LOOKUP, bkpath );
+        entry2backend_path(p_old_id, p_attrs_old, FOR_LOOKUP, bkpath, config.compress);
         DisplayLog( lvl_log, RBHEXT_TAG,
                     "No backend path is set for '%s', guess it could be '%s'",
                     fspath, bkpath );
@@ -1465,7 +1843,7 @@ recov_status_t rbhext_recover( const entry_id_t * p_old_id,
     {
         if (bkinfo)
             st_bk=*bkinfo;
-        else if (lstat( backend_path, &st_bk ) != 0)
+        else if (bk_lstat(backend_path, &st_bk, 1, &compressed) != 0)
         {
             rc = errno;
             DisplayLog( LVL_MAJOR, RBHEXT_TAG, "Cannot restore entry "
@@ -1567,14 +1945,16 @@ recov_status_t rbhext_recover( const entry_id_t * p_old_id,
             {
                 st_bk=*bkinfo;
                 stat_done = TRUE;
+                /* does the backend path looks compressed? */
+                compressed = IS_ZIP_NAME(backend_path);
             }
-            else if ( lstat( backend_path, &st_bk ) != 0 )
+            else if (bk_lstat(backend_path, &st_bk, 1, &compressed) != 0)
             {
                 rc = errno;
                 if (rc != ENOENT)
                 {
-                    DisplayLog( LVL_MAJOR, RBHEXT_TAG, "Cannot stat '%s' in backend: %s",
-                                backend_path, strerror(rc) );
+                    DisplayLog(LVL_MAJOR, RBHEXT_TAG, "Cannot stat '%s' in backend: %s",
+                               backend_path, strerror(rc));
                     return RS_ERROR;
                 }
             }
@@ -1605,20 +1985,20 @@ recov_status_t rbhext_recover( const entry_id_t * p_old_id,
 
             ATTR_MASK_INIT( &attr_bk );
             /* merge missing posix attrs to p_attrs_old */
-            PosixStat2EntryAttr( &st_bk, &attr_bk, TRUE );
+            PosixStat2EntryAttr(&st_bk, &attr_bk, TRUE);
             /* leave attrs unchanged if they are already set in p_attrs_old */
-            ListMgr_MergeAttrSets( p_attrs_old, &attr_bk, FALSE );
+            ListMgr_MergeAttrSets(p_attrs_old, &attr_bk, FALSE);
         }
 
         /* test if the target does not already exist */
-        rc = lstat( ATTR(p_attrs_old, fullpath), &st_dest ) ? errno : 0;
-        if ( rc == 0 )
+        rc = lstat(fspath, &st_dest) ? errno : 0;
+        if (rc == 0)
         {
             DisplayLog( LVL_MAJOR, RBHEXT_TAG, "Error: cannot recover '%s': already exists",
                         fspath );
             return RS_ERROR;
         }
-        else if ( rc != ENOENT )
+        else if (rc != ENOENT)
         {
             DisplayLog( LVL_MAJOR, RBHEXT_TAG, "Unexpected error performing lstat(%s): %s",
                         fspath, strerror(rc) );
@@ -1648,7 +2028,7 @@ recov_status_t rbhext_recover( const entry_id_t * p_old_id,
         /* restripe the file in Lustre */
         if (ATTR_MASK_TEST(p_attrs_old, stripe_info))
         {
-            CreateStriped( fspath, &ATTR( p_attrs_old, stripe_info ), FALSE );
+            CreateStriped(fspath, &ATTR( p_attrs_old, stripe_info ), FALSE);
             set_mode= TRUE;
         }
         else {
@@ -1675,6 +2055,8 @@ recov_status_t rbhext_recover( const entry_id_t * p_old_id,
          * so it will be recovered at first open.
          */
     #ifdef HAVE_SHOOK
+            size_t restore_size = st_bk.st_size;
+
             /* set the file in "released" state */
             rc = shook_set_status(fspath, SS_RELEASED);
             if (rc)
@@ -1682,9 +2064,13 @@ recov_status_t rbhext_recover( const entry_id_t * p_old_id,
                 DisplayLog( LVL_CRIT, RBHEXT_TAG, "ERROR setting released state for '%s': %s",
                             fspath, strerror(-rc));
                 return RS_ERROR;
-            }
+             }
 
-            rc = truncate( fspath, st_bk.st_size ) ? errno : 0;
+            /* if the file was compressed, set the saved size (from the DB), not the one from the backend */
+            if (compressed && p_attrs_old && ATTR_MASK_TEST(p_attrs_old, size))
+                restore_size = ATTR(p_attrs_old, size);
+
+            rc = truncate(fspath, restore_size) ? errno : 0;
             if (rc)
             {
                 DisplayLog( LVL_CRIT, RBHEXT_TAG, "ERROR could not set original size %"PRI_SZ" for '%s': %s",
@@ -1697,9 +2083,11 @@ recov_status_t rbhext_recover( const entry_id_t * p_old_id,
     #else
             /* full restore (even data) */
             if (EMPTY_STRING(config.action_cmd))
-                rc = builtin_copy(backend_path, fspath, O_WRONLY, FALSE);
+                rc = builtin_copy(backend_path, fspath, O_WRONLY, FALSE,
+                                  (compressed?COMPRESSED_SRC:0) |
+                                  (config.sendfile?USE_SENDFILE:0));
             else
-                rc = execute_shell_command(config.action_cmd, 3, "RESTORE",
+                rc = execute_shell_command(TRUE, config.action_cmd, 3, "RESTORE",
                                            backend_path, fspath);
             if (rc)
                 return RS_ERROR;
@@ -1761,7 +2149,7 @@ recov_status_t rbhext_recover( const entry_id_t * p_old_id,
             struct passwd pw;
             struct passwd * p_pw;
 
-            if ((getpwnam_r( ATTR(p_attrs_old, owner ), &pw, buff, 4096, &p_pw ) != 0)
+            if ((getpwnam_r(ATTR(p_attrs_old, owner), &pw, buff, 4096, &p_pw ) != 0)
                  || (p_pw == NULL))
             {
                 DisplayLog( LVL_MAJOR, RBHEXT_TAG, "Warning: couldn't resolve uid for user '%s'",
@@ -1830,11 +2218,16 @@ recov_status_t rbhext_recover( const entry_id_t * p_old_id,
     {
         if ( ATTR_MASK_TEST(p_attrs_old, size) && (st_dest.st_size != ATTR(p_attrs_old, size)) )
         {
-            DisplayLog( LVL_MAJOR, RBHEXT_TAG, "%s: the restored size (%zu) is "
-                        "different from the last known size in filesystem (%"PRIu64"): "
-                        "it should have been modified in filesystem after the last backup.",
-                        fspath, st_dest.st_size, ATTR(p_attrs_old, size) );
-            success_status = RS_FILE_DELTA;
+            if (!compressed)
+            {
+                DisplayLog( LVL_MAJOR, RBHEXT_TAG, "%s: the restored size (%zu) is "
+                            "different from the last known size in filesystem (%"PRIu64"): "
+                            "it may have been modified in filesystem after the last backup.",
+                            fspath, st_dest.st_size, ATTR(p_attrs_old, size) );
+                success_status = RS_FILE_DELTA;
+            }
+            else
+                success_status = RS_FILE_OK;
         }
     }
     /* only for files */
@@ -1876,7 +2269,7 @@ recov_status_t rbhext_recover( const entry_id_t * p_old_id,
     char * name = strrchr(ATTR(p_attrs_new, fullpath), '/');
     if (name && *(name + 1) != '\0')
     {
-        strncpy(ATTR( p_attrs_new, name ), name+1, RBH_NAME_MAX);
+        rh_strncpy(ATTR(p_attrs_new, name), name+1, RBH_NAME_MAX);
         ATTR_MASK_SET(p_attrs_new, name);
     }
 
@@ -1920,10 +2313,10 @@ recov_status_t rbhext_recover( const entry_id_t * p_old_id,
             ATTR_MASK_SET( p_attrs_new, status );
         }
 
-        /* set the new entry path in backend, according to the new fid */
-        entry2backend_path( p_new_id, p_attrs_new,
-                             FOR_NEW_COPY,
-                             ATTR(p_attrs_new, backendpath ) );
+        /* set the new entry path in backend, according to the new fid, and actual compression */
+        entry2backend_path(p_new_id, p_attrs_new,
+                           FOR_NEW_COPY,
+                           ATTR(p_attrs_new, backendpath), compressed);
         ATTR_MASK_SET( p_attrs_new, backendpath );
 
         /* recursively create the parent directory */
@@ -1983,6 +2376,7 @@ int rbhext_rebind(const char *fs_path, const char *old_bk_path,
     char tmp[RBH_PATH_MAX];
     char fidpath[RBH_PATH_MAX];
     char * destdir;
+    int compressed = IS_ZIP_NAME(old_bk_path);
 
     BuildFidPath( new_id, fidpath );
 
@@ -2007,11 +2401,16 @@ int rbhext_rebind(const char *fs_path, const char *old_bk_path,
     ATTR_MASK_SET( &attrs_new, fullpath );
 
     /* build new path in backend */
-    entry2backend_path(new_id, &attrs_new, FOR_NEW_COPY, new_bk_path);
+    entry2backend_path(new_id, &attrs_new, FOR_NEW_COPY, new_bk_path,
+                       compressed); /* Ensure the target name is not compressed
+                                     * if the source was not */
+    /* set compression name if the previous entry was compressed */
+    if (compressed && !IS_ZIP_NAME(new_bk_path))
+        strcat(new_bk_path, "z");
 
     /* -- move entry from old bk path to the new location -- */
 
-    /* recursively create the parent directory */
+    /* recursively create the parent directory*/
     /* extract dir path */
     strcpy(tmp, new_bk_path);
     destdir = dirname(tmp);

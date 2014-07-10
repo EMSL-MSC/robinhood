@@ -84,6 +84,7 @@ static char   *mount_point;
 static char    fsname[RBH_PATH_MAX] = "";
 static dev_t   dev_id = 0;
 static uint64_t fs_key = 0;
+static entry_id_t root_id;
 
 /* to optimize string concatenation */
 static unsigned int mount_len = 0;
@@ -165,11 +166,15 @@ static void _set_mount_point( char *mntpnt )
     }
 }
 
-static void set_fs_info( char *name, char * mountp, dev_t dev, fsid_t fsid)
+static int path2id(const char *path, entry_id_t *id);
+
+static int set_fs_info(char *name, char * mountp, dev_t dev, fsid_t fsid)
 {
-    P( mount_point_lock );
+    int rc = 0;
+
+    P(mount_point_lock);
     _set_mount_point(mountp);
-    strcpy( fsname, name );
+    strcpy(fsname, name);
     dev_id = dev;
 
     switch (global_config.fs_key)
@@ -190,7 +195,15 @@ static void set_fs_info( char *name, char * mountp, dev_t dev, fsid_t fsid)
             DisplayLog(LVL_MAJOR, "FSInfo", "Invalid fs_key type %#x", global_config.fs_key);
             fs_key = 0;
     }
-    V( mount_point_lock );
+
+    /* now, path2id can be called */
+    rc = path2id(global_config.fs_path, &root_id);
+    if (rc)
+        DisplayLog(LVL_CRIT, "FSInfo", "Failed to get id for root directory %s: %s",
+                   mountp, strerror(-rc));
+
+    V(mount_point_lock);
+    return rc;
 }
 
 /* retrieve the mount point from any module
@@ -227,6 +240,11 @@ uint64_t       get_fskey( void )
     return fs_key;
 }
 
+const entry_id_t *get_root_id(void)
+{
+    return &root_id;
+}
+
 
 
 /**
@@ -256,29 +274,31 @@ int SendMail( const char *recipient, const char *subject, const char *message )
  * If cfg_in is empty: search any config in config paths
  * /!\ not thread safe
  */
-int SearchConfig( const char * cfg_in, char * cfg_out, int * changed, char * unmatched )
+int SearchConfig(const char *cfg_in, char *cfg_out, int *changed, char *unmatched,
+                 size_t max_len)
 {
-    static const char * default_cfg_path = SYSCONFDIR"/robinhood.d/"PURPOSE_EXT;
-    DIR * dir;
-    struct dirent * ent;
+    static const char *default_cfg_path = SYSCONFDIR"/robinhood.d/"PURPOSE_EXT;
+    DIR *dir;
+    struct dirent *ent;
+    const char *cfg = cfg_in;
 
     *changed = 1; /* most of the cases */
 
-    if (cfg_in == NULL || EMPTY_STRING(cfg_in))
+    if (cfg == NULL || EMPTY_STRING(cfg))
     {
         /* check if a default config file is specified */
-        cfg_in = getenv(DEFAULT_CFG_VAR);
+        cfg = getenv(DEFAULT_CFG_VAR);
     }
 
     /* set unmatched, for better logging */
     if (unmatched) {
-        if (cfg_in)
-            strcpy(unmatched, cfg_in);
+        if (cfg)
+            rh_strncpy(unmatched, cfg, max_len);
         else
-            sprintf(unmatched, "%s/*.conf", default_cfg_path);
+            snprintf(unmatched, max_len, "%s/*.conf", default_cfg_path);
     }
 
-    if (cfg_in == NULL || EMPTY_STRING(cfg_in)) {
+    if (cfg == NULL || EMPTY_STRING(cfg)) {
         int found = 0;
 
         /* look for files in default config path */
@@ -312,15 +332,15 @@ int SearchConfig( const char * cfg_in, char * cfg_out, int * changed, char * unm
            return 0;
        }
     }
-    else if (access(cfg_in, F_OK) == 0)
+    else if (access(cfg, F_OK) == 0)
     {
         /* the specified config file exists */
-        if (cfg_out != cfg_in)
-            strcpy(cfg_out, cfg_in);
+        if (cfg_out != cfg)
+            rh_strncpy(cfg_out, cfg, max_len);
         *changed=0;
         return 0;
     }
-    else if (strchr(cfg_in, '/'))
+    else if (strchr(cfg, '/'))
     {
         /* the argument is a path (not a single name
          * and this path was not found) */
@@ -329,25 +349,25 @@ int SearchConfig( const char * cfg_in, char * cfg_out, int * changed, char * unm
     }
     else /* look for a file in the given paths */
     {
-        char cfg_cp[RBH_PATH_MAX];
-        int has_ext = (strchr(cfg_in, '.') != NULL);
+        char cfg_cp[RBH_PATH_MAX] = "";
+        int has_ext = (strchr(cfg, '.') != NULL);
 
-        strcpy(cfg_cp, cfg_in);
+        rh_strncpy(cfg_cp, cfg, MIN2(max_len, RBH_PATH_MAX));
 
         /* if the file already has an extension, try path/name */
         if (has_ext)
         {
-            sprintf(cfg_out, "%s/%s", default_cfg_path, cfg_cp);
+            snprintf(cfg_out, max_len, "%s/%s", default_cfg_path, cfg_cp);
             if (access(cfg_out, F_OK) == 0)
                 return 0;
         }
 
         /* try path/name.cfg, path/name.conf */
-        sprintf(cfg_out, "%s/%s.conf", default_cfg_path, cfg_cp);
+        snprintf(cfg_out, max_len, "%s/%s.conf", default_cfg_path, cfg_cp);
         if (access(cfg_out, F_OK) == 0)
             return 0;
 
-        sprintf(cfg_out, "%s/%s.cfg", default_cfg_path, cfg_cp);
+        snprintf(cfg_out, max_len, "%s/%s.cfg", default_cfg_path, cfg_cp);
         if (access(cfg_out, F_OK) == 0)
             return 0;
     }
@@ -442,14 +462,15 @@ void PosixStat2EntryAttr( struct stat *p_inode, attr_set_t * p_attr_set, int siz
         ATTR_MASK_SET( p_attr_set, blksize );
         ATTR( p_attr_set, blksize ) = p_inode->st_blksize;
 #endif
+
+        /* times are also wrong when they come from the MDT device */
+        ATTR_MASK_SET( p_attr_set, last_access );
+        ATTR( p_attr_set, last_access ) =
+            MAX3( p_inode->st_atime, p_inode->st_mtime, p_inode->st_ctime );
+
+        ATTR_MASK_SET( p_attr_set, last_mod );
+        ATTR( p_attr_set, last_mod ) = p_inode->st_mtime;
     }
-
-    ATTR_MASK_SET( p_attr_set, last_access );
-    ATTR( p_attr_set, last_access ) =
-        MAX3( p_inode->st_atime, p_inode->st_mtime, p_inode->st_ctime );
-
-    ATTR_MASK_SET( p_attr_set, last_mod );
-    ATTR( p_attr_set, last_mod ) = p_inode->st_mtime;
 
 #ifdef ATTR_INDEX_creation_time
     if (ATTR_MASK_TEST(p_attr_set, creation_time))
@@ -629,9 +650,9 @@ int CheckFSInfo( char *path, char *expected_type,
                             "Root mountpoint is allowed for matching %s, type=%s, fs=%s",
                             rpath, p_mnt->mnt_type, p_mnt->mnt_fsname );
                 outlen = pathlen;
-                strncpy( mntdir, p_mnt->mnt_dir, RBH_PATH_MAX );
-                strncpy( type, p_mnt->mnt_type, 256 );
-                strncpy( fs_spec, p_mnt->mnt_fsname, RBH_PATH_MAX );
+                rh_strncpy(mntdir, p_mnt->mnt_dir, RBH_PATH_MAX);
+                rh_strncpy(type, p_mnt->mnt_type, 256);
+                rh_strncpy(fs_spec, p_mnt->mnt_fsname, RBH_PATH_MAX);
             }
             /* in other cases, the filesystem must be <mountpoint>/<smthg> or <mountpoint>\0 */
             else if ( ( pathlen > outlen ) &&
@@ -643,9 +664,9 @@ int CheckFSInfo( char *path, char *expected_type,
                             rpath, p_mnt->mnt_dir, p_mnt->mnt_type, p_mnt->mnt_fsname );
 
                 outlen = pathlen;
-                strncpy( mntdir, p_mnt->mnt_dir, RBH_PATH_MAX );
-                strncpy( type, p_mnt->mnt_type, 256 );
-                strncpy( fs_spec, p_mnt->mnt_fsname, RBH_PATH_MAX );
+                rh_strncpy(mntdir, p_mnt->mnt_dir, RBH_PATH_MAX);
+                rh_strncpy(type, p_mnt->mnt_type, 256);
+                rh_strncpy(fs_spec, p_mnt->mnt_fsname, RBH_PATH_MAX);
             }
         }
     }
@@ -740,6 +761,8 @@ int CheckFSInfo( char *path, char *expected_type,
 
     if ( save_fs )
     {
+        int rc;
+
         /* getting filesystem fsid (needed for fskey) */
         if (global_config.fs_key == FSKEY_FSID)
         {
@@ -754,17 +777,19 @@ int CheckFSInfo( char *path, char *expected_type,
             /* if fsid == 0, it may mean that fsid is not significant on the current system
              * => DISPLAY A WARNING */
             if (fsidto64(stf.f_fsid) == 0)
-            {
-                DisplayLog(LVL_MAJOR, "CheckFS", "WARNING: fsid(0) doesn't look significant on this system. I should not be used as fs_key!");
-            }
-            set_fs_info(name, mntdir, pathstat.st_dev, stf.f_fsid);
+                DisplayLog(LVL_MAJOR, "CheckFS", "WARNING: fsid(0) doesn't look significant on this system."
+                           "It should not be used as fs_key!");
+
+            rc = set_fs_info(name, mntdir, pathstat.st_dev, stf.f_fsid);
         }
         else
         {
             fsid_t dummy_fsid;
             memset(&dummy_fsid, 0, sizeof(fsid_t));
-            set_fs_info(name, mntdir, pathstat.st_dev, dummy_fsid);
+            rc = set_fs_info(name, mntdir, pathstat.st_dev, dummy_fsid);
         }
+        if (rc)
+            return rc;
     }
 
     if ( p_fs_dev != NULL )
@@ -784,7 +809,11 @@ int CheckFSInfo( char *path, char *expected_type,
  */
 int InitFS( void )
 {
+    static int initialized = FALSE;
     int rc;
+
+    if (initialized)
+        return 0;
 
     /* Initialize mount point info */
 #ifdef _LUSTRE
@@ -807,6 +836,7 @@ int InitFS( void )
     }
 
     /* OK */
+    initialized = TRUE;
     return 0;
 }
 
@@ -1976,10 +2006,17 @@ int relative_path( const char * fullpath, const char * root, char * rel_path )
     size_t len;
     char rootcopy[1024];
 
+    if (!strcmp(root, fullpath))
+    {
+        /* arg is root */
+        rel_path[0]='\0';
+        return 0;
+    }
+
     /* copy root path */
     strcpy(rootcopy, root);
-
     len = strlen(rootcopy);
+
     /* add '/' if needed */
     if ( (len > 1) && (rootcopy[len-1] != '/') )
     {
@@ -1991,8 +2028,8 @@ int relative_path( const char * fullpath, const char * root, char * rel_path )
     /* test if the full path starts with the same dirs */
     if (strncmp(rootcopy, fullpath,len))
     {
-        DisplayLog( LVL_MAJOR, "RelPath", "ERROR: file path '%s' is not under filesystem root '%s'",
-                    fullpath, rootcopy );
+        DisplayLog(LVL_MAJOR, "RelPath", "ERROR: file path '%s' is not under filesystem root '%s'",
+                   fullpath, rootcopy);
         return -EINVAL;
     }
 
@@ -2031,7 +2068,7 @@ static char * escape_shell_arg( const char * in, char * out )
     return out;
 }
 
-int execute_shell_command( const char * cmd, int argc, ... )
+int execute_shell_command(int quiet, const char * cmd, int argc, ...)
 {
 #define SHCMD "ShCmd"
     va_list arglist;
@@ -2048,7 +2085,8 @@ int execute_shell_command( const char * cmd, int argc, ... )
         curr += sprintf( curr, " %s",
                          escape_shell_arg( va_arg(arglist, char *), argbuf ));
     va_end(arglist);
-    curr += sprintf( curr, " %s", " >/dev/null 2>/dev/null");
+    if (quiet)
+        curr += sprintf(curr, " %s", " >/dev/null 2>/dev/null");
 
     DisplayLog(LVL_DEBUG, SHCMD, "Executing command: %s", cmdline);
     rc = system(cmdline);
@@ -2089,6 +2127,51 @@ int execute_shell_command( const char * cmd, int argc, ... )
     return rc;
 }
 
+char *quote_shell_arg(const char *arg)
+{
+    const char *replace_with = "'\\''";
+    char *arg_walk, *quoted, *quoted_walk;
+    int count = 0;
+
+    arg_walk = (char *) arg;
+    while (*arg_walk) {
+        if (*arg_walk == '\'') {
+            ++count;
+            if (count < 0) {
+                /* It's unlikely given our input, but avoid integer overflow. */
+                return NULL;
+            }
+        }
+        ++arg_walk;
+    }
+
+    quoted = (char *)calloc(1, strlen(arg) +
+                            (count * strlen(replace_with)) + 2 + 1);
+    if (!quoted)
+        return NULL;
+
+    quoted_walk = quoted;
+    *quoted_walk = '\'';
+    ++quoted_walk;
+
+    arg_walk = (char *) arg;
+    while (*arg_walk) {
+        if (*arg_walk == '\'') {
+            strcat(quoted_walk, replace_with);
+            quoted_walk += strlen(replace_with);
+        } else {
+            *quoted_walk = *arg_walk;
+            ++quoted_walk;
+        }
+        ++arg_walk;
+    }
+
+    *quoted_walk = '\'';
+    ++quoted_walk;
+    *quoted_walk = '\0';
+
+    return quoted;
+}
 
 /**
  * Replace special parameters {cfgfile}, {fspath}, ...
@@ -2104,6 +2187,7 @@ char *replace_cmd_parameters(const char *cmd_in, const char **replace_array)
     char *pass_begin = NULL;
     char *begin_var;
     char *end_var;
+    char *quoted_arg;
     const char *var_value;
 
     pass_begin = strdup(cmd_in);
@@ -2155,27 +2239,35 @@ char *replace_cmd_parameters(const char *cmd_in, const char **replace_array)
         if (var_value == NULL)
         {
             DisplayLog(LVL_CRIT,CMDPARAMS, "ERROR: unknown parameter '%s' in command parameters '%s'", begin_var, cmd_in);
-            free(pass_begin);
             errno = EINVAL;
-            return NULL;
+            goto err_free;
         }
+
+        quoted_arg = quote_shell_arg(var_value);
+        if (!quoted_arg)
+            goto err_free;
 
         /* allocate a new string */
-        new_str = malloc(strlen(pass_begin) + strlen(var_value) + strlen(end_var) + 1);
+        new_str = malloc(strlen(pass_begin) + strlen(quoted_arg) +
+                         strlen(end_var) + 1);
         if (!new_str)
-        {
-            free(pass_begin);
-            return NULL;
-        }
+            goto err_free_quoted;
 
-        sprintf(new_str, "%s%s%s", pass_begin, var_value, end_var);
+        sprintf(new_str, "%s%s%s", pass_begin, quoted_arg, end_var);
 
         free(pass_begin);
+        free(quoted_arg);
         pass_begin = new_str;
 
     } while(1);
 
     return pass_begin;
+
+err_free_quoted:
+    free(quoted_arg);
+err_free:
+    free(pass_begin);
+    return NULL;
 }
 
 
@@ -2336,7 +2428,7 @@ int mkdir_recurse(const char * full_path, mode_t mode, entry_id_t *dir_id)
         int path_len = curr - full_path;
 
         /* extract directory name */
-        strncpy( path_copy, full_path, path_len );
+        rh_strncpy(path_copy, full_path, path_len);
         path_copy[path_len]='\0';
 
         DisplayLog(LVL_FULL, MKDIR_TAG, "mkdir(%s)", path_copy );
@@ -2675,3 +2767,43 @@ int create_from_attrs(const attr_set_t * attrs_in,
 #endif
     return 0;
 }
+
+#ifdef _HAVE_FID
+void path_check_update(const entry_id_t *p_id,
+                       const char *fid_path, attr_set_t *p_attrs,
+                       int attr_mask)
+{
+    int rc;
+    if (attr_mask & (ATTR_MASK_name | ATTR_MASK_parent_id))
+    {
+        rc = Lustre_GetNameParent(fid_path, 0, &ATTR(p_attrs, parent_id),
+                                  ATTR(p_attrs, name), RBH_NAME_MAX);
+        if (rc == 0)
+        {
+            ATTR_MASK_SET(p_attrs, name);
+            ATTR_MASK_SET(p_attrs, parent_id);
+            /* update path refresh time */
+            ATTR_MASK_SET(p_attrs, path_update);
+            ATTR(p_attrs, path_update) = time(NULL);
+        }
+        else if (rc != -ENOENT)
+        {
+            DisplayLog(LVL_MAJOR, "PathCheck", "Failed to get parent+name for "DFID": %s",
+                       PFID(p_id), strerror(-rc));
+        }
+    }
+
+    /* if fullpath is in the policy, get the fullpath */
+    if (attr_mask & ATTR_MASK_fullpath)
+    {
+        rc = Lustre_GetFullPath(p_id, ATTR(p_attrs, fullpath), RBH_PATH_MAX);
+        if (rc == 0)
+            ATTR_MASK_SET(p_attrs, fullpath);
+        else if (rc != -ENOENT)
+            DisplayLog(LVL_MAJOR, "PathCheck", "Failed to retrieve fullpath for "DFID": %s",
+                       PFID(p_id), strerror(-rc));
+    }
+}
+#endif
+
+

@@ -647,25 +647,59 @@ int mk_result_bind_list( const attr_set_t * p_set, table_enum table, db_type_t *
 
 }
 
-static inline int fullpath_attr2db(const char *attr, char *db)
+int fullpath_attr2db(const char *attr, char *db)
 {
+    DEF_PK(root_pk);
+    char rel[RBH_PATH_MAX];
+
     /* fullpath 2 relative */
-    if (relative_path(attr, global_config.fs_path, db))
+    if (relative_path(attr, global_config.fs_path, rel))
     {
         DisplayLog(LVL_MAJOR, LISTMGR_TAG, "fullpath %s is not under FS root %s",
                    attr, global_config.fs_path);
         return -EINVAL;
     }
+    /* prefix with root id */
+    entry_id2pk(get_root_id(), PTR_PK(root_pk));
+    sprintf(db, "%s/%s", root_pk, rel);
     return 0;
 }
 
-static inline void fullpath_db2attr(const char *db, char *attr)
+void fullpath_db2attr(const char *db, char *attr)
 {
+    DEF_PK(id_from_db);
+    DEF_PK(root_pk);
+
+    entry_id2pk(get_root_id(), PTR_PK(root_pk));
+    const char *c = strchr(db, '/');
+    if (!c)
+    {
+        DisplayLog(LVL_MAJOR, LISTMGR_TAG, "Unexpected path format from DB: '%s'", db);
+        /* use c = db */
+        c = db;
+    }
+    else
+    {
+        memset(PTR_PK(id_from_db), 0, sizeof(id_from_db));
+        strncpy(id_from_db, db, (ptrdiff_t)(c - db));
+
+        /* check FS root */
+        if (strcmp(root_pk, id_from_db) != 0)
+        {
+            DisplayLog(LVL_EVENT, LISTMGR_TAG, "Entry has incomplete path in DB: "
+                       "parent_id='%s', relative_path='%s'", id_from_db, c+1);
+            /* copy as is */
+            sprintf(attr, "%s", db);
+            return;
+        }
+        c++; /* skip '/' */
+    }
+
     /* relative 2 full */
     if (!strcmp(global_config.fs_path, "/")) /* FS root is '/' */
-        sprintf(attr, "/%s", db);
+        sprintf(attr, "/%s", c);
     else
-        sprintf(attr, "%s/%s", global_config.fs_path, db);
+        sprintf(attr, "%s/%s", global_config.fs_path, c);
 }
 
 int result2attrset( table_enum table, char **result_tab,
@@ -706,8 +740,7 @@ int result2attrset( table_enum table, char **result_tab,
                 }
                 ATTR(p_set, stripe_info).stripe_count = atoi( result_tab[nbfields]  );
                 ATTR(p_set, stripe_info).stripe_size = atoi( result_tab[nbfields+1]  );
-                strncpy( ATTR(p_set, stripe_info).pool_name, result_tab[nbfields+2] , MAX_POOL_LEN );
-                ATTR(p_set, stripe_info).pool_name[MAX_POOL_LEN-1] = 0;
+                rh_strncpy(ATTR(p_set, stripe_info).pool_name, result_tab[nbfields+2] , MAX_POOL_LEN);
 
                 /* stripe count, stripe size and pool_name */
                 nbfields += 3;
@@ -1025,7 +1058,9 @@ int filter2str( lmgr_t * p_mgr, char *str, const lmgr_filter_t * p_filter,
 
             if ( MATCH_TABLE( table, index ) )
             {
-                if (is_funcattr(index))
+                /* exception: fullpath is a real field in SOFT_RM table */
+                if (is_funcattr(index) &&
+                    !((table == T_SOFTRM) && (index == ATTR_INDEX_fullpath)))
                 {
                     char tmp[128] = "";
                     if (prefix_table)
@@ -1044,7 +1079,8 @@ int filter2str( lmgr_t * p_mgr, char *str, const lmgr_filter_t * p_filter,
                     sprintf( values_curr, "%s%s", fname,
                              compar2str( p_filter->filter_simple.filter_compar[i] ) );
 
-                if (index == ATTR_INDEX_fullpath)
+                /* fullpath already includes root for SOFT_RM table */
+                if ((index == ATTR_INDEX_fullpath) && (table != T_SOFTRM))
                 {
                     char relative[RBH_PATH_MAX];
                     if (fullpath_attr2db(p_filter->filter_simple.filter_value[i].value.val_str, relative))
@@ -1192,7 +1228,7 @@ int pk2entry_id( lmgr_t * p_mgr, PK_ARG_T pk, entry_id_t * p_id )
 #ifndef FID_PK
     unsigned long long tmp_ino;
 
-    if ( sscanf( pk, "%"PRI_DT":%LX", &p_id->fs_key, &tmp_ino ) != 2 )
+    if (sscanf(pk, "%"PRI_DT":%LX", &p_id->fs_key, &tmp_ino ) != FID_SCAN_CNT)
         return DB_INVALID_ARG;
     else
     {
@@ -1200,7 +1236,7 @@ int pk2entry_id( lmgr_t * p_mgr, PK_ARG_T pk, entry_id_t * p_id )
         return DB_SUCCESS;
     }
 #else /* FID_PK */
-    if ( sscanf( pk, SFID, RFID(p_id) ) != 3 )
+    if (sscanf( pk, SFID, RFID(p_id) ) != FID_SCAN_CNT)
         return DB_INVALID_ARG;
     else
         return DB_SUCCESS;
@@ -1474,7 +1510,7 @@ int lmgr_range2list(const char * set, db_type_t type, value_list_t * p_list)
         return -1;
 
     /* local copy for strtok */
-    strncpy(buffer, set, 1024);
+    rh_strncpy(buffer, set, 1024);
 
     /* inialize list */
     p_list->count = 0;
@@ -1531,4 +1567,70 @@ out_free:
     p_list->values = NULL;
     p_list->count = 0;
     return -1;
+}
+
+
+/** manage delayed retry of retryable errors
+ * \return != 0 if the transaction must be restarted
+ */
+int _lmgr_delayed_retry(lmgr_t *lmgr, int errcode, const char *func, int line)
+{
+    if (!db_is_retryable(errcode))
+    {
+        /* if a retry was pending, display a success message */
+        if (lmgr->retry_delay != 0)
+        {
+            struct timeval diff, now;
+            timerclear(&diff);
+            gettimeofday(&now, NULL);
+            timersub(&now, &lmgr->first_error, &diff);
+
+            /* Only notify success if the suceeded function
+             * is the same as the last error.
+             */
+            if ((lmgr->last_err_func == func) && (lmgr->last_err_line == line)
+                && errcode == DB_SUCCESS)
+            {
+                DisplayLog(LVL_EVENT, LISTMGR_TAG,
+                           "DB operation succeeded after %u retries (%ld.%03ld sec)",
+                           lmgr->retry_count, diff.tv_sec, diff.tv_usec/1000);
+            }
+
+            /* reset retry delay if no error occured,
+             * or if the error is not retryable */
+            lmgr->retry_delay = 0;
+            lmgr->retry_count = 0;
+            timerclear(&lmgr->first_error);
+        }
+        return 0;
+    }
+
+    /* transaction is about to be restarted,
+     * sleep for a given time */
+    if (lmgr->retry_delay == 0)
+    {
+        /* first error, first sleep */
+        gettimeofday(&lmgr->first_error, NULL);
+        lmgr->retry_delay = lmgr_config.connect_retry_min;
+    }
+    else
+    {
+        lmgr->retry_delay *= 2;
+        if (lmgr->retry_delay > lmgr_config.connect_retry_max)
+            lmgr->retry_delay = lmgr_config.connect_retry_max;
+    }
+    lmgr->last_err_func = func;
+    lmgr->last_err_line = line;
+    if (lmgr->retry_count == 0)
+        DisplayLog(LVL_EVENT, LISTMGR_TAG,
+                   "Retryable DB error in %s l.%u. Retrying...",
+                   func, line);
+    else /* only display for debug level */
+        DisplayLog(LVL_DEBUG, LISTMGR_TAG,
+                  "Retryable DB error in %s l.%u. Restarting transaction in %u sec...",
+                  func, line, lmgr->retry_delay);
+
+    rh_sleep(lmgr->retry_delay);
+    lmgr->retry_count ++;
+    return 1;
 }

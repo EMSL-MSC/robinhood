@@ -21,6 +21,7 @@
 #include "listmgr_common.h"
 #include "Memory.h"
 #include "RobinhoodLogs.h"
+#include "RobinhoodMisc.h"
 #include "var_str.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -308,8 +309,7 @@ int get_stripe_info( lmgr_t * p_mgr, PK_ARG_T pk, stripe_info_t * p_stripe_info,
 
     p_stripe_info->stripe_count = atoi( res[0] );
     p_stripe_info->stripe_size = atoi( res[1] );
-    strncpy( p_stripe_info->pool_name, res[2], MAX_POOL_LEN );
-    p_stripe_info->pool_name[MAX_POOL_LEN-1] = 0;
+    rh_strncpy(p_stripe_info->pool_name, res[2], MAX_POOL_LEN);
 
     db_result_free( &p_mgr->conn, &result );
 
@@ -411,13 +411,18 @@ int ListMgr_CheckStripe( lmgr_t * p_mgr, const entry_id_t * p_id )
 
     sprintf( query, "SELECT validator FROM " STRIPE_INFO_TABLE " WHERE id="DPK, pk );
 
+retry:
     rc = db_exec_sql( &p_mgr->conn, query, &result );
-    if ( rc )
+    if (lmgr_delayed_retry(p_mgr, rc))
+        goto retry;
+    else if (rc)
         goto out;
 
     rc = db_next_record( &p_mgr->conn, &result, &res, 1 );
+    if (lmgr_delayed_retry(p_mgr, rc))
+        goto retry;
 
-    if ( rc == DB_END_OF_LIST )
+    if (rc == DB_END_OF_LIST)
         rc = DB_NOT_EXISTS;
 
     if ( rc )
@@ -448,9 +453,14 @@ int ListMgr_SetStripe( lmgr_t * p_mgr, const entry_id_t * p_id,
                        stripe_info_t * p_stripe_info, stripe_items_t * p_stripe_items )
 {
     DEF_PK(pk);
+    int rc;
 
     entry_id2pk(p_id, PTR_PK(pk));
+retry:
+    rc = insert_stripe_info(p_mgr, pk, VALID(p_id), p_stripe_info, p_stripe_items,
+                            TRUE);
+    if (lmgr_delayed_retry(p_mgr, rc))
+        goto retry;
 
-    return insert_stripe_info( p_mgr, pk, VALID(p_id), p_stripe_info, p_stripe_items,
-                               TRUE );
+    return rc;
 }

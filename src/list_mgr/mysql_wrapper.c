@@ -29,7 +29,7 @@
 
 #define _DEBUG_DB
 
-static int mysql_error_convert( int err )
+static int mysql_error_convert(int err, int verb)
 {
     switch ( err )
     {
@@ -44,13 +44,27 @@ static int mysql_error_convert( int err )
         return DB_TRG_NOT_EXISTS;
 #endif
     case ER_BAD_FIELD_ERROR:
-        DisplayLog( LVL_CRIT, LISTMGR_TAG, "Invalid DB field" );
+        if (verb)
+            DisplayLog(LVL_CRIT, LISTMGR_TAG, "Invalid DB field");
         return DB_INVALID_ARG;
     case ER_PARSE_ERROR:
-        DisplayLog( LVL_CRIT, LISTMGR_TAG, "SQL request parse error" );
+        if (verb)
+            DisplayLog(LVL_CRIT, LISTMGR_TAG, "SQL request parse error");
         return DB_REQUEST_FAILED;
     case ER_LOCK_DEADLOCK:
-        DisplayLog( LVL_MAJOR, LISTMGR_TAG, "DB deadlock detected" );
+        if (verb)
+            DisplayLog(LVL_EVENT, LISTMGR_TAG, "DB deadlock detected");
+        return DB_DEADLOCK;
+    case ER_LOCK_WAIT_TIMEOUT:
+        if (verb)
+        {
+            if (lmgr_config.db_config.innodb)
+                DisplayLog(LVL_MAJOR, LISTMGR_TAG, "Lock timeout detected. "
+                           "Consider increasing \"innodb_lock_wait_timeout\" in MySQL config.");
+            else
+                DisplayLog(LVL_MAJOR, LISTMGR_TAG, "Lock timeout detected. "
+                           "Consider increasing \"lock_wait_timeout\" in MySQL config.");
+        }
         return DB_DEADLOCK;
 
         /* connection relative errors */
@@ -75,22 +89,23 @@ static int mysql_error_convert( int err )
     case CR_SERVER_GONE_ERROR:
     case CR_SERVER_LOST:
     case CR_CONN_HOST_ERROR:
-        DisplayLog( LVL_CRIT, LISTMGR_TAG, "DB connection error %d", err );
+        if (verb)
+            DisplayLog(LVL_CRIT, LISTMGR_TAG, "DB connection error %d", err);
         return DB_CONNECT_FAILED;
 
     default:
-        DisplayLog( LVL_MAJOR, LISTMGR_TAG,
-                    "Unhandled error %d: default conversion to DB_REQUEST_FAILED", err );
+        DisplayLog(verb?LVL_MAJOR:LVL_DEBUG, LISTMGR_TAG,
+                   "Unhandled error %d: default conversion to DB_REQUEST_FAILED", err);
         return DB_REQUEST_FAILED;
     }
 }
 
-static int is_retryable( int sql_err )
+int db_is_retryable(int db_err)
 {
-    switch (mysql_error_convert(sql_err))
+    switch (db_err)
     {
         case DB_CONNECT_FAILED:
-        case DB_DEADLOCK:
+        case DB_DEADLOCK: /* Note: the whole transaction must be retryed */
             return TRUE;
         default:
             return FALSE;
@@ -129,7 +144,8 @@ int db_connect( db_conn_t * conn )
                             NULL:lmgr_config.db_config.socket,
                0 ) )
         {
-            if ((retry < 3) && is_retryable(mysql_errno(conn))) {
+            /* connection error is retried at DB level */
+            if ((retry < 3) && db_is_retryable(mysql_error_convert(mysql_errno(conn),0))) {
                 DisplayLog( LVL_MAJOR, LISTMGR_TAG,
                             "Failed to connect to MySQL: Error: %s. Retrying...", mysql_error( conn ) );
                 retry ++;
@@ -183,7 +199,7 @@ int db_close_conn( db_conn_t * conn )
 char          *db_errmsg( db_conn_t * conn, char *errmsg, unsigned int buflen )
 {
     if ( strlen( mysql_error( conn ) ) + 1 > buflen )
-        strncpy( errmsg, mysql_error( conn ), buflen );
+        rh_strncpy(errmsg, mysql_error(conn), buflen);
     else
         strcpy( errmsg, mysql_error( conn ) );
 
@@ -195,66 +211,39 @@ static int _db_exec_sql( db_conn_t * conn, const char *query,
                          int quiet )
 {
     int            rc;
-    time_t         start;
-    unsigned int   retry = lmgr_config.connect_retry_min;
+    int            dberr;
 #ifdef _DEBUG_DB
     DisplayLog( LVL_FULL, LISTMGR_TAG, "SQL query: %s", query );
 #endif
 
-    do
+    rc = mysql_real_query(conn, query, strlen(query));
+    dberr = mysql_errno(conn);
+    if (rc)
     {
-        int dberr;
-        start = time(NULL);
-        rc = mysql_real_query( conn, query, strlen( query ) );
-
-        dberr = mysql_errno( conn );
-        if ( rc && is_retryable( dberr ) )
+        rc = mysql_error_convert(dberr, quiet?0:1);
+        if (dberr == ER_DUP_ENTRY)
         {
-            if (dberr != ER_LOCK_DEADLOCK)
-                DisplayLog( LVL_MAJOR, LISTMGR_TAG,
-                            "Connection to database lost in %s()... Retrying in %u sec.",
-                            __FUNCTION__, retry );
-            else
-                DisplayLog( LVL_MAJOR, LISTMGR_TAG,
-                            "Deadlock during DB request '%s' after %u sec. Retrying in %u sec.",
-                            query, (unsigned int)(time(NULL) - start), retry );
-
-            rh_sleep( retry );
-            retry *= 2;
-            if ( retry > lmgr_config.connect_retry_max )
-                retry = lmgr_config.connect_retry_max;
-        }
-        else
-            break;
-
-    }
-    while ( 1 );
-
-    if ( rc )
-    {
-        if (mysql_errno( conn ) == ER_DUP_ENTRY)
-        {
-            DisplayLog( quiet?LVL_DEBUG:LVL_EVENT, LISTMGR_TAG,
-                        "A database record already exists for this entry: '%s' (%s)",
-                        query, mysql_error(conn) );
+            DisplayLog(quiet?LVL_DEBUG:LVL_EVENT, LISTMGR_TAG,
+                       "A database record already exists for this entry: '%s' (%s)",
+                       query, mysql_error(conn));
         }
 #ifdef _MYSQL5
-        else if (mysql_errno( conn ) == ER_TRG_DOES_NOT_EXIST)
+        else if (dberr == ER_TRG_DOES_NOT_EXIST)
         {
-            DisplayLog( quiet?LVL_DEBUG:LVL_EVENT, LISTMGR_TAG,
-                        "Trigger does not exist: '%s' (%s)",
-                        query, mysql_error(conn) );
+            DisplayLog(quiet?LVL_DEBUG:LVL_EVENT, LISTMGR_TAG,
+                       "Trigger does not exist: '%s' (%s)",
+                       query, mysql_error(conn));
         }
 #endif
-        else if (mysql_errno( conn ) == ER_NO_SUCH_TABLE)
-            DisplayLog( quiet?LVL_DEBUG:LVL_EVENT, LISTMGR_TAG,
-                        "Table does not exist: '%s' (%s)",
-                        query, mysql_error(conn) );
-        else
-            DisplayLog( LVL_MAJOR, LISTMGR_TAG, "Error %d executing query '%s': %s",
-                        rc, query, mysql_error(conn) );
+        else if (dberr == ER_NO_SUCH_TABLE)
+            DisplayLog(quiet?LVL_DEBUG:LVL_EVENT, LISTMGR_TAG,
+                       "Table does not exist: '%s' (%s)",
+                       query, mysql_error(conn));
+        else if (!db_is_retryable(rc))
+            DisplayLog(LVL_MAJOR, LISTMGR_TAG, "Error %d executing query '%s': %s",
+                       rc, query, mysql_error(conn));
 
-        return mysql_error_convert( mysql_errno( conn ) );
+        return rc;
     }
     else
     {

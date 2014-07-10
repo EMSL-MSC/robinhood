@@ -37,6 +37,7 @@ typedef struct __list_by_stage__
     struct list_head entries;
     unsigned int   nb_threads;                   /* number of threads working on this stage */
     unsigned int   nb_unprocessed_entries;       /* number of entries to be processed in this list */
+    unsigned int   nb_current_entries;           /* number of entries being processed in the list */
     unsigned int   nb_processed_entries;         /* number of entries processed in this list */
     unsigned long long total_processed;          /* total number of processed entries since start */
     unsigned long long nb_batches;               /* number of batched steps */
@@ -45,7 +46,7 @@ typedef struct __list_by_stage__
     pthread_mutex_t stage_mutex;
 } list_by_stage_t;
 
-/* Note1: nb_threads + nb_unprocessed_entries + nb_processed_entries = nb entries at a given step */
+/* Note1: nb_current_entries + nb_unprocessed_entries + nb_processed_entries = nb entries at a given step */
 /* stages mutex must always be taken from lower stage to upper to avoid deadlocks */
 
 static list_by_stage_t * pipeline = NULL;
@@ -173,18 +174,76 @@ static void   *entry_proc_worker_thr( void *arg )
 }
 
 
+#ifdef _BENCH_PIPELINE
+static pipeline_descr_t bench_pipeline_descr = {0}; /* to be set */
+static pipeline_stage_t *bench_pipeline = NULL; /* to be allocated */
+
+static int EntryProc_noop(struct entry_proc_op_t *p_op, lmgr_t *lmgr)
+{
+    int rc;
+    /* last stage ? */
+    if (p_op->pipeline_stage < bench_pipeline_descr.stage_count - 1)
+        rc = EntryProcessor_Acknowledge(p_op, p_op->pipeline_stage+1, FALSE);
+    else {
+        if (p_op->callback_func)
+            p_op->callback_func(lmgr, p_op, p_op->callback_param);
+
+        /* last stage, remove from the pipeline */
+        rc = EntryProcessor_Acknowledge(p_op, -1, TRUE);
+    }
+    return rc;
+}
+
+static int mk_bench_pipeline(unsigned int stages)
+{
+    int i;
+    bench_pipeline_descr.stage_count = stages;
+    bench_pipeline = MemCalloc(stages, sizeof(pipeline_stage_t));
+    if (bench_pipeline == NULL)
+        return -ENOMEM;
+    for (i = 0; i < stages; i++)
+    {
+        bench_pipeline[i].stage_index = i;
+        bench_pipeline[i].stage_name = "stage_bench";
+        bench_pipeline[i].stage_function = EntryProc_noop;
+        bench_pipeline[i].stage_batch_function = NULL;
+        bench_pipeline[i].test_batchable = NULL;
+        bench_pipeline[i].stage_flags = STAGE_FLAG_PARALLEL | STAGE_FLAG_SYNC;
+        bench_pipeline[i].max_thread_count = 0; /* unlimited */
+    }
+
+        if (stages > 2)
+        {
+             bench_pipeline[1].stage_flags |= STAGE_FLAG_ID_CONSTRAINT;
+             bench_pipeline_descr.DB_APPLY = stages - 1;
+        }
+    return 0;
+}
+#endif
+
+
 /**
  *  Initialize entry processor pipeline
  */
 int EntryProcessor_Init( const entry_proc_config_t * p_conf, pipeline_flavor_e flavor, int flags,
                          void * arg )
 {
-    int            i;
+    int i;
 
     entry_proc_conf = *p_conf;
     pipeline_flags = flags;
     entry_proc_arg = arg;
 
+#ifdef _BENCH_PIPELINE
+    int rc;
+
+    /* in this case, arg points to stage count */
+    rc = mk_bench_pipeline(*((int*)arg));
+    if (rc)
+        return rc;
+    entry_proc_pipeline = bench_pipeline; /* pointer */
+    entry_proc_descr = bench_pipeline_descr; /* full copy */
+#else
     switch (flavor)
     {
         case STD_PIPELINE:
@@ -198,6 +257,23 @@ int EntryProcessor_Init( const entry_proc_config_t * p_conf, pipeline_flavor_e f
         default:
             DisplayLog(LVL_CRIT, ENTRYPROC_TAG, "Pipeline flavor not supported");
             return EINVAL;
+    }
+#endif
+
+    DisplayLog(LVL_FULL, "EntryProc_Config", "nb_threads=%u", p_conf->nb_thread);
+    DisplayLog(LVL_FULL, "EntryProc_Config", "max_batch_size=%u", p_conf->max_batch_size);
+    for (i = 0; i < entry_proc_descr.stage_count; i++)
+    {
+        if (entry_proc_pipeline[i].stage_flags & STAGE_FLAG_SEQUENTIAL)
+            DisplayLog(LVL_FULL,"EntryProc_Config","%s: sequential",
+                       entry_proc_pipeline[i].stage_name);
+        else if (entry_proc_pipeline[i].stage_flags & STAGE_FLAG_PARALLEL)
+            DisplayLog(LVL_FULL,"EntryProc_Config","%s: parallel",
+                       entry_proc_pipeline[i].stage_name);
+        else if (entry_proc_pipeline[i].stage_flags & STAGE_FLAG_MAX_THREADS)
+            DisplayLog(LVL_FULL,"EntryProc_Config","%s: %u threads max",
+                       entry_proc_pipeline[i].stage_name,
+                       entry_proc_pipeline[i].max_thread_count);
     }
 
     pipeline = (list_by_stage_t*)MemCalloc(entry_proc_descr.stage_count, sizeof(list_by_stage_t));
@@ -228,6 +304,7 @@ int EntryProcessor_Init( const entry_proc_config_t * p_conf, pipeline_flavor_e f
         rh_list_init(&pipeline[i].entries);
         pipeline[i].nb_threads = 0;
         pipeline[i].nb_unprocessed_entries = 0;
+        pipeline[i].nb_current_entries = 0;
         pipeline[i].nb_processed_entries = 0;
         pipeline[i].total_processed = 0;
         pipeline[i].nb_batches = 0;
@@ -501,7 +578,7 @@ static entry_proc_op_t **next_work_avail(int *p_empty, int *op_count)
         P( pl->stage_mutex );
 
         /* Accumulate the number of entries in the upper stages. */
-        tot_entries += pl->nb_threads + pl->nb_unprocessed_entries + pl->nb_processed_entries;
+        tot_entries += pl->nb_current_entries + pl->nb_unprocessed_entries + pl->nb_processed_entries;
 
         if ( pl->nb_unprocessed_entries == 0 )
         {
@@ -569,6 +646,7 @@ static entry_proc_op_t **next_work_avail(int *p_empty, int *op_count)
 
                     /* tag the entry and update stage info */
                     pl->nb_unprocessed_entries--;
+                    pl->nb_current_entries++;
                     pl->nb_threads++;
                     p_curr->being_processed = TRUE;
 
@@ -691,6 +769,7 @@ static entry_proc_op_t **next_work_avail(int *p_empty, int *op_count)
                 /* this entry can be processed */
                 /* tag the entry and update stage info */
                 pl->nb_unprocessed_entries--;
+                pl->nb_current_entries++;
                 pl->nb_threads++;
                 p_curr->being_processed = TRUE;
 
@@ -718,6 +797,7 @@ static entry_proc_op_t **next_work_avail(int *p_empty, int *op_count)
                         if (entry_proc_pipeline[i].test_batchable(p_curr, p_next))
                         {
                             pl->nb_unprocessed_entries--;
+                            pl->nb_current_entries++;
                             p_next->being_processed = TRUE;
 
                             listop[*op_count] = p_next;
@@ -846,6 +926,7 @@ int EntryProcessor_AcknowledgeBatch(entry_proc_op_t ** ops, unsigned int count,
 
     /* update stats */
     pl->nb_processed_entries += count;
+    pl->nb_current_entries -= count;
     pl->total_processed += count;
 
     if (count > 1)
@@ -957,8 +1038,8 @@ static void print_op_stats(entry_proc_op_t * p_op, unsigned int stage, const cha
 #ifdef HAVE_CHANGELOGS
     if ( p_op->extra_info.is_changelog_record )
     {
-        DisplayLog( LVL_EVENT, "STATS", "%-20s: %s: changelog record #%Lu, fid="DFID", status=%s",
-                    entry_proc_pipeline[stage].stage_name, what,
+        DisplayLog( LVL_EVENT, "STATS", "%-14s: %s: changelog record #%Lu, fid="DFID", status=%s",
+                    strchr(entry_proc_pipeline[stage].stage_name,'_')+1, what,
                     p_op->extra_info.log_record.p_log_rec->cr_index,
                     PFID(&p_op->extra_info.log_record.p_log_rec->cr_tfid),
                     entry_status_str(p_op, stage));
@@ -967,21 +1048,21 @@ static void print_op_stats(entry_proc_op_t * p_op, unsigned int stage, const cha
 #endif
     if (ATTR_FSorDB_TEST(p_op, fullpath))
     {
-        DisplayLog(LVL_EVENT, "STATS", "%-20s: %s: %s, status=%s",
-                   entry_proc_pipeline[stage].stage_name, what,
+        DisplayLog(LVL_EVENT, "STATS", "%-14s: %s: %s, status=%s",
+                   strchr(entry_proc_pipeline[stage].stage_name,'_')+1, what,
                    ATTR_FSorDB(p_op, fullpath),
                    entry_status_str(p_op, stage));
     }
     else if (p_op->entry_id_is_set)
     {
-        DisplayLog(LVL_EVENT, "STATS", "%-20s: %s: "DFID", status=%s",
-                   entry_proc_pipeline[stage].stage_name, what,
+        DisplayLog(LVL_EVENT, "STATS", "%-14s: %s: "DFID", status=%s",
+                   strchr(entry_proc_pipeline[stage].stage_name,'_')+1, what,
                    PFID(&p_op->entry_id),
                    entry_status_str(p_op, stage));
     }
     else
-        DisplayLog(LVL_EVENT, "STATS", "%-20s: %s: special op, status=%s",
-                   entry_proc_pipeline[stage].stage_name, what,
+        DisplayLog(LVL_EVENT, "STATS", "%-14s: %s: special op, status=%s",
+                   strchr(entry_proc_pipeline[stage].stage_name,'_')+1, what,
                    entry_status_str(p_op, stage));
 }
 
@@ -1002,14 +1083,28 @@ void EntryProcessor_DumpCurrentStages( void )
     {
 
         DisplayLog( LVL_MAJOR, "STATS", "==== EntryProcessor Pipeline Stats ===" );
-        DisplayLog( LVL_MAJOR, "STATS", "Threads waiting: %u", nb_waiting_threads );
+        DisplayLog( LVL_MAJOR, "STATS", "Idle threads: %u", nb_waiting_threads );
 
-        id_constraint_dump(  );
+        id_constraint_stats();
+
+        DisplayLog(LVL_MAJOR, "STATS",
+                   "%-18s | Wait | Curr | Done |     Total | ms/op |",
+                   "Stage");
 
         for ( i = 0; i < entry_proc_descr.stage_count; i++ )
         {
             P( pipeline[i].stage_mutex );
-            if ( pipeline[i].total_processed )
+
+            /* nb_current_entries cannot be higher than nb_threads, unless it's a batch.
+            is this case, nb_threads = 1 */
+            if ((pipeline[i].nb_current_entries > pipeline[i].nb_threads)
+                && (pipeline[i].nb_threads != 1))
+            {
+                DisplayLog(LVL_MAJOR, ENTRYPROC_TAG, "WARNING: inconsistent stage stats: %s: %u current entries, %u threads",
+                           entry_proc_pipeline[i].stage_name, pipeline[i].nb_current_entries, pipeline[i].nb_threads);
+            }
+
+            if (pipeline[i].total_processed != 0)
                 tpe =
                     ( ( 1000.0 * pipeline[i].total_processing_time.tv_sec ) +
                       ( 1E-3 * pipeline[i].total_processing_time.tv_usec ) ) /
@@ -1019,19 +1114,20 @@ void EntryProcessor_DumpCurrentStages( void )
 
             if (pipeline[i].nb_batches > 0)
                 DisplayLog(LVL_MAJOR, "STATS",
-                           "%2u: %-20s | Wait: %5u | Curr: %3u | Done: %3u | Total: %6llu, batches: %5Lu (avg size: %Lu) | ms/op: %.2f",
-                           i, entry_proc_pipeline[i].stage_name,
+                           "%2u: %-14s |%5u | %4u | %4u | %9Lu | %5.2f | %.2f%% batched (avg batch size: %.1f)",
+                           i, strchr(entry_proc_pipeline[i].stage_name,'_')+1, /* remove STAGE_ */
                            pipeline[i].nb_unprocessed_entries,
-                           pipeline[i].nb_threads,
-                           pipeline[i].nb_processed_entries, pipeline[i].total_processed,
-                           pipeline[i].nb_batches, pipeline[i].total_batched_entries/pipeline[i].nb_batches, tpe);
-
+                           pipeline[i].nb_current_entries,
+                           pipeline[i].nb_processed_entries,
+                           pipeline[i].total_processed, tpe,
+                           pipeline[i].total_processed ? 100.0*(float)pipeline[i].total_batched_entries/(float)pipeline[i].total_processed:0.0,
+                           (float)pipeline[i].total_batched_entries/(float)pipeline[i].nb_batches);
             else
                 DisplayLog(LVL_MAJOR, "STATS",
-                           "%2u: %-20s | Wait: %5u | Curr: %3u | Done: %3u | Total: %6llu | ms/op: %.2f",
-                           i, entry_proc_pipeline[i].stage_name,
+                           "%2u: %-14s |%5u | %4u | %4u | %9Lu | %5.2f |",
+                           i, strchr(entry_proc_pipeline[i].stage_name,'_')+1, /* remove STAGE_ */
                            pipeline[i].nb_unprocessed_entries,
-                           pipeline[i].nb_threads,
+                           pipeline[i].nb_current_entries,
                            pipeline[i].nb_processed_entries, pipeline[i].total_processed, tpe);
             V( pipeline[i].stage_mutex );
 
@@ -1064,12 +1160,17 @@ void EntryProcessor_DumpCurrentStages( void )
                 P( pipeline[i].stage_mutex );
                 if ( !rh_list_empty(&pipeline[i].entries) )
                 {
-                    entry_proc_op_t *op = rh_list_first_entry(&pipeline[i].entries, entry_proc_op_t, list);
-                    print_op_stats(op, i, "first");
+                    entry_proc_op_t *op1, *op2;
+                    op1 = rh_list_first_entry(&pipeline[i].entries, entry_proc_op_t, list);
+                    op2 = rh_list_last_entry(&pipeline[i].entries, entry_proc_op_t, list);
 
-                    /* Now, get the last entry. */
-                    op = rh_list_last_entry(&pipeline[i].entries, entry_proc_op_t, list);
-                    print_op_stats(op, i, "last");
+                    if (op1 != op2)
+                    {
+                        print_op_stats(op1, i, "first");
+                        print_op_stats(op2, i, "last");
+                    }
+                    else
+                        print_op_stats(op1, i, "(1 op)");
                 }
                 V( pipeline[i].stage_mutex );
 
@@ -1105,7 +1206,7 @@ static unsigned int count_nb_ops( void )
 
     for ( i = 0; i < entry_proc_descr.stage_count; i++ )
     {
-        total +=  pipeline[i].nb_threads
+        total +=  pipeline[i].nb_current_entries
                 + pipeline[i].nb_unprocessed_entries
                 + pipeline[i].nb_processed_entries ;
     }

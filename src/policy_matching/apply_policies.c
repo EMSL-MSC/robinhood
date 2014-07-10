@@ -49,6 +49,8 @@
 #endif
 
 
+//#define _DEBUG_POLICIES 1
+
 
 static char   *ExtractParentDir( const char *file_path, char *out_buff )
 {
@@ -56,7 +58,7 @@ static char   *ExtractParentDir( const char *file_path, char *out_buff )
     char           buff[RBH_PATH_MAX];
     char          *dir;
 
-    strncpy( buff, file_path, RBH_PATH_MAX );
+    rh_strncpy(buff, file_path, RBH_PATH_MAX);
 
     dir = dirname( buff );
 
@@ -167,11 +169,12 @@ static inline int int_compare( int int1, compare_direction_t comp, int int2 )
 #define BOOL2POLICY(_rc_) ((_rc_)?POLICY_MATCH:POLICY_NO_MATCH)
 
 #define CHECK_ATTR( _pset_, _attr_, _no_trace ) do {                                    \
-                                           if ( !ATTR_MASK_TEST( _pset_, _attr_ ) )     \
+                                           if (!ATTR_MASK_TEST( _pset_, _attr_ ))       \
                                            {                                            \
                                                if (!(_no_trace))                        \
-                                                   DisplayLog( LVL_MAJOR, POLICY_TAG,   \
-                                                       "Missing attribute '%s' for evaluating boolean expression", (#_attr_) ); \
+                                                   DisplayLog(LVL_MAJOR, POLICY_TAG,   \
+                                                       "Missing attribute '%s' for evaluating boolean expression on " \
+                                                        DFID, (#_attr_), PFID(p_entry_id)); \
                                                return POLICY_MISSING_ATTR;              \
                                            }                                            \
                                      } while (0)
@@ -1271,12 +1274,11 @@ policy_item_t *GetPolicyCase( const entry_id_t * p_entry_id,
     if ( default_index != -1 )
         return &pol_list[default_index];
 
-    /* entry matches no policy  */
-    DisplayLog( LVL_MAJOR, POLICY_TAG, "Warning: entry " F_ENT_ID " matches no %s policy.",
-                P_ENT_ID( p_entry_id, p_entry_attr ), ( policy_type == PURGE_POLICY ) ? "purge" : "migration" );
+    /* entry matches no policy => ignored */
+    DisplayLog(LVL_DEBUG, POLICY_TAG, "Entry " F_ENT_ID " matches no policy case: not applying %s to it.",
+               P_ENT_ID(p_entry_id, p_entry_attr), (policy_type == PURGE_POLICY) ? "purge" : "migration");
 
     return NULL;
-
 }
 
 /** get the policy case for the given fileclass.
@@ -1619,31 +1621,53 @@ int check_policies( const entry_id_t * p_id, attr_set_t * p_attrs_new,
 #ifdef HAVE_PURGE_POLICY
     ListMgr_GenerateFields( &attrs, policies.purge_policies.global_attr_mask );
     /* set release class if whitelisted */
-    if (_IsWhitelisted( p_id, p_attrs_new, &attrs, PURGE_POLICY, TRUE ) == POLICY_MATCH)
-        wl_purge = TRUE;
+    switch (_IsWhitelisted( p_id, p_attrs_new, &attrs, PURGE_POLICY, TRUE))
+    {
+        case POLICY_MATCH:
+            wl_purge = TRUE;
 #ifdef _DEBUG_POLICIES
             printf( "release_class=%s\n", ATTR(p_attrs_new, release_class));
 #endif
+            break;
+        case POLICY_NO_MATCH:
+            break;
+        case POLICY_MISSING_ATTR:
+        case POLICY_ERR:
+            /* skip next class matching */
+            wl_purge = TRUE;
+            break;
+    }
 #endif
 
 #ifdef HAVE_MIGR_POLICY
     /* check whitelisted fileclasses for migration */
     ListMgr_GenerateFields( &attrs, policies.migr_policies.global_attr_mask );
-    if (_IsWhitelisted( p_id, p_attrs_new, &attrs, MIGR_POLICY, TRUE ) == POLICY_MATCH)
-        wl_migr = TRUE;
+    switch (_IsWhitelisted(p_id, p_attrs_new, &attrs, MIGR_POLICY, TRUE))
+    {
+        case POLICY_MATCH:
+            wl_migr = TRUE;
+            break;
+        case POLICY_NO_MATCH:
+            break;
+        case POLICY_MISSING_ATTR:
+        case POLICY_ERR:
+            /* skip next class matching */
+            wl_migr = TRUE;
+            break;
+    }
 #endif
 
     if ( match_all_fc )
     {
 #ifdef HAVE_PURGE_POLICY
-        if (!wl_purge && (need_fileclass_update( &attrs, PURGE_POLICY ) == TRUE) )
+        if (!wl_purge && (need_fileclass_update(&attrs, PURGE_POLICY) == TRUE))
                                      /* can return -1 on error */
         {
             policy_item_t *policy_case = NULL;
             fileset_item_t *p_fileset = NULL;
 
-            policy_case = GetPolicyCase( p_id, &attrs, PURGE_POLICY,
-                                         &p_fileset );
+            policy_case = GetPolicyCase(p_id, &attrs, PURGE_POLICY,
+                                        &p_fileset);
             if ( policy_case != NULL )
             {
                 /* store the matched fileclass */
@@ -1660,11 +1684,19 @@ int check_policies( const entry_id_t * p_id, attr_set_t * p_attrs_new,
                 printf( "release_class=%s\n",  ATTR( p_attrs_new, release_class ) );
 #endif
             }
+            else
+            {
+                /* no policy case: fileclass = ignored */
+                strcpy(ATTR(p_attrs_new, release_class), CLASS_IGNORED);
+                ATTR_MASK_SET(p_attrs_new, release_class);
+                ATTR(p_attrs_new, rel_cl_update) = time(NULL);
+                ATTR_MASK_SET(p_attrs_new, rel_cl_update);
+            }
         }
 #endif
 
 #ifdef HAVE_MIGR_POLICY
-        if ( !wl_migr && (need_fileclass_update( &attrs, MIGR_POLICY ) == TRUE))
+        if (!wl_migr && (need_fileclass_update(&attrs, MIGR_POLICY) == TRUE))
                                      /* can return -1 on error */
         {
             policy_item_t *policy_case = NULL;
@@ -1676,13 +1708,21 @@ int check_policies( const entry_id_t * p_id, attr_set_t * p_attrs_new,
             {
                 /* store the matched fileclass */
                 if ( p_fileset )
-                    strcpy( ATTR( p_attrs_new, archive_class ),
-                            p_fileset->fileset_id );
+                    strcpy(ATTR(p_attrs_new, archive_class),
+                           p_fileset->fileset_id);
                 else
-                    strcpy( ATTR( p_attrs_new, archive_class ), CLASS_DEFAULT );
-                ATTR_MASK_SET( p_attrs_new, archive_class );
-                ATTR( p_attrs_new, arch_cl_update ) = time(NULL);
-                ATTR_MASK_SET( p_attrs_new, arch_cl_update );
+                    strcpy(ATTR(p_attrs_new, archive_class), CLASS_DEFAULT);
+                ATTR_MASK_SET(p_attrs_new, archive_class);
+                ATTR(p_attrs_new, arch_cl_update) = time(NULL);
+                ATTR_MASK_SET(p_attrs_new, arch_cl_update);
+            }
+            else
+            {
+                /* no policy case: fileclass = ignored */
+                strcpy(ATTR(p_attrs_new, archive_class), CLASS_IGNORED);
+                ATTR_MASK_SET(p_attrs_new, archive_class);
+                ATTR(p_attrs_new, arch_cl_update) = time(NULL);
+                ATTR_MASK_SET(p_attrs_new, arch_cl_update);
             }
         }
 #endif
@@ -1799,6 +1839,7 @@ int need_info_update( const attr_set_t * p_attrs, int * update_if_event,
        is_set = ATTR_MASK_TEST( p_attrs, path_update );
        if ( is_set )
            last = ATTR( p_attrs, path_update );
+
     }
 #endif
     else
@@ -1813,6 +1854,12 @@ int need_info_update( const attr_set_t * p_attrs, int * update_if_event,
     {
         do_update = TRUE;
         why = "not in DB/never updated";
+    }
+    /* Need to update the path if it is partial */
+    else if (ATTR_MASK_TEST(p_attrs, fullpath) && ATTR(p_attrs, fullpath)[0] != '/')
+    {
+        do_update = TRUE;
+        why = "partial path in DB";
     }
     else if ( pol.policy == UPDT_ALWAYS )
     {

@@ -433,7 +433,7 @@ static int TerminateScan( int scan_complete, time_t date_fin )
         char * cmd = replace_cmd_parameters(fs_scan_config.completion_command, vars);
         if (cmd)
         {
-            execute_shell_command(cmd, 0);
+            execute_shell_command(TRUE, cmd, 0);
             free(cmd);
         }
     }
@@ -736,7 +736,7 @@ static int create_child_task(const char *childpath, struct stat *inode, robinhoo
     }
 
     p_task->parent_task = parent;
-    strncpy(p_task->path, childpath, RBH_PATH_MAX);
+    rh_strncpy(p_task->path, childpath, RBH_PATH_MAX);
 
     /* set parent id */
     if ((rc = get_dirid(childpath, inode, &p_task->dir_id)))
@@ -794,6 +794,7 @@ static int process_one_entry(thread_scan_info_t *p_info,
     char           entry_path[RBH_PATH_MAX];
     struct stat    inode;
     int            rc = 0;
+    int            no_md = 0;
 
     /* build absolute path */
     snprintf(entry_path, RBH_PATH_MAX, "%s/%s", p_task->path, entry_name);
@@ -802,6 +803,19 @@ static int process_one_entry(thread_scan_info_t *p_info,
     rc = stat_entry(entry_path, entry_name, parentfd, &inode);
     if (rc)
     {
+#ifdef _LUSTRE
+        if (is_lustre_fs && (rc == -ESHUTDOWN))
+        {
+            /* File can't be stat because it is on a disconnected OST.
+             * Still push it to the pipeline, to avoid loosing valid info
+             * in the DB.
+             */
+            DisplayLog(LVL_EVENT, FSSCAN_TAG, "Entry %s is on inactive OST or MDT. "
+                       "Cannot get its attributes.", entry_path);
+            no_md = 1;
+            goto push;
+        }
+#endif
         DisplayLog(LVL_MAJOR, FSSCAN_TAG,
                    "failed to stat %s (%s): entry ignored",
                    entry_path, strerror(-rc));
@@ -830,6 +844,7 @@ static int process_one_entry(thread_scan_info_t *p_info,
     else
     {
         entry_proc_op_t * op;
+push:
 
         op = EntryProcessor_Get( );
         if (!op) {
@@ -861,23 +876,37 @@ static int process_one_entry(thread_scan_info_t *p_info,
         ATTR_MASK_SET( &op->fs_attrs, depth );
         ATTR( &op->fs_attrs, depth ) = p_task->depth;  /* depth(/<mntpoint>/toto) = 0 */
 
+        if (!no_md)
+        {
 #if defined( _LUSTRE ) && defined( _MDS_STAT_SUPPORT )
-        PosixStat2EntryAttr( &inode, &op->fs_attrs, !(is_lustre_fs && global_config.direct_mds_stat) );
+            PosixStat2EntryAttr( &inode, &op->fs_attrs, !(is_lustre_fs && global_config.direct_mds_stat) );
 #else
-        PosixStat2EntryAttr( &inode, &op->fs_attrs, TRUE );
+            PosixStat2EntryAttr(&inode, &op->fs_attrs, TRUE);
 #endif
-        /* set update time  */
-        ATTR_MASK_SET( &op->fs_attrs, md_update );
-        ATTR( &op->fs_attrs, md_update ) = time( NULL );
+            /* set update time  */
+            ATTR_MASK_SET( &op->fs_attrs, md_update );
+            ATTR( &op->fs_attrs, md_update ) = time( NULL );
+        }
+        else
+        {
+            /* must still set it to avoid the entry to be impacted by scan final GC */
+            ATTR_MASK_SET(&op->fs_attrs, md_update);
+            ATTR(&op->fs_attrs, md_update) = time(NULL);
+        }
         ATTR_MASK_SET( &op->fs_attrs, path_update );
         ATTR( &op->fs_attrs, path_update ) = time( NULL );
 
         /* Set entry id */
 #ifndef _HAVE_FID
-        op->entry_id.inode = inode.st_ino;
-        op->entry_id.fs_key = get_fskey();
-        op->entry_id.validator = inode.st_ctime;
-        op->entry_id_is_set = TRUE;
+        if (!no_md)
+        {
+            op->entry_id.inode = inode.st_ino;
+            op->entry_id.fs_key = get_fskey();
+            op->entry_id.validator = inode.st_ctime;
+            op->entry_id_is_set = TRUE;
+        }
+        else
+            op->entry_id_is_set = FALSE;
 #else
         op->entry_id_is_set = FALSE;
 #ifndef _NO_AT_FUNC
@@ -903,7 +932,7 @@ static int process_one_entry(thread_scan_info_t *p_info,
         op->extra_info_is_set = FALSE;
 
 #ifdef _LUSTRE
-        if (S_ISREG(inode.st_mode) && is_first_scan)
+        if ((no_md || S_ISREG(inode.st_mode)) && is_first_scan)
         {
             /* Fetch the stripes information now. This is faster than
              * doing it later in the pipeline. However if that fails now,
@@ -1106,9 +1135,8 @@ static int process_one_task(robinhood_task_t *p_task,
 #ifdef _BENCH_DB
     /* to map entry_id_t to an integer  we can increment */
     struct id_map { uint64_t high; uint64_t low; } * volatile fakeid;
-    /* root task: insert 500k entries with root entry id + N.
-     * no subtask */
-    if (p_task->parent_task != NULL)
+    /* level1 tasks: insert 100k entries with root entry id + N. */
+    if (p_task->depth > 1)
         return 0;
 #endif
 
@@ -1178,6 +1206,9 @@ static int process_one_task(robinhood_task_t *p_task,
     }
 #ifndef _BENCH_DB
     else
+#else
+    else if (p_task->depth == 0)
+#endif
     {
         /* read the directory and process each entry */
         rc = process_one_dir(p_task, p_info, nb_entries, nb_errors);
@@ -1185,10 +1216,13 @@ static int process_one_task(robinhood_task_t *p_task,
             return rc;
     }
 
-    if (p_task->depth > 0)
-#else
+#ifdef _BENCH_DB
     int i;
-    for (i = 1; i < 500000 && !p_info->force_stop; i++)
+#endif
+
+    if (p_task->depth > 0)
+#ifdef _BENCH_DB
+    for (i = 1; i < 100000 && !p_info->force_stop; i++)
 #endif
     {
         /* Fill dir info and push it to the pileline for checking alerts on it,
@@ -1250,10 +1284,27 @@ static int process_one_task(robinhood_task_t *p_task,
         ATTR_MASK_SET(&op->fs_attrs, dircount);
         ATTR(&op->fs_attrs, dircount) = *nb_entries;
 
+#ifndef _BENCH_PIPELINE
 #if defined( _LUSTRE ) && defined( _MDS_STAT_SUPPORT )
         PosixStat2EntryAttr(&p_task->dir_md, &op->fs_attrs, !(is_lustre_fs && global_config.direct_mds_stat));
 #else
         PosixStat2EntryAttr(&p_task->dir_md, &op->fs_attrs, TRUE);
+#endif
+#endif
+
+#ifdef _BENCH_DB
+        /* generate cyclic owner, group, type, size, ... */
+        unsigned int u = (i + 17) % 137;
+        sprintf(ATTR(&op->fs_attrs, owner), "user%u", u);
+        sprintf(ATTR(&op->fs_attrs, gr_name), "group%u", u/8); /* 8 user per group */
+        switch (i % 2)
+        {
+            case 0: strcpy(ATTR(&op->fs_attrs, type), STR_TYPE_DIR); break;
+            case 1: strcpy(ATTR(&op->fs_attrs, type), STR_TYPE_FILE); break;
+        }
+        ATTR(&op->fs_attrs, size) = ((i % 311) * 1493);
+
+        p_info->entries_handled ++;
 #endif
         /* set update time  */
         ATTR_MASK_SET(&op->fs_attrs, md_update);
@@ -1554,6 +1605,7 @@ static int StartScan( void )
         /* check that partial_root is under FS root */
         if (strncmp(global_config.fs_path, partial_scan_root, strlen(global_config.fs_path)))
         {
+            V(lock_scan);
             DisplayLog( LVL_CRIT, FSSCAN_TAG, "ERROR scan root %s is not under fs root %s",
                         partial_scan_root, global_config.fs_path );
             return -1;
@@ -1858,18 +1910,14 @@ int Robinhood_CheckScanDeadlines( void )
                 }
                 else
                 {
-                    char tmpbuf[1024];
                     DisplayLog( LVL_MAJOR, FSSCAN_TAG,
                                 "Hang of thread #%d while it was scanning %s (inactive for %ld sec)",
                                 i, thread_list[i].current_task->path,
                                 time( NULL ) - thread_list[i].last_action );
-
-                    snprintf( tmpbuf, 1024, "FS scan is blocked (%s)",
-                              global_config.fs_path );
-                    RaiseAlert( tmpbuf, "A thread has been inactive for %ld sec\n"
-                                "while scanning directory %s",
-                                time( NULL ) - thread_list[i].last_action,
-                                thread_list[i].current_task->path );
+                    RaiseAlert("FS scan is blocked", "A thread has been inactive for %ld sec\n"
+                               "while scanning directory %s",
+                               time(NULL) - thread_list[i].last_action,
+                               thread_list[i].current_task->path);
 
                     /* if the config says to exit on timeout => do it */
                     if ( fs_scan_config.exit_on_timeout )

@@ -401,13 +401,12 @@ static void report_progress(const unsigned long long * pass_begin, const unsigne
     unsigned int nb_errors = migration_info.errors;
 
     /* add stats for the current pass */
-    if (pass_begin && pass_current)
+    if (pass_begin && pass_current &&
+        status_tab_begin && status_tab_current)
     {
         migr_vol += pass_current[MIGR_FDBK_VOL] - pass_begin[MIGR_FDBK_VOL];
-        migr_count += pass_current[MIGR_FDBK_NBR] - pass_begin[MIGR_FDBK_NBR];
-    }
-    if (status_tab_begin && status_tab_current)
-    {
+        migr_count += status_tab_current[MIGR_OK] - status_tab_begin[MIGR_OK];
+
         nb_skipped = skipped_count(status_tab_current)
                         - skipped_count(status_tab_begin);
         nb_errors = error_count(status_tab_current)
@@ -446,7 +445,8 @@ static int wait_queue_empty( unsigned int nb_submitted,
                              unsigned int * status_tab_after,
                              int long_sleep )
 {
-    unsigned int nb_in_queue, nb_migr_pending;
+    unsigned int nb_in_queue;
+    int nb_migr_pending;
 
     /* Wait for end of migration pass */
     do
@@ -465,14 +465,14 @@ static int wait_queue_empty( unsigned int nb_submitted,
         nb_migr_pending = nb_submitted - (ack_count(status_tab_after)
                                           - ack_count(status_tab_init));
 
-        if ( ( nb_in_queue != 0 ) || ( nb_migr_pending != 0 ) )
+        if ((nb_in_queue > 0) || (nb_migr_pending > 0))
         {
             /* abort this migrations pass if the last action was done a too long time ago */
             if ( ( migr_config.migration_timeout != 0 ) &&
                  (time(NULL) - last_activity > migr_config.migration_timeout) )
             {
                 DisplayLog( LVL_MAJOR, MIGR_TAG,
-                            "Migration pass time-out: %u migrations inactive for %us",
+                            "Migration pass time-out: %d migrations inactive for %us",
                             nb_migr_pending, (unsigned int) (time(NULL) - last_activity) );
                 /* don't wait for current migrations to end, continue with other entries */
                 return ETIME;
@@ -483,7 +483,7 @@ static int wait_queue_empty( unsigned int nb_submitted,
             DisplayLog( LVL_DEBUG, MIGR_TAG,
                         "Waiting for the end of this migr pass: "
                         "still %u files to be archived "
-                        "(%u in queue, %u being processed). "
+                        "(%d in queue, %d being processed). "
                         "Last action: %"PRI_TT"s ago.",
                         nb_migr_pending, nb_in_queue,
                         nb_migr_pending - nb_in_queue,
@@ -730,13 +730,13 @@ int perform_migration( lmgr_t * lmgr, migr_param_t * p_migr_param,
     switch ( p_migr_param->type )
     {
     case MIGR_FS:
-        DisplayLog( LVL_EVENT, MIGR_TAG, "Starting migration pass" );
+        DisplayLog(LVL_MAJOR, MIGR_TAG, "Starting migration");
         /* We must retrieve all files sorted by mtime: no extra filter */
         break;
 
     case MIGR_BY_OST:
-        DisplayLog( LVL_EVENT, MIGR_TAG, "Starting migration on OST #%u",
-                    p_migr_param->param_u.ost_index );
+        DisplayLog(LVL_MAJOR, MIGR_TAG, "Starting migration on OST #%u",
+                   p_migr_param->param_u.ost_index);
 
         /* retrieve stripe info and stripe items */
         ATTR_MASK_SET( &attr_set, stripe_info );
@@ -751,8 +751,8 @@ int perform_migration( lmgr_t * lmgr, migr_param_t * p_migr_param,
         break;
 
     case MIGR_BY_USER:
-        DisplayLog( LVL_EVENT, MIGR_TAG, "Starting migration of '%s' user files",
-                    p_migr_param->param_u.user_name );
+        DisplayLog(LVL_MAJOR, MIGR_TAG, "Starting migration of '%s' user files",
+                   p_migr_param->param_u.user_name);
 
         /* We must retrieve files for this user */
 
@@ -763,8 +763,8 @@ int perform_migration( lmgr_t * lmgr, migr_param_t * p_migr_param,
         break;
 
     case MIGR_BY_GROUP:
-        DisplayLog( LVL_EVENT, MIGR_TAG, "Starting migration of '%s' group files",
-                    p_migr_param->param_u.group_name );
+        DisplayLog(LVL_MAJOR, MIGR_TAG, "Starting migration of '%s' group files",
+                   p_migr_param->param_u.group_name);
 
         /* We must retrieve files for this group */
 
@@ -776,8 +776,8 @@ int perform_migration( lmgr_t * lmgr, migr_param_t * p_migr_param,
         break;
 
     case MIGR_BY_CLASS:
-        DisplayLog( LVL_EVENT, MIGR_TAG, "Starting migration on fileclass '%s'",
-                    p_migr_param->param_u.class_name );
+        DisplayLog(LVL_MAJOR, MIGR_TAG, "Starting migration on fileclass '%s'",
+                   p_migr_param->param_u.class_name);
 
         if (!strcasecmp( p_migr_param->param_u.class_name, "default"))
             fval.value.val_str = CLASS_DEFAULT;
@@ -1023,7 +1023,7 @@ int perform_migration( lmgr_t * lmgr, migr_param_t * p_migr_param,
 
         /* add stats for this pass */
         migration_info.migr_vol += feedback_after[MIGR_FDBK_VOL] - feedback_before[MIGR_FDBK_VOL];
-        migration_info.migr_count += feedback_after[MIGR_FDBK_NBR] - feedback_before[MIGR_FDBK_NBR];
+        migration_info.migr_count += status_tab_after[MIGR_OK] - status_tab_before[MIGR_OK];
         migration_info.skipped += skipped_count(status_tab_after) - skipped_count(status_tab_before);
         migration_info.errors += error_count(status_tab_after) - error_count(status_tab_before);
 
@@ -1150,31 +1150,12 @@ static int check_entry( lmgr_t * lmgr, migr_item_t * p_item, attr_set_t * new_at
 
     /* get fullpath or name, if they are needed for applying policy
      * and if it is expired in DB */
-    if ( ( policies.migr_policies.global_attr_mask & ATTR_MASK_fullpath )
-         || ( policies.migr_policies.global_attr_mask & ATTR_MASK_name ) )
+    if (((policies.migr_policies.global_attr_mask & ATTR_MASK_fullpath)
+          || (policies.migr_policies.global_attr_mask & ATTR_MASK_name)) &&
+        need_path_update(&p_item->entry_attr, NULL))
     {
-        if ( need_path_update(&p_item->entry_attr, NULL) )
-        {
-            if ( Lustre_GetFullPath( &p_item->entry_id,
-                                    ATTR( new_attr_set, fullpath ),
-                                    1024 ) == 0 )
-            {
-                char          *curr;
-                ATTR_MASK_SET( new_attr_set, fullpath );
-                curr = strrchr( ATTR( new_attr_set, fullpath ), '/' );
-
-                /* update path refresh time */
-                ATTR_MASK_SET( new_attr_set, path_update );
-                ATTR( new_attr_set, path_update ) = time( NULL );
-
-                if ( curr )
-                {
-                    curr++;
-                    strcpy( ATTR( new_attr_set, name ), curr );
-                    ATTR_MASK_SET( new_attr_set, name );
-                }
-            }
-        } /* end get path */
+        path_check_update(&p_item->entry_id, fid_path, new_attr_set,
+                          policies.migr_policies.global_attr_mask);
     }
 
     /* is status known? */
@@ -1258,28 +1239,11 @@ static int check_entry( lmgr_t * lmgr, migr_item_t * p_item, attr_set_t * new_at
         }
     }
 
-    if ( (need_fresh_attrs & (ATTR_MASK_fullpath | ATTR_MASK_name | ATTR_MASK_depth ))
-         || need_path_update(&p_item->entry_attr, NULL) )
+    if ((need_fresh_attrs & (ATTR_MASK_fullpath | ATTR_MASK_name | ATTR_MASK_depth))
+         || need_path_update(&p_item->entry_attr, NULL))
     {
 #ifdef _HAVE_FID
-        char pathnew[RBH_PATH_MAX];
-        /* /!\ Lustre_GetFullPath modifies fullpath even on failure,
-         * so, first write to a tmp buffer */
-        rc = Lustre_GetFullPath( &p_item->entry_id, pathnew, RBH_PATH_MAX );
-
-        if ( rc == 0 )
-        {
-            strcpy( ATTR( &p_item->entry_attr, fullpath ), pathnew );
-            ATTR_MASK_SET( &p_item->entry_attr, fullpath );
-            ATTR_MASK_SET( &p_item->entry_attr, path_update );
-            ATTR( &p_item->entry_attr, path_update ) = time( NULL );
-        }
-        else if (rc == -ENOENT)
-        {
-            invalidate_entry( lmgr, &p_item->entry_id );
-            return MIGR_ENTRY_MOVED;
-        }
-
+        path_check_update(&p_item->entry_id, fspath, new_attr_set, need_fresh_attrs);
 #else
         DisplayLog( LVL_MAJOR, MIGR_TAG, "Missing path info for addressing the entry" );
         return MIGR_PARTIAL_MD;
@@ -1646,10 +1610,10 @@ static int ManageEntry( lmgr_t * lmgr, migr_item_t * p_item, int no_queue )
 
         /* we probably have a wrong status for this entry: refresh it */
 
-        rc = LustreHSM_GetStatus( fid_path, &ATTR( &new_attr_set, status ),
-                                  &ATTR( &new_attr_set, no_release ),
-                                  &ATTR( &new_attr_set, no_archive ) );
-        if ( !rc )
+        int rc2 = LustreHSM_GetStatus(fid_path, &ATTR(&new_attr_set, status),
+                                      &ATTR(&new_attr_set, no_release),
+                                      &ATTR(&new_attr_set, no_archive));
+        if (!rc2)
         {
             ATTR_MASK_SET( &new_attr_set, status );
             ATTR_MASK_SET( &new_attr_set, no_release );

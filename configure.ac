@@ -4,8 +4,9 @@
 
 AC_PREREQ(2.59)
 
-AC_INIT( [robinhood], [2.5.0], [robinhood-support@lists.sourceforge.net])
-RELEASE="0.beta1"
+AC_INIT( [robinhood], [2.5.2], [robinhood-support@lists.sourceforge.net])
+RELEASE="1"
+
 AC_DEFINE_UNQUOTED(RELEASE, "$RELEASE", [release info] )
 AC_SUBST(RELEASE)
 
@@ -64,9 +65,11 @@ AX_ENABLE_FLAG([debug-pipeline], [enables debug traces for entry processor pipel
 AX_ENABLE_FLAG([debug-policies], [enables debug traces for entry processor pipeline], [-D_DEBUG_POLICIES])
 AX_ENABLE_FLAG([debug-hash], [enables debug traces internal hash tables], [-D_DEBUG_HASH])
 
-AX_ENABLE_FLAG([bench-scan], [build version for scan benchmarking], [-D_BENCH_SCAN])
-AX_ENABLE_FLAG([bench-db], [build version for DB benchmarking], [-D_BENCH_DB])
-AX_ENABLE_FLAG([gprof], [Add gprof info to the binaries], [-g -pg])
+AX_ENABLE_FLAG([bench-scan], [test only: build special version for scan benchmarking], [-D_BENCH_SCAN])
+AX_ENABLE_FLAG([bench-db], [test only: build special version for DB benchmarking], [-D_BENCH_DB])
+AX_ENABLE_FLAG([bench-pipeline], [test only: build special version for pipeline benchmarking], [-D_BENCH_PIPELINE -D_BENCH_DB])
+AX_ENABLE_FLAG([gprof], [test only: add gprof info to the binaries], [-g -pg])
+AX_ENABLE_FLAG([gcov], [test only: add gcov info to the binaries], [--coverage])
 
 # behavior flags
 AX_DISABLE_FLAG([atfunc], [Don't use 'at' functions for scanning], [-D_NO_AT_FUNC])
@@ -357,7 +360,7 @@ case $DB in
 
         AC_CHECK_HEADERS([mysql/mysql.h])
         AC_CHECK_HEADER([mysql/mysql.h], HAVE_MYSQLCLNT="true",
-                        AC_MSG_ERROR([MySQL devel. package not installed]) )
+                        AC_MSG_ERROR([MySQL client header not found (mysql/mysql.h). mysql-devel may not be installed.]))
 
         DB_CFLAGS="-D_MYSQL `$MYSQL_CONFIG --include`"
         DB_LDFLAGS=`mysql_config --libs_r`
@@ -400,6 +403,10 @@ AC_CHECK_FUNC([getmntent_r],[getmntent_r=yes],[getmntent_r=no])
 test "$getmntent_r" = "yes" && AC_DEFINE(HAVE_GETMNTENT_R, 1, [Reentrant version of getmntent exists])
 AM_CONDITIONAL(MNTENTCOMPAT, test "$getmntent_r" = "no" )
 
+# Check if fallocate(2) exists.
+AC_CHECK_FUNC([fallocate],[fallocate=yes],[fallocate=no])
+test "$fallocate" = "yes" && AC_DEFINE(HAVE_FALLOCATE, 1, [File preallocation available])
+
 AS_AC_EXPAND(CONFDIR, $sysconfdir)
 if test $prefix = NONE && test "$CONFDIR" = "/usr/etc"  ; then
     CONFDIR="/etc"
@@ -440,6 +447,8 @@ AC_CONFIG_FILES([Makefile
          scripts/sysconfig_robinhood
          tests/Makefile
          web_gui/Makefile
+         man/Makefile
          robinhood.spec
-         doc/doxygen/doxygen.cfg])
+         doc/doxygen/doxygen.cfg
+         scripts/make_mans.sh])
 AC_OUTPUT

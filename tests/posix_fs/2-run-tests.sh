@@ -80,6 +80,7 @@ function set_skipped
 
 function clean_logs
 {
+    local f
 	for f in $CLEAN; do
 		if [ -s $f ]; then
 			cp /dev/null $f
@@ -486,6 +487,11 @@ function test_custom_purge
 		dd if=/dev/zero of=$ROOT/file.$i bs=1M count=10 >/dev/null 2>/dev/null || error "writing file.$i"
 	done
 
+    # create malicious file names to test vulnerability
+    touch "$ROOT/foo1 \`pkill -9 $CMD\`" || error "couldn't create file"
+    touch "$ROOT/foo2 ; exit 1" || error "couldn't create file"
+    touch "$ROOT/foo3' ';' 'exit' '1'" || error "couldn't create file"
+
 	echo "Inital scan..."
 	$RH -f ./cfg/$config_file --scan --once -l DEBUG -L rh_scan.log 
 	check_db_error rh_scan.log
@@ -499,10 +505,10 @@ function test_custom_purge
 	check_db_error rh_purge.log
 
 	nb_purge=`grep "Purged" rh_purge.log | wc -l`
-	if (($nb_purge != 10)); then
-		error "********** TEST FAILED: 10 purge actions expected, $nb_purge done"
+	if (($nb_purge != 13)); then
+		error "********** TEST FAILED: 13 purge actions expected, $nb_purge done"
 	else
-		echo "OK: 10 actions done"
+		echo "OK: 13 actions done"
 	fi
 
 	# checking that the custom command was called for each
@@ -511,6 +517,17 @@ function test_custom_purge
         # check the entry has been deleted
         [ -f $ROOT/file.$i ] && error "$ROOT/file.$i still exists after purge command"
 	done
+
+    for f in  "$ROOT/foo1 \`pkill -9 $CMD\`" "$ROOT/foo2 ; exit 1" "$ROOT/foo3' ';' 'exit' '1'" ; do
+        f0=$(echo "$f" | awk '{print $1}')
+		line=$(grep "Executing " rh_purge.log | grep '/bin/rm' | grep "$f0")
+        if [ -z "$line" ]; then
+            error "No action found on $f"
+            continue
+        fi
+        [ -f "$f" ] && error "$f still exists after purge command"
+    done
+
 	return 0
 }
 
@@ -1587,7 +1604,7 @@ function test_info_collect
 	grep "DB query failed" rh_scan.log && error ": a DB query failed when scanning"
 
 	nb_create=`grep ChangeLog rh_scan.log | grep 01CREAT | wc -l`
-	nb_db_apply=`grep STAGE_DB_APPLY rh_scan.log | tail -1 | cut -d '|' -f 6 | cut -d ':' -f 2 |
+	nb_db_apply=`grep ': DB_APPLY' rh_scan.log | tail -1 | cut -d '|' -f 6 | cut -d ':' -f 2 |
 		     cut -d ',' -f 1 | tr -d ' '`
 
 	if (( $is_hsmlite != 0 )); then
@@ -1611,7 +1628,7 @@ function test_info_collect
 	check_db_error rh_scan.log
 
 	grep "DB query failed" rh_scan.log && error ": a DB query failed when scanning"
-	nb_db_apply=`grep STAGE_DB_APPLY rh_scan.log | tail -1 | cut -d '|' -f 6 | cut -d ':' -f 2 |
+	nb_db_apply=`grep ': DB_APPLY' rh_scan.log | tail -1 | cut -d '|' -f 6 | cut -d ':' -f 2 |
 		     cut -d ',' -f 1 |  tr -d ' '`
 
 	# 4 db operations expected (1 for each file)
@@ -1798,6 +1815,45 @@ function test_diff_apply_fs # test diff --apply=fs in particular for entry recov
     rm -f  diff.out diff.log find.out find2.out
 }
 
+function test_mnt_point
+{
+	config_file=$1
+	clean_logs
+
+    export fs_path=$ROOT/subdir # retrieved from env when parsing config file
+
+    local dir_rel="dir1 dir2"
+    local file_rel="dir1/file.1 dir1/file.2 dir2/file.3 file.4"
+
+    for d in $dir_rel; do
+        mkdir -p $fs_path/$d || error mkdir
+    done
+    for f in $file_rel; do
+        touch $fs_path/$f || error touch
+    done
+
+    # scan the filesystem
+    $RH -f ./cfg/$config_file --scan --once -l EVENT -L rh_scan.log  || error "performing inital scan"
+    check_db_error rh_scan.log
+
+    # check that rbh-find output is correct (2 methods)
+    for opt in "-nobulk $fs_path" "$fs_path" "-nobulk" ""; do
+        echo "checking output for rbh-find $opt..."
+        $FIND -f ./cfg/$config_file $opt > rh_report.log
+        for e in $dir_rel $file_rel; do
+            egrep -E "^$fs_path/$e$" rh_report.log || error "$e not found in rbh-find output"
+        done
+    done
+
+    # check that rbh-report output is correct
+    $REPORT -f ./cfg/$config_file -q --dump | awk '{print $(NF)}'> rh_report.log
+    [ "$DEBUG" = "1" ] && cat rh_report.log
+    for e in $dir_rel $file_rel; do
+        egrep -E "^$fs_path/$e$" rh_report.log || error "$e not found in report output"
+    done
+}
+
+
 function test_completion
 {
 	config_file=$1
@@ -1871,7 +1927,7 @@ function test_rename
     $REPORT -f ./cfg/$config_file --dump-all -q > report.out || error "$REPORT"
     [ "$DEBUG" = "1" ] && cat report.out
 
-    $FIND -f ./cfg/$config_file $ROOT -ls > find.out || error "$FIND"
+    $FIND -f ./cfg/$config_file $ROOT -nobulk -ls > find.out || error "$FIND"
     [ "$DEBUG" = "1" ] && cat find.out
 
     # checking all objects in reports
@@ -1937,7 +1993,7 @@ function test_rename
     $REPORT -f ./cfg/$config_file --dump-all -q > report.out || error "$REPORT"
     [ "$DEBUG" = "1" ] && cat report.out
 
-    $FIND -f ./cfg/$config_file $ROOT -ls > find.out || error "$FIND"
+    $FIND -f ./cfg/$config_file $ROOT -nobulk -ls > find.out || error "$FIND"
     [ "$DEBUG" = "1" ] && cat find.out
 
     # checking all objects in reports
@@ -2014,7 +2070,7 @@ function test_hardlinks
     $REPORT -f ./cfg/$config_file --dump-all -q > report.out || error "$REPORT"
     [ "$DEBUG" = "1" ] && cat report.out
 
-    $FIND -f ./cfg/$config_file $ROOT -ls > find.out || error "$FIND"
+    $FIND -f ./cfg/$config_file $ROOT -nobulk -ls > find.out || error "$FIND"
     [ "$DEBUG" = "1" ] && cat find.out
 
     # checking all objects in reports
@@ -2106,10 +2162,8 @@ function test_hardlinks
     $REPORT -f ./cfg/$config_file --dump-all -q > report.out || error "$REPORT"
     [ "$DEBUG" = "1" ] && cat report.out
 
-    $FIND -f ./cfg/$config_file $ROOT -ls > find.out || error "$FIND"
+    $FIND -f ./cfg/$config_file $ROOT -nobulk -ls > find.out || error "$FIND"
     [ "$DEBUG" = "1" ] && cat find.out
-
-
 
     # checking all objects in reports
     for o in $dirs_tgt $files_tgt; do
@@ -2172,9 +2226,9 @@ function test_hl_count
     #   dump report with path filter (3 entries)
     (($($REPORT -f ./cfg/$config_file -D -q -P $ROOT/dir.1 | wc -l) == $ino_subdir )) || error "wrong count in 'rbh-report -D -P <path>' output"
     #   dump find output (whole FS) (10 entries, incl. root)
-    (($($FIND -f ./cfg/$config_file | wc -l) == $ino + 1))  || error "wrong count in 'rbh-find' output"
+    (($($FIND -f ./cfg/$config_file -nobulk | wc -l) == $ino + 1))  || error "wrong count in 'rbh-find' output"
     #   dump find output (subdir: 3 entries)
-    (($($FIND -f ./cfg/$config_file $ROOT/dir.1 | wc -l) == $ino_subdir )) || error "wrong count in 'rbh-find <path>' output"
+    (($($FIND -f ./cfg/$config_file -nobulk $ROOT/dir.1 | wc -l) == $ino_subdir )) || error "wrong count in 'rbh-find <path>' output"
 
     #   dump summary (9 entries)
     $REPORT -f ./cfg/$config_file -icq > report.out
@@ -2214,9 +2268,9 @@ function test_hl_count
     #   dump report with path filter (still 3 entries)
     (($($REPORT -f ./cfg/$config_file -D -q -P $ROOT/dir.1 | wc -l) == $ino_subdir )) || error "wrong count in 'rbh-report -D -P <path>' output"
     #   dump find output (whole FS) (
-    (($($FIND -f ./cfg/$config_file | wc -l) == $paths + 1 ))  || error "wrong count in 'rbh-find' output"
+    (($($FIND -f ./cfg/$config_file -nobulk | wc -l) == $paths + 1 ))  || error "wrong count in 'rbh-find' output"
     #   dump find output (subdir: 3 entries)
-    (($($FIND -f ./cfg/$config_file $ROOT/dir.1 | wc -l) == $paths_subdir )) || error "wrong count in 'rbh-find <path>' output"
+    (($($FIND -f ./cfg/$config_file -nobulk $ROOT/dir.1 | wc -l) == $paths_subdir )) || error "wrong count in 'rbh-find <path>' output"
 
     #   dump summary (9 entries)
     $REPORT -f ./cfg/$config_file -icq > report.out
@@ -2398,10 +2452,21 @@ function test_logs
 			egrep -v 'ALERT' /tmp/extract_all | grep  ': [A-Za-Z ]* \|' > /tmp/extract_log
 			egrep -v 'ALERT|: [A-Za-Z ]* \|' /tmp/extract_all > /tmp/extract_report
 			grep 'ALERT' /tmp/extract_all > /tmp/extract_alert
-		elif (( $stdio )); then
-			grep ALERT /tmp/rbh.stdout > /tmp/extract_alert
-			# grep 'robinhood\[' => don't select lines with no headers
-			grep -v ALERT /tmp/rbh.stdout | grep "$CMD[^ ]*\[" > /tmp/extract_report
+
+            if [ "$DEBUG" = "1" ]; then
+                echo "----- syslog alerts:" ; cat /tmp/extract_alert
+                echo "----- syslog actions:" ; cat /tmp/extract_report
+                echo "----- syslog traces:" ; cat /tmp/extract_log
+            fi
+        elif (( $stdio )); then
+                        grep ALERT /tmp/rbh.stdout > /tmp/extract_alert
+                       # grep [22909/8] => don't select lines with no headers
+                       grep -v ALERT /tmp/rbh.stdout | grep "\[[0-9]*/[0-9]*\]" > /tmp/extract_report
+            if [ "$DEBUG" = "1" ]; then
+                echo "----- stdio alerts:" ; cat /tmp/extract_alert
+                echo "----- stdio actions:" ; cat /tmp/extract_report
+                echo "----- stdio (all):" ; cat /tmp/rbh.stdout
+            fi
 		fi
 
 		# check that there is something written in the log
@@ -4166,6 +4231,7 @@ run_test 109d    test_hardlinks info_collect.conf diff "hardlinks management (di
 run_test 109e    test_hardlinks info_collect.conf partdiff "hardlinks management (partial diffs+apply)"
 run_test 112     test_hl_count info_collect.conf "reports with hardlinks"
 run_test 113     test_diff_apply_fs info_collect2.conf  "diff"  "rbh-diff --apply=fs"
+run_test 116     test_mnt_point  test_mnt_point.conf "test with mount point != fs_path"
 
 #### policy matching tests  ####
 

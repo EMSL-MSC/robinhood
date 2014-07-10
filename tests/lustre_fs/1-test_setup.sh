@@ -17,6 +17,7 @@ service mysqld start
 
 $CFG_SCRIPT test_db  robinhood_lustre robinhood || $CFG_SCRIPT create_db robinhood_lustre localhost robinhood
 $CFG_SCRIPT empty_db robinhood_lustre
+$CFG_SCRIPT repair_db robinhood_lustre
 
 if [[ -z "$NOLOG" || $NOLOG = "0" ]]; then
 	$CFG_SCRIPT enable_chglogs lustre
@@ -41,6 +42,7 @@ if [[ $PURPOSE = "LUSTRE_HSM" ]]; then
 	if (( `pgrep -f lhsmtool_posix | wc -l` > 0 )); then
 		echo "Already running"
 	else
+		mkdir -p $BKROOT
 		$COPYTOOL --hsm_root=$BKROOT --no-shadow --daemon /mnt/lustre &
 	fi
 

@@ -88,10 +88,10 @@ int main( int argc, char **argv )
                 }
                 break;
             case 'f':
-                strncpy(config_file, optarg, MAX_OPT_LEN);
+                rh_strncpy(config_file, optarg, MAX_OPT_LEN);
                 break;
             case 'o':
-                strncpy(output_file, optarg, MAX_OPT_LEN);
+                rh_strncpy(output_file, optarg, MAX_OPT_LEN);
                 break;
             case 'm':
                 margin = str2int(optarg);
@@ -113,7 +113,7 @@ int main( int argc, char **argv )
     }
 
     /* get default config file, if not specified */
-    if ( SearchConfig( config_file, config_file, &chgd, badcfg ) != 0 )
+    if (SearchConfig(config_file, config_file, &chgd, badcfg, MAX_OPT_LEN) != 0)
     {
         fprintf(stderr, "No config file (or too many) found matching %s\n", badcfg);
         exit(2);

@@ -50,6 +50,8 @@
 
 #define bool2str( _b_ )   ((_b_)?"TRUE":"FALSE")
 
+#define rh_strncpy(_s1, _s2, _sz) do { strncpy(_s1, _s2, _sz-1); if (_sz > 0) (_s1)[_sz-1] = '\0'; } while(0)
+
 /**
  *  Other useful definitions
  */
@@ -92,7 +94,8 @@ int            SendMail( const char *recipient, const char *subject, const char 
 /**
  * Search for Robinhood config file
  */
-int SearchConfig( const char * cfg_in, char * cfg_out, int * changed, char * unmatched);
+int SearchConfig(const char * cfg_in, char * cfg_out, int * changed, char * unmatched,
+                 size_t max_len);
 
 /**
  * This function is blocking as long as the lock file is present.
@@ -152,6 +155,7 @@ const char    *get_fid_dir( void );
 const char    *get_fsname( void );
 dev_t          get_fsdev( void );
 uint64_t       get_fskey( void );
+const entry_id_t *get_root_id(void);
 
 /**
  * extract relative path from full path
@@ -195,6 +199,10 @@ int            Lustre_GetFidByFd(int fd, entry_id_t * p_id);
 int            Lustre_GetNameParent(const char *path, int linkno,
                                     lustre_fid *pfid, char *name, int namelen);
 
+void path_check_update(const entry_id_t *p_id,
+                       const char *fid_path, attr_set_t *p_attrs,
+                       int attr_mask);
+
 #define FID_IS_ZERO(_pf) (((_pf)->f_seq == 0) && ((_pf)->f_oid == 0))
 
 #endif
@@ -233,12 +241,10 @@ int            Get_OST_usage( const char *fs_path, unsigned int ost_index, struc
 int            Get_pool_usage( const char *poolname, struct statfs *pool_statfs );
 #endif
 
-#ifdef _MDS_STAT_SUPPORT
 /** Retrieve file information from MDS */
 int lustre_mds_stat(char *fullpath, int parentfd, struct stat *inode);
 #ifdef _HAVE_FID
 int lustre_mds_stat_by_fid( const entry_id_t * p_id, struct stat *inode );
-#endif
 #endif
 
 #ifndef _MDT_SPECIFIC_LOVEA
@@ -388,7 +394,9 @@ int str_replace( char * str_in_out, const char * to_be_replaced,
 /**
  * Execute a shell command and analyze the return code
  */
-int execute_shell_command( const char * cmd, int argc, ... );
+int execute_shell_command(int quiet, const char * cmd, int argc, ...);
+
+char *quote_shell_arg(const char *arg);
 
 /**
  * Replace special parameters {cfgfile}, {fspath}, ...

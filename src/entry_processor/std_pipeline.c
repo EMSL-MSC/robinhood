@@ -55,7 +55,7 @@ static int  dbop_is_batchable(struct entry_proc_op_t *, struct entry_proc_op_t *
 
 /* pipeline stages */
 enum {
-    STAGE_GET_FID,
+    STAGE_GET_FID = 0,
     STAGE_GET_INFO_DB,
     STAGE_GET_INFO_FS,
     STAGE_REPORTING,
@@ -76,6 +76,7 @@ const pipeline_descr_t std_pipeline_descr =
     .GET_INFO_DB    = STAGE_GET_INFO_DB,
     .GET_INFO_FS    = STAGE_GET_INFO_FS,
     .GC_OLDENT      = STAGE_RM_OLD_ENTRIES,
+    .DB_APPLY       = STAGE_DB_APPLY,
 };
 
 /** pipeline stages definition */
@@ -118,75 +119,6 @@ pipeline_stage_t std_pipeline[] = {
      STAGE_FLAG_SEQUENTIAL | STAGE_FLAG_SYNC, 0}
 };
 
-
-
-#ifdef HAVE_SHOOK
-static int shook_special_obj( struct entry_proc_op_t *p_op )
-{
-    if (ATTR_FSorDB_TEST( p_op, fullpath )
-        && ATTR_FSorDB_TEST( p_op, type))
-    {
-        if ( !strcmp(STR_TYPE_FILE, ATTR_FSorDB(p_op, type)) )
-        {
-            /* is it a lock file? */
-            if (!fnmatch("*/"LOCK_DIR"/"SHOOK_LOCK_PREFIX"*", ATTR_FSorDB(p_op, fullpath ), 0))
-            {
-                /* skip the entry */
-                DisplayLog(LVL_DEBUG, ENTRYPROC_TAG, "%s is a shook lock",
-                           ATTR_FSorDB(p_op, fullpath));
-                /** @TODO raise special event for the file: LOCK/UNLOCK */
-                return TRUE;
-            }
-        }
-        else if (!strcmp(STR_TYPE_DIR, ATTR_FSorDB(p_op, type)))
-        {
-            if (!fnmatch("*/"LOCK_DIR, ATTR_FSorDB(p_op, fullpath ), 0))
-            {
-                /* skip the entry */
-                DisplayLog(LVL_DEBUG, ENTRYPROC_TAG, "%s is a shook lock dir",
-                           ATTR_FSorDB(p_op, fullpath));
-                return TRUE;
-            }
-            else if (!fnmatch("*/"RESTRIPE_DIR, ATTR_FSorDB(p_op, fullpath ), 0))
-            {
-                /* skip the entry */
-                DisplayLog(LVL_DEBUG, ENTRYPROC_TAG, "%s is a shook restripe dir",
-                           ATTR_FSorDB(p_op, fullpath));
-                return TRUE;
-            }
-        }
-    }
-
-    /* also match '.shook' directory */
-    if (p_op && ATTR_FSorDB_TEST( p_op, name )
-        && ATTR_FSorDB_TEST( p_op, type ))
-    {
-        if ( !strcmp(STR_TYPE_DIR, ATTR_FSorDB(p_op, type)) &&
-             !strcmp(SHOOK_DIR, ATTR_FSorDB(p_op, name)) )
-        {
-            /* skip the entry */
-            DisplayLog(LVL_DEBUG, ENTRYPROC_TAG, "\"%s\" is a shook dir",
-                       ATTR_FSorDB(p_op, name));
-            return TRUE;
-        }
-    }
-
-    return FALSE;
-}
-
-#define SKIP_SPECIAL_OBJ(_pop, _goto) do {                              \
-        if (shook_special_obj( _pop )) {                                \
-                    DisplayLog( LVL_DEBUG, ENTRYPROC_TAG,               \
-                        "Shook special file or dir '%s', skipped",      \
-                        (ATTR_FSorDB_TEST( _pop, fullpath )?            \
-                         ATTR_FSorDB(_pop, fullpath):                   \
-                         ATTR_FSorDB(_pop, name)) );                    \
-            goto _goto;                                                 \
-        }                                                               \
-    } while(0)
-#else
-#define SKIP_SPECIAL_OBJ(_pop, _goto) /* do nothing */
-#endif
 
 /**
  * For entries from FS scan, we must get the associated entry ID.
@@ -339,9 +271,7 @@ static inline void check_path_info(struct entry_proc_op_t *p_op, const char *rec
     {
         DisplayLog(LVL_MAJOR, ENTRYPROC_TAG, "WARNING: name and parent should be set by %s record",
                    recname);
-        p_op->fs_attr_need |= ATTR_MASK_fullpath
-                              | ATTR_MASK_name
-                              | ATTR_MASK_parent_id;
+        p_op->fs_attr_need |= ATTR_MASK_name | ATTR_MASK_parent_id;
     }
 }
 
@@ -703,17 +633,25 @@ static int EntryProc_ProcessLogRec( struct entry_proc_op_t *p_op )
     int md_allow_event_updt = TRUE;
 
     /* is there entry name in log rec? */
-    if ( logrec->cr_namelen > 0 )
+    if (logrec->cr_namelen > 0)
     {
-        ATTR_MASK_SET( &p_op->fs_attrs, name );
-        strcpy( ATTR( &p_op->fs_attrs, name ), logrec->cr_name );
+        ATTR_MASK_SET(&p_op->fs_attrs, name);
+        strcpy(ATTR(&p_op->fs_attrs, name), logrec->cr_name);
 
         /* parent id is always set when name is (Cf. comment in lfs.c) */
-        ATTR_MASK_SET( &p_op->fs_attrs, parent_id );
-        ATTR( &p_op->fs_attrs, parent_id ) = logrec->cr_pfid;
+        if (fid_is_sane(&logrec->cr_pfid))
+        {
+            ATTR_MASK_SET(&p_op->fs_attrs, parent_id);
+            ATTR(&p_op->fs_attrs, parent_id) = logrec->cr_pfid;
 
-        ATTR_MASK_SET( &p_op->fs_attrs, path_update );
-        ATTR(&p_op->fs_attrs, path_update) = time(NULL);
+            ATTR_MASK_SET(&p_op->fs_attrs, path_update);
+            ATTR(&p_op->fs_attrs, path_update) = time(NULL);
+        }
+        else
+        {
+            DisplayLog(LVL_MAJOR, ENTRYPROC_TAG, "Error: unsane parent fid "DFID"in %s changelog record (namelen=%u)",
+                       PFID(&logrec->cr_pfid), changelog_type2str(logrec->cr_type), logrec->cr_namelen);
+        }
     }
 
     if ( logrec->cr_type == CL_UNLINK )
@@ -730,13 +668,21 @@ static int EntryProc_ProcessLogRec( struct entry_proc_op_t *p_op )
                     bool2str( logrec->cr_flags & CLF_UNLINK_LAST ) );
 #endif
 
+    #ifndef HAVE_RM_POLICY
         if (p_op->check_if_last_entry) {
             /* When inserting that entry, we didn't know whether the
              * entry was the last one or not, so use the nlink
              * attribute we requested earlier to determine. */
-            if (ATTR(&p_op->db_attrs, nlink) == 1)
+            if (ATTR_MASK_TEST(&p_op->db_attrs, nlink) && (ATTR(&p_op->db_attrs, nlink) <= 1))
+            {
+                DisplayLog(LVL_DEBUG, ENTRYPROC_TAG, "UNLINK record for entry with nlink=%u in DB => removing it",
+                           ATTR(&p_op->db_attrs, nlink));
                 logrec->cr_flags |= CLF_UNLINK_LAST;
+            }
         }
+    #else
+            /* too dangerous */
+    #endif
 
         /* is it the last reference to this file? */
         if ( logrec->cr_flags & CLF_UNLINK_LAST )
@@ -843,6 +789,11 @@ static int EntryProc_ProcessLogRec( struct entry_proc_op_t *p_op )
         p_op->fs_attr_need |= (POSIX_ATTR_MASK | ATTR_MASK_name | ATTR_MASK_parent_id
                                | ATTR_MASK_stripe_info | ATTR_MASK_stripe_items
                                | ATTR_MASK_link) & ~ p_op->fs_attrs.attr_mask;
+
+        /* if we needed fullpath (e.g. for policies), set it */
+        if ((p_op->db_attr_need & ATTR_MASK_fullpath) &&
+            !ATTR_MASK_TEST(&p_op->fs_attrs, fullpath))
+            p_op->fs_attr_need |= ATTR_MASK_fullpath;
 #ifdef ATTR_INDEX_status
         /* By default, get status for a new record.
          * This is overwritten by EntryProc_FillFromLogRec if the status
@@ -885,11 +836,12 @@ static int EntryProc_ProcessLogRec( struct entry_proc_op_t *p_op )
         /* Check md_update policy */
         if (need_md_update(&p_op->db_attrs, &md_allow_event_updt))
             p_op->fs_attr_need |= POSIX_ATTR_MASK;
+
         /* check if path update is needed (only if it was not just updated) */
         if ((!ATTR_MASK_TEST(&p_op->fs_attrs, parent_id) || !ATTR_MASK_TEST(&p_op->fs_attrs, name))
             && (need_path_update(&p_op->db_attrs, NULL)
                 || (db_missing & (ATTR_MASK_fullpath | ATTR_MASK_name | ATTR_MASK_parent_id))))
-            p_op->fs_attr_need |= ATTR_MASK_fullpath | ATTR_MASK_name
+            p_op->fs_attr_need |= ATTR_MASK_name
                                   | ATTR_MASK_parent_id;
     }
 
@@ -897,6 +849,75 @@ static int EntryProc_ProcessLogRec( struct entry_proc_op_t *p_op )
     return EntryProc_FillFromLogRec( p_op, md_allow_event_updt );
 }
 #endif /* CHANGELOG support */
+
+/* Ensure the fullpath from DB is consistent.
+ * Set updt_mask according to the missing info.
+ */
+static void check_fullpath(attr_set_t *attrs, const entry_id_t *id, int *updt_mask)
+{
+#ifdef _HAVE_FID
+    /* If the parent id from the changelog refers to a directory
+     * that no longer exists, the path built from the DB may be partial.
+     * If the current entry is the direct child of such a directory,
+     * we must update the parent information.
+     * Else, we should do it for every parent up to the unknown dir.
+     */
+    if (ATTR_MASK_TEST(attrs, fullpath) && ATTR(attrs, fullpath)[0] != '/')
+    {
+        char parent[RBH_NAME_MAX];
+        char *next = strchr(ATTR(attrs, fullpath), '/');
+        if (next != NULL)
+        {
+            entry_id_t parent_id;
+
+            memset(parent,0, sizeof(parent));
+            strncpy(parent, ATTR(attrs, fullpath), (ptrdiff_t)(next-ATTR(attrs, fullpath)));
+
+            if (sscanf(parent, SFID, RFID(&parent_id)) != FID_SCAN_CNT) /* fid consists of 3 numbers */
+            {
+                DisplayLog(LVL_MAJOR, ENTRYPROC_TAG, "Entry "DFID" has an inconsistent relative path: %s",
+                           PFID(id), ATTR(attrs, fullpath));
+                /* fullpath is not consistent (should be <id>/name) */
+                ATTR_MASK_UNSET(attrs, fullpath);
+                /* update all path information */
+                *updt_mask |= ATTR_MASK_parent_id | ATTR_MASK_name | ATTR_MASK_fullpath;
+            }
+            /* check if the entry is the direct child of the unknown directory */
+            else if (strchr(next+1, '/') == NULL)
+            {
+                DisplayLog(LVL_EVENT, ENTRYPROC_TAG, "Parent dir for entry "DFID
+                           " is unknown (parent: "DFID", child name: '%s'): updating entry path info",
+                           PFID(id), PFID(&parent_id), next+1);
+                ATTR_MASK_UNSET(attrs, fullpath);
+                *updt_mask |= ATTR_MASK_parent_id | ATTR_MASK_name | ATTR_MASK_fullpath;
+            }
+            /* else: FIXME: We should update parent info for an upper entry. */
+            else
+            {
+                ATTR_MASK_UNSET(attrs, fullpath);
+                /* update path info anyhow, to try fixing the issue */
+                *updt_mask |= ATTR_MASK_parent_id | ATTR_MASK_name | ATTR_MASK_fullpath;
+            }
+        }
+        else
+        {
+            /* fullpath is not consistent (should be <pid>/name) */
+            ATTR_MASK_UNSET(attrs, fullpath);
+            /* update path info, to try fixing the issue */
+            *updt_mask |= ATTR_MASK_parent_id | ATTR_MASK_name | ATTR_MASK_fullpath;
+        }
+    }
+#else
+    if (ATTR_MASK_TEST(attrs, fullpath)
+        && ATTR(attrs, fullpath)[0] != '/')
+    {
+        /* fullpath is not pertinent */
+        ATTR_MASK_UNSET(attrs, fullpath);
+        /* update path info, to try fixing the issue */
+        *updt_mask |= ATTR_MASK_parent_id | ATTR_MASK_name | ATTR_MASK_fullpath;
+    }
+#endif
+}
 
 
 /**
@@ -915,6 +936,16 @@ int EntryProc_get_info_db( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
 
     const pipeline_stage_t *stage_info =
         &entry_proc_pipeline[p_op->pipeline_stage];
+
+    /* always ignore root */
+    if (p_op->entry_id_is_set &&
+        entry_id_equal(&p_op->entry_id, get_root_id()))
+    {
+        DisplayLog(LVL_DEBUG, ENTRYPROC_TAG, "Ignoring record for root directory");
+        /* drop the entry */
+        next_stage = -1;
+        goto next_step;
+    }
 
 #ifdef HAVE_CHANGELOGS
     /* is this a changelog record? */
@@ -936,9 +967,9 @@ int EntryProc_get_info_db( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
         /* add diff mask for diff mode */
         p_op->db_attr_need |= entry_proc_conf.diff_mask;
 
-#ifdef HAVE_SHOOK
-        /* needed to check special objects, ... */
-        p_op->db_attr_need = ATTR_MASK_fullpath | ATTR_MASK_name | ATTR_MASK_parent_id;
+#ifdef _HSM_LITE
+        /* needed attributes to check special objects */
+        p_op->db_attr_need |= rbhext_ignore_need();
 #endif
 
         if (!chglog_reader_config.mds_has_lu543 &&
@@ -952,6 +983,11 @@ int EntryProc_get_info_db( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
             rc = ListMgr_Get_FID_from_Path( lmgr, &logrec->cr_pfid, logrec->cr_name, &p_op->entry_id );
 
             if (!rc) {
+
+                if (!fid_is_sane(&logrec->cr_pfid))
+                    DisplayLog(LVL_MAJOR, ENTRYPROC_TAG,
+                               "Error: unsane parent fid "DFID" from DB",
+                               PFID(&logrec->cr_pfid));
                 /* The FID is now set, so we can register it with the
                  * constraint engine. Since this operation is at the
                  * very top of the queue, we register it at the head
@@ -1087,9 +1123,9 @@ int EntryProc_get_info_db( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
         else
         {
             /* ERROR */
-            DisplayLog( LVL_CRIT, ENTRYPROC_TAG,
-                        "Error %d retrieving entry "DFID" from DB", rc,
-                        PFID(&p_op->entry_id) );
+            DisplayLog(LVL_CRIT, ENTRYPROC_TAG,
+                       "Error %d retrieving entry "DFID" from DB: %s.", rc,
+                       PFID(&p_op->entry_id), lmgr_err2str(rc));
             p_op->db_exists = FALSE;
             /* no attrs from DB */
             ATTR_MASK_INIT( &p_op->db_attrs );
@@ -1246,9 +1282,9 @@ int EntryProc_get_info_db( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
             else
             {
                 /* ERROR */
-                DisplayLog( LVL_CRIT, ENTRYPROC_TAG,
-                            "Error %d retrieving entry "DFID" from DB", rc,
-                            PFID(&p_op->entry_id) );
+                DisplayLog(LVL_CRIT, ENTRYPROC_TAG,
+                           "Error %d retrieving entry "DFID" from DB: %s.", rc,
+                           PFID(&p_op->entry_id), lmgr_err2str(rc));
                 p_op->db_exists = FALSE;
                 ATTR_MASK_INIT( &p_op->db_attrs );
             }
@@ -1414,6 +1450,8 @@ int EntryProc_get_info_db( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
     } /* end if entry from FS scan */
 #endif
 
+    check_fullpath(&p_op->db_attrs, &p_op->entry_id, &p_op->fs_attr_need);
+
 next_step:
     if ( next_stage == -1 )
         /* drop the entry */
@@ -1428,7 +1466,6 @@ next_step:
                     stage_info->stage_name );
     return rc;
 }
-
 
 
 int EntryProc_get_info_fs( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
@@ -1451,9 +1488,6 @@ int EntryProc_get_info_fs( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
     }
 #endif
 
-    /* early check using DB info */
-    SKIP_SPECIAL_OBJ(p_op, skip_record);
-
     DisplayLog(LVL_FULL, ENTRYPROC_TAG,
         DFID": Getattr=%u, Getpath=%u, Readlink=%u"
 #ifdef ATTR_INDEX_status
@@ -1471,7 +1505,7 @@ int EntryProc_get_info_fs( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
     p_op->fs_attr_need &= ~p_op->fs_attrs.attr_mask;
 
 #ifdef HAVE_CHANGELOGS /* never needed for scans */
-    if (NEED_GETATTR(p_op))
+    if (NEED_GETATTR(p_op) && (p_op->extra_info.is_changelog_record))
     {
         struct stat    entry_md;
 
@@ -1506,6 +1540,20 @@ int EntryProc_get_info_fs( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
             /* If lstat returns an error, drop the log record */
             goto skip_record;
         }
+        else if (entry_md.st_nlink == 0)
+        {
+            /* remove pending */
+            DisplayLog(LVL_DEBUG, ENTRYPROC_TAG, "Entry %s has nlink=0: remove pending", path);
+            /* schedule rm in the backend, if enabled */
+            if ((!p_op->db_exists)
+#ifdef HAVE_RM_POLICY
+                && (!policies.unlink_policy.hsm_remove)
+#endif
+            )
+                goto skip_record;
+            else /* else, remove it from db */
+                goto rm_record;
+        }
 
         /* convert them to internal structure */
 #if defined( _LUSTRE ) && defined( _HAVE_FID ) && defined( _MDS_STAT_SUPPORT )
@@ -1519,25 +1567,7 @@ int EntryProc_get_info_fs( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
     } /* getattr needed */
 
     if (NEED_GETPATH(p_op))
-    {
-        /* the log record did not provide name information and the path is needed:
-         * get parent_id and name (FIXME, just retrieve one for now).
-         */
-        rc = Lustre_GetNameParent(path, 0, &ATTR(&p_op->fs_attrs, parent_id),
-                                  ATTR(&p_op->fs_attrs, name), RBH_NAME_MAX);
-        if (rc == 0)
-        {
-            ATTR_MASK_SET(&p_op->fs_attrs, parent_id);
-            ATTR_MASK_SET(&p_op->fs_attrs, name);
-            ATTR_MASK_SET(&p_op->fs_attrs, path_update);
-            ATTR(&p_op->fs_attrs, path_update) = time(NULL);
-        }
-        else if (!ERR_MISSING(-rc))
-        {
-            DisplayLog(LVL_MAJOR, ENTRYPROC_TAG, "Failed to get parent+name for "DFID": %s",
-                       PFID(&p_op->entry_id), strerror(-rc));
-        }
-    } /* getpath needed */
+        path_check_update(&p_op->entry_id, path, &p_op->fs_attrs, p_op->fs_attr_need);
 #endif
 
 #ifdef ATTR_INDEX_creation_time
@@ -1712,6 +1742,29 @@ int EntryProc_get_info_fs( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
             DisplayLog(LVL_MAJOR, ENTRYPROC_TAG, "readlink failed on %s: %s", path, strerror(errno));
     }
 
+    /* check if the entry must be ignored */
+    #ifdef _HSM_LITE
+    {
+        attr_set_t merged_attrs; /* attrs from FS+DB */
+        ATTR_MASK_INIT(&merged_attrs);
+
+        ListMgr_MergeAttrSets(&merged_attrs, &p_op->fs_attrs, 1);
+        ListMgr_MergeAttrSets(&merged_attrs, &p_op->db_attrs, 0);
+
+        /* ignored entries will always go there, as they are considered as new */
+        /* use the same merged attributes to check the ignore condition */
+        if (rbhext_ignore(&p_op->entry_id, &merged_attrs))
+        {
+            DisplayLog(LVL_DEBUG, ENTRYPROC_TAG,
+                       "Special file or dir '%s' skipped",
+                       (ATTR_FSorDB_TEST(p_op, fullpath )?
+                        ATTR_FSorDB(p_op, fullpath):
+                        ATTR_FSorDB(p_op, name)));
+            goto skip_record;
+        }
+    }
+    #endif
+
     /* match fileclasses if specified in config */
 
     /* sure it's a directory */
@@ -1727,9 +1780,6 @@ int EntryProc_get_info_fs( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
             check_policies(&p_op->entry_id, &p_op->fs_attrs, &p_op->db_attrs, TRUE);
     }
     /* non-dir or not supported (no check) */
-
-    /* later check using DB+FS info */
-    SKIP_SPECIAL_OBJ(p_op, skip_record);
 
     /* set other info */
     rc = EntryProcessor_Acknowledge( p_op, STAGE_REPORTING, FALSE );
@@ -1880,9 +1930,6 @@ int EntryProc_pre_apply(struct entry_proc_op_t *p_op, lmgr_t * lmgr)
     int            rc;
     const pipeline_stage_t *stage_info = &entry_proc_pipeline[p_op->pipeline_stage];
 
-    /* final check before DB operation */
-    SKIP_SPECIAL_OBJ(p_op, skip_record);
-
 #ifdef ATTR_INDEX_creation_time
     /* once set, never change creation time */
     if (p_op->db_op_type != OP_TYPE_INSERT)
@@ -1938,6 +1985,8 @@ int EntryProc_pre_apply(struct entry_proc_op_t *p_op, lmgr_t * lmgr)
 
         /* remove other unchanged attrs + attrs not in db mask */
         p_op->fs_attrs.attr_mask &= (diff_mask | to_keep | ~p_op->db_attrs.attr_mask);
+
+        /* FIXME: free cleared attributes */
 
         /* SQL req optimizations:
          * if update policy == always and fileclass is not changed,
@@ -2079,7 +2128,8 @@ int EntryProc_db_apply(struct entry_proc_op_t *p_op, lmgr_t * lmgr)
     }
 
     if ( rc )
-        DisplayLog( LVL_CRIT, ENTRYPROC_TAG, "Error %d performing database operation.", rc );
+        DisplayLog(LVL_CRIT, ENTRYPROC_TAG, "Error %d performing database operation: %s.",
+                   rc, lmgr_err2str(rc));
 
     /* Acknowledge the operation if there is a callback */
 #ifdef HAVE_CHANGELOGS
@@ -2149,7 +2199,8 @@ int EntryProc_db_batch_apply(struct entry_proc_op_t **ops, int count,
     }
 
     if (rc)
-        DisplayLog(LVL_CRIT, ENTRYPROC_TAG, "Error %d performing batch database operation.", rc);
+        DisplayLog(LVL_CRIT, ENTRYPROC_TAG, "Error %d performing batch database operation: %s.",
+                   rc, lmgr_err2str(rc));
 
     /* Acknowledge the operation if there is a callback */
 #ifdef HAVE_CHANGELOGS
@@ -2265,8 +2316,9 @@ int EntryProc_rm_old_entries( struct entry_proc_op_t *p_op, lmgr_t * lmgr )
         lmgr_simple_filter_free( &filter );
 
         if ( rc )
-            DisplayLog( LVL_CRIT, ENTRYPROC_TAG,
-                        "Error: ListMgr MassRemove operation failed with code %d.", rc );
+            DisplayLog(LVL_CRIT, ENTRYPROC_TAG,
+                       "Error: ListMgr MassRemove operation failed with code %d: %s",
+                       rc,lmgr_err2str(rc));
     }
 
     /* must call callback function in any case, to unblock the scan */

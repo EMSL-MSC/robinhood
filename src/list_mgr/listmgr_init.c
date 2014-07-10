@@ -1155,8 +1155,8 @@ static int create_table_softrm(db_conn_t *pconn)
 #define VERSION_VAR_FUNC    "VersionFunctionSet"
 #define VERSION_VAR_TRIG    "VersionTriggerSet"
 
-#define FUNCTIONSET_VERSION    "1"
-#define TRIGGERSET_VERSION     "1"
+#define FUNCTIONSET_VERSION    "1.1"
+#define TRIGGERSET_VERSION     "1.1"
 
 static int check_functions_version(db_conn_t *conn)
 {
@@ -1169,8 +1169,10 @@ static int check_functions_version(db_conn_t *conn)
     {
         if (strcmp(val, FUNCTIONSET_VERSION))
         {
-            DisplayLog(LVL_MAJOR, LISTMGR_TAG, "Wrong functions version (in DB: %s, expected: %s). "
-                       "Existing functions will be dropped and re-created.", val, FUNCTIONSET_VERSION);
+            DisplayLog(LVL_MAJOR, LISTMGR_TAG, "Wrong functions version (in DB: %s, expected: %s). %s.",
+                       val, FUNCTIONSET_VERSION, report_only?"Reports output might be incorrect":
+                            "Existing functions will be dropped and re-created");
+
             return DB_BAD_SCHEMA;
         }
         else
@@ -1181,9 +1183,9 @@ static int check_functions_version(db_conn_t *conn)
     }
     else if (rc == DB_NOT_EXISTS)
     {
-        DisplayLog(LVL_MAJOR, LISTMGR_TAG, "No function versioning (expected: %s). "
-                   "Existing functions will be dropped and re-created.",
-                   FUNCTIONSET_VERSION);
+        DisplayLog(LVL_MAJOR, LISTMGR_TAG, "No function versioning (expected: %s). %s.",
+                   FUNCTIONSET_VERSION, report_only?"Reports output might be incorrect":
+                            "Existing functions will be dropped and re-created");
         return DB_BAD_SCHEMA;
     }
     else
@@ -1498,12 +1500,12 @@ static int create_trig_acct_update(db_conn_t *pconn)
         if (is_acct_field(i))
         {
             if (!is_first_field)
-                next += sprintf(next, ", %s=%s+(CAST(NEW.%s as SIGNED)-CAST(OLD.%s as SIGNED)) ",
+                next += sprintf(next, ", %s=%s+CAST(NEW.%s as SIGNED)-CAST(OLD.%s as SIGNED) ",
                                  field_infos[i].field_name, field_infos[i].field_name,
                                  field_infos[i].field_name, field_infos[i].field_name);
             else
             {
-                next += sprintf(next, " %s=%s+(CAST(NEW.%s as SIGNED)-CAST(OLD.%s as SIGNED)) ",
+                next += sprintf(next, " %s=%s+CAST(NEW.%s as SIGNED)-CAST(OLD.%s as SIGNED) ",
                                  field_infos[i].field_name, field_infos[i].field_name,
                                  field_infos[i].field_name, field_infos[i].field_name);
                 is_first_field = FALSE;
@@ -1517,11 +1519,11 @@ static int create_trig_acct_update(db_conn_t *pconn)
     is_first_field = FALSE;
     for (i = 1; i < SZ_PROFIL_COUNT-1; i++) /* 2nd to before the last */
     {
-        next += sprintf(next, ", %s=CAST(%s as SIGNED)-CAST((IFNULL(val_old=%u,0)+IFNULL(val_new=%u,0)) as SIGNED)",
+        next += sprintf(next, ", %s=CAST(%s as SIGNED)-CAST(IFNULL(val_old=%u,0) as SIGNED)+CAST(IFNULL(val_new=%u,0) as SIGNED)",
                          sz_field[i], sz_field[i], i-1, i-1);
     }
     /* last */
-    next += sprintf(next, ", %s=CAST(%s as SIGNED)-CAST((IFNULL(val_old>=%u,0)+IFNULL(val_new>=%u,0)) as SIGNED)",
+    next += sprintf(next, ", %s=CAST(%s as SIGNED)-CAST(IFNULL(val_old>=%u,0) as SIGNED)+CAST(IFNULL(val_new>=%u,0) as SIGNED)",
                      sz_field[i], sz_field[i], i-1, i-1);
 
     APPEND_TXT(next, " WHERE ");
@@ -1627,7 +1629,7 @@ static int create_func_onepath(db_conn_t *pconn)
             " DECLARE pid "PK_TYPE" DEFAULT NULL;"
             " DECLARE n VARCHAR(%u) DEFAULT NULL;"
             // returns path when parent is not found (NULL if id is not found)
-            " DECLARE EXIT HANDLER FOR NOT FOUND RETURN p;"
+            " DECLARE EXIT HANDLER FOR NOT FOUND RETURN CONCAT(pid,'/',p);"
             " SELECT parent_id, name INTO pid, p from NAMES where id=param LIMIT 1;"
             " LOOP"
                 " SELECT parent_id, name INTO pid, n from NAMES where id=pid ;"
@@ -1678,7 +1680,7 @@ static int create_func_thispath(db_conn_t *pconn)
             " DECLARE pid "PK_TYPE" DEFAULT NULL;"
             " DECLARE n VARCHAR(%u) DEFAULT NULL;"
             // returns path when parent is not found (NULL if id is not found)
-            " DECLARE EXIT HANDLER FOR NOT FOUND RETURN p;"
+            " DECLARE EXIT HANDLER FOR NOT FOUND RETURN CONCAT(pid,'/',p);"
             " SET pid=pid_arg;"
             " SET p=n_arg;"
             " LOOP"
@@ -1817,14 +1819,14 @@ int ListMgr_Init(const lmgr_config_t * p_conf, int report_access_only)
         }
     }
 
-    if (create_all_triggers)
+    if (create_all_triggers && !report_only)
     {
         rc = set_triggers_version(&conn);
         if (rc)
             goto close_conn;
     }
 
-    if (create_all_functions)
+    if (create_all_functions && !report_only)
     {
         rc = set_functions_version(&conn);
         if (rc)
@@ -1852,6 +1854,9 @@ int ListMgr_InitAccess( lmgr_t * p_mgr )
 
     p_mgr->last_commit = 0;
     p_mgr->force_commit = FALSE;
+    p_mgr->retry_delay = 0;
+    p_mgr->retry_count = 0;
+    timerclear(&p_mgr->first_error);
 
     for (i = 0; i < OPCOUNT; i++)
         p_mgr->nbop[i] = 0;

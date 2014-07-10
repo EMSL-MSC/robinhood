@@ -187,7 +187,7 @@ static inline int rebind_helper(const char       *old_backend_path,
         else
             nb_read = sscanf(new_fid_str, SFID, RFID(&new_fid));
 
-        if (nb_read != 3)
+        if (nb_read != FID_SCAN_CNT)
         {
             DisplayLog( LVL_CRIT, LOGTAG, "Unexpected format for fid %s", new_fid_str );
             return -EINVAL;
@@ -249,7 +249,7 @@ int main( int argc, char **argv )
         switch ( c )
         {
         case 'f':
-            strncpy( config_file, optarg, MAX_OPT_LEN );
+            rh_strncpy(config_file, optarg, MAX_OPT_LEN);
             break;
         case 'l':
             force_log_level = TRUE;
@@ -294,7 +294,7 @@ int main( int argc, char **argv )
     }
 
     /* get default config file, if not specified */
-    if ( SearchConfig( config_file, config_file, &chgd, badcfg ) != 0 )
+    if (SearchConfig(config_file, config_file, &chgd, badcfg, MAX_OPT_LEN) != 0)
     {
         fprintf(stderr, "No config file (or too many) found matching %s\n", badcfg );
         exit(2);

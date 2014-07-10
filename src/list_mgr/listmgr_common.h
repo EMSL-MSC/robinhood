@@ -237,13 +237,8 @@ typedef enum
     T_STRIPE_INFO,                               /* field in stripe info table */
     T_STRIPE_ITEMS,                              /* field in stripe items table */
     T_ACCT,                                      /* fields in accounting table */
-#ifdef HAVE_RM_POLICY
-    T_SOFTRM,                                    /* fields in softrm table */
-#endif
-#ifdef _HSM_LITE
-    T_RECOV,                                     /* fields in recov table */
-#endif
-
+    T_SOFTRM,                                    /* fields in softrm table (backup and HSM flavors only) */
+    T_RECOV                                      /* fields in recov table (HSM flavors only) */
 } table_enum;
 
 static inline const char * table2name(table_enum table)
@@ -257,12 +252,8 @@ static inline const char * table2name(table_enum table)
         case T_STRIPE_INFO: return STRIPE_INFO_TABLE;
         case T_STRIPE_ITEMS: return STRIPE_ITEMS_TABLE;
         case T_ACCT: return ACCT_TABLE;
-#ifdef HAVE_RM_POLICY
         case T_SOFTRM: return SOFT_RM_TABLE;
-#endif
-#ifdef _HSM_LITE
         case T_RECOV: return RECOV_TABLE;
-#endif
    }
    return NULL;
 }
@@ -330,9 +321,17 @@ int            lmgr_commit( lmgr_t * p_mgr );
 /* to be called before closing a connection */
 int            lmgr_flush_commit( lmgr_t * p_mgr );
 
+/** manage delayed retry of retryable errors
+ * \return != 0 if the transaction must be restarted
+ */
+#define lmgr_delayed_retry(_l, _e) _lmgr_delayed_retry(_l, _e, __func__, __LINE__)
+int _lmgr_delayed_retry(lmgr_t *lmgr, int errcode, const char *func, int line);
+
 /* get/set variable in DB */
 int lmgr_get_var(db_conn_t *pconn, const char *varname, char *value);
 int lmgr_set_var(db_conn_t *pconn, const char *varname, const char *value);
 
+int fullpath_attr2db(const char *attr, char *db);
+void fullpath_db2attr(const char *db, char *attr);
 
 #endif
