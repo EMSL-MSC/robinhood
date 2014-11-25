@@ -108,6 +108,9 @@ function clean_caches
 
 function wait_stable_df
 {
+    sync
+    clean_caches
+
     $LFS df $ROOT > /tmp/lfsdf.1
     while (( 1 )); do
         sleep 5
@@ -610,10 +613,10 @@ function test_rmdir
     	check_db_error rh_chglogs.log
 
 	echo "3-Applying rmdir policy ($policy_str)..."
-	$RH -f ./cfg/$config_file --rmdir --once -l EVENT -L rh_purge.log 2>/dev/null
+	$RH -f ./cfg/$config_file --rmdir --once -l FULL -L rh_purge.log 2>/dev/null
 
-	grep "Empty dir removal summary" rh_purge.log || error "did not file summary line in log"
-	grep "Recursive dir removal summary" rh_purge.log || error "did not file summary line in log"
+	grep "Empty dir removal summary" rh_purge.log || error "did not find summary line in log"
+	grep "Recursive dir removal summary" rh_purge.log || error "did not find summary line in log"
 
 	cnt_empty=`grep "Empty dir removal summary" rh_purge.log | cut -d '|' -f 2 | awk '{print $5}'`
 	cnt_recurs=`grep "Recursive dir removal summary" rh_purge.log | cut -d '|' -f 2 | awk '{print $5}'`
@@ -626,7 +629,7 @@ function test_rmdir
 	if (( $cnt_recurs == 2 )); then
 		echo "OK: 2 top-level directories removed"
 	else
-		error "$cnt_resurs directories removed (2 expected)"
+		error "$cnt_recurs directories removed (2 expected)"
 	fi
 
 	cp /dev/null rh_purge.log
@@ -2829,7 +2832,6 @@ function test_ost_trigger
 	clean_logs
 
     # reset df values
-    clean_caches
     wait_stable_df
 
 	empty_vol=`$LFS df $ROOT | grep OST0000 | awk '{print $3}'`
@@ -2863,7 +2865,6 @@ function test_ost_trigger
     fi
 
 	# wait for df sync
-	sync; clean_caches
     wait_stable_df
 
 	if (( $is_lhsm != 0 )); then
@@ -2914,6 +2915,9 @@ function test_ost_trigger
 	(( $needed_ost == $need_purge )) && (( $purged_ost >= $need_purge )) && (( $purged_ost <= $need_purge + 1 )) \
 		&& (( $purged_total == 2*$purged_ost )) && echo "OK: purge of OST#0 succeeded"
 
+    # sync df values before checking df return
+    wait_stable_df
+
 	full_vol1=`$LFS df $ROOT | grep OST0001 | awk '{print $3}'`
 	full_vol1=$(($full_vol1/1024))
 	purge_ost1=`grep summary rh_purge.log | grep "OST #1" | wc -l`
@@ -2937,7 +2941,6 @@ function test_ost_order
 	clean_logs
 
     # reset df values
-    sync; clean_caches
     wait_stable_df
 
 	if (( ($is_hsmlite != 0) && ($shook == 0) )); then
@@ -2979,7 +2982,6 @@ function test_ost_order
         done
     done
 
-    sync; clean_caches
     wait_stable_df
 
     # check thresholds only, then purge
@@ -3025,6 +3027,8 @@ function test_trigger_check
 		return 1
 	fi
 	clean_logs
+
+    wait_stable_df
 
 	if (( $is_hsmlite != 0 )); then
         # this mode may create an extra inode in filesystem: inital scan
@@ -3079,9 +3083,7 @@ function test_trigger_check
 	fi
 
 	# wait for df sync
-	sync
-	clean_caches
-	sync; clean_caches
+    wait_stable_df
 
 	if (( $is_hsmlite != 0 )); then
         # scan and sync
@@ -5237,6 +5239,14 @@ function test_cfg_parsing
 	policy_str="$3"
 
 	clean_logs
+
+    # needed for reading password file
+    if [[ ! -f /etc/robinhood.d/.dbpassword ]]; then
+        if [[ ! -d /etc/robinhood.d ]]; then
+            mkdir /etc/robinhood.d
+        fi
+        echo robinhood > /etc/robinhood.d/.dbpassword
+    fi
 
 	if [[ $flavor == "basic" ]]; then
 
@@ -8748,8 +8758,13 @@ function TEST_OTHER_PARAMETERS_3
     local countRemainFile=0
 	for i in ${rmd[*]}; do
         bi=$(basename $i)
-        [ "$DEBUG" = "1" ] && find $BKROOT -type f -name "${bi}__*"
-	    local found=`find $BKROOT -type f -name "${bi}__*" | wc -l`
+        if (( $is_lhsm > 0 )); then # <fid>
+            [ "$DEBUG" = "1" ] && find $BKROOT -type f -name "${bi}"
+	        local found=`find $BKROOT -type f -name "${bi}" | wc -l`
+        else # <name>__<fid>
+            [ "$DEBUG" = "1" ] && find $BKROOT -type f -name "${bi}__*"
+	        local found=`find $BKROOT -type f -name "${bi}__*" | wc -l`
+        fi
         (( $found != 0 )) && echo "$i remains in backend"
         ((countRemainFile+=$found))
 	done

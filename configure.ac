@@ -4,7 +4,7 @@
 
 AC_PREREQ(2.59)
 
-AC_INIT( [robinhood], [2.5.2], [robinhood-support@lists.sourceforge.net])
+AC_INIT( [robinhood], [2.5.3], [robinhood-support@lists.sourceforge.net])
 RELEASE="1"
 
 AC_DEFINE_UNQUOTED(RELEASE, "$RELEASE", [release info] )
@@ -107,6 +107,11 @@ if test "x$support_lustre" = "xyes" ; then
             AC_DEFINE(_LUSTRE_API_HEADER, 1, [New lustreapi header])
             # this comes with Lustre 2.4, so disable features of Lustre < 2.4 at the same time
             AC_DEFINE(_MDT_SPECIFIC_LOVEA, 1, [MDT LOV EA is no longer the same as lov_user_md])
+        fi
+
+        AC_CHECK_HEADER([lustre/lustre_idl.h], have_lustre_idl="true", have_lustre_idl="false")
+        if test "$have_lustre_idl" = "true"; then
+            AC_DEFINE(_LUSTRE_IDL_HEADER, 1, [lustre_idl header exists])
         fi
 
         # this defines LVERSION and LPACKAGE variables

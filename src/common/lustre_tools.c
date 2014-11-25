@@ -266,7 +266,7 @@ int DataOnOST(size_t fsize, unsigned int ost_index, const stripe_info_t * sinfo,
     else if (fsize > (sinfo->stripe_count - 1) * sinfo->stripe_size)
         return TRUE;
 
-    /* unsane value, file may not be striped */
+    /* insane value, file may not be striped */
     if (sinfo->stripe_size == 0)
         return FALSE;
 
@@ -409,6 +409,13 @@ int Lustre_GetFullPath( const entry_id_t * p_id, char *fullpath, unsigned int le
                     "Error %d calling llapi_fid2path(%s,%s,%lld,%d), errno=%d."
                     " Cannot retrieve full path for %s",
                     rc, mpath, fid, recno, linkno, errno, fid );
+    /* curr == fullpath => fullpath is root: '/'
+     * so don't remove final slash */
+    else if (curr != fullpath)
+    {
+        while (FINAL_SLASH(fullpath))
+            REMOVE_FINAL_SLASH(fullpath);
+    }
 
     return rc;
 }
@@ -488,7 +495,7 @@ int Lustre_GetNameParent(const char *path, int linkno,
 
     if (!fid_is_sane(pfid))
     {
-        DisplayLog(LVL_MAJOR, __func__, "unsane fid: "DFID, PFID(pfid));
+        DisplayLog(LVL_MAJOR, __func__, "insane fid: "DFID, PFID(pfid));
         return -EPROTO;
     }
 
