@@ -30,6 +30,7 @@
 #define ACCT_FIELD_COUNT    "count"
 #define ACCT_DEFAULT_OWNER  "unknown"
 #define ACCT_DEFAULT_GROUP  "unknown"
+#define SZRANGE_FUNC        "sz_range"
 #define ONE_PATH_FUNC       "one_path"
 #define THIS_PATH_FUNC      "this_path"
 
@@ -53,13 +54,7 @@ char * sz_field[SZ_PROFIL_COUNT] =
     ACCT_SIZE_PREFIX"1T"
 };
 
-#define ACCT_SZ_VAL(_s) "FLOOR(LOG2("_s")/5)"
-
-
-
 extern lmgr_config_t lmgr_config;
-extern int     annex_table;                      /* are we using an annex table */
-
 
 /* -------------------- Connexion management ---------------- */
 
@@ -91,9 +86,9 @@ int            db_result_nb_records( db_conn_t * conn, result_handle_t * p_resul
 int            db_result_free( db_conn_t * conn, result_handle_t * p_result );
 
 /* indicate if the error is retryable (transaction must be restarted) */
-int db_is_retryable(int db_err);
+bool db_is_retryable(int db_err);
 
-typedef enum {DBOBJ_TABLE, DBOBJ_TRIGGER, DBOBJ_FUNCTION, DBOBJ_PROC } db_object_e;
+typedef enum {DBOBJ_TABLE, DBOBJ_TRIGGER, DBOBJ_FUNCTION, DBOBJ_PROC, DBOBJ_INDEX} db_object_e;
 
 static inline const char *dbobj2str(db_object_e ot)
 {
@@ -103,6 +98,7 @@ static inline const char *dbobj2str(db_object_e ot)
         case DBOBJ_TRIGGER:  return "trigger";
         case DBOBJ_FUNCTION: return "function";
         case DBOBJ_PROC:     return "procedure";
+        case DBOBJ_INDEX:    return "index";
     }
     return NULL;
 }
@@ -125,16 +121,16 @@ int            db_create_trigger( db_conn_t * conn, const char *name, const char
 /* -------------------- miscellaneous routines ---------------- */
 
 /* escape a string in a SQL request */
-void db_escape_string( db_conn_t * conn, char * str_out, size_t out_size, const char * str_in );
+int db_escape_string(db_conn_t *conn, char *str_out, size_t out_size, const char *str_in);
 
 /* retrieve error message */
 char          *db_errmsg( db_conn_t * conn, char *errmsg, unsigned int buflen );
 
-/* check table fields */
-int            db_list_table_fields( db_conn_t * conn, const char *table,
-                                     char **outtab,
-                                     unsigned int outtabsize,
-                                     char *inbuffer, unsigned int inbuffersize );
+/** list table fields, their type, and default value */
+int db_list_table_info(db_conn_t * conn, const char *table,
+                       char **field_tab, char **type_tab, char **default_tab,
+                       unsigned int outtabsize,
+                       char *inbuffer, unsigned int inbuffersize);
 
 /* id of the last inserted row */
 unsigned long long db_last_id( db_conn_t * conn );

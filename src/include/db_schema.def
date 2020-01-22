@@ -1,0 +1,140 @@
+%header
+
+/* -*- mode: c; c-basic-offset: 4; indent-tabs-mode: nil; -*-
+ * vim:expandtab:shiftwidth=4:tabstop=4:
+ */
+/*
+ * Copyright (C) 2009 CEA/DAM
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the CeCILL License.
+ *
+ * The fact that you are presently reading this means that you have had
+ * knowledge of the CeCILL license (http://www.cecill.info) and that you
+ * accept its terms.
+ */
+/**
+ * \file   lustre_hsm_types.h
+ * \brief  Defines data types for Lustre-HSM purpose.
+ */
+
+#include <sys/types.h>
+#include <sys/param.h>
+#include <errno.h>
+#include <string.h>
+#include "rbh_types.h"
+#include "global_config.h"
+
+#ifdef _LUSTRE
+#include "lustre_extended_types.h"
+#endif
+
+#if (defined (_LUSTRE) && defined(_HAVE_FID))
+
+#define FID_PK
+typedef lustre_fid entry_id_t;
+
+#define entry_id_equal( _p_id_1, _p_id_2 ) ( ((_p_id_1)->f_seq == (_p_id_2)->f_seq) && ((_p_id_1)->f_oid == (_p_id_2)->f_oid)  )
+
+#else
+
+#define INUM_PK
+typedef struct __entry_id__
+{
+  uint64_t fs_key;
+  ino_t inode;
+} entry_id_t;
+
+#define entry_id_equal( _p_id_1, _p_id_2 ) ( ((_p_id_1)->fs_key == (_p_id_2)->fs_key) && ((_p_id_1)->inode == (_p_id_2)->inode)  )
+
+#endif
+
+static int lmgr_gen_depth( void * tgt, const void * src )
+{
+    const char * fullpath = (char*)src;
+    unsigned int * p_depth = (unsigned int *)tgt;
+
+    const char     *curr;
+    unsigned int   nb1;
+    unsigned int   nb2;
+    /* depth = number of '/' - 1 - depth of root fs.
+     * E.g.: root="/mnt/lustre", path="/mnt/lustre/dir/foo", depth=4-2-1=1
+     */
+
+    nb1 = 0;
+    curr = global_config.fs_path;
+    while ( ( curr = strchr( curr, '/' ) ) )
+    {
+        curr++;
+        nb1++;
+    }
+
+    nb2 = 0;
+    curr = fullpath;
+    while ( ( curr = strchr( curr, '/' ) ) )
+    {
+        curr++;
+        nb2++;
+    }
+
+    (*p_depth) = nb2 - nb1 - 1;
+
+   return 0;
+}
+
+typedef union {
+    int  num;
+    char txt[RBH_LOGIN_MAX];
+} uidgid_u;
+ 
+%attrdef
+
+# /!\ Entry attribute type must fit with DB type
+# name,	C type,	db type, size (C and db), flags (INIT_ONLY, FREQ_ACCESS, ANNEX_INFO, DIR_ATTR or SLINK_ATTR)
+
+# path information
+parent_id,      entry_id_t,    DB_ID,          0, FREQ_ACCESS | INDEXED | DNAMES
+name,           char, DB_TEXT, RBH_NAME_MAX, FREQ_ACCESS | DNAMES
+path_update,    unsigned int, DB_UINT, 0, FREQ_ACCESS | DNAMES
+
+# built from NAMES table
+fullpath,   char, DB_TEXT, RBH_PATH_MAX, FUNC_ATTR | DNAMES
+
+#generated from fullpath
+depth, 	unsigned int, DB_UINT, 0, GENERATED, fullpath, lmgr_gen_depth
+
+# directory meta-attributes
+dircount,       unsigned int,  DB_UINT,        0, DIR_ATTR, type, NULL
+avgsize,        uint64_t,      DB_BIGUINT,     0, DIR_ATTR, type, NULL
+
+# info in main table
+# POSIX attrs
+uid,        uidgid_u,   DB_UIDGID,  0,   FREQ_ACCESS
+gid,        uidgid_u,   DB_UIDGID,  0,   FREQ_ACCESS
+size,       uint64_t,   DB_BIGUINT, 0,   FREQ_ACCESS
+blocks,     uint64_t,   DB_BIGUINT, 0,   FREQ_ACCESS
+creation_time,  unsigned int,   DB_UINT,    0, FREQ_ACCESS
+last_access, 	unsigned int, DB_UINT, 0, FREQ_ACCESS
+last_mod, 	unsigned int, DB_UINT, 0, FREQ_ACCESS
+last_mdchange, unsigned int,   DB_UINT, 0,   FREQ_ACCESS
+type,	    	char,   DB_ENUM_FTYPE, 32, FREQ_ACCESS
+mode,       unsigned short, DB_USHORT, 0, FREQ_ACCESS
+nlink,      unsigned int, DB_UINT, 0, FREQ_ACCESS
+# metadata update
+md_update,	 unsigned int, DB_UINT, 0, FREQ_ACCESS
+# FIXME only for POSIX or Lustre 1.8
+invalid, 	 bool, DB_BOOL, 0, FREQ_ACCESS
+
+# fileclasses and last update
+fileclass,        char,           DB_TEXT,   1024,   FREQ_ACCESS | SEPD_LIST
+class_update,     unsigned int,   DB_UINT,      0,   FREQ_ACCESS
+
+# info that is set once for each file
+stripe_info, 	stripe_info_t,  DB_STRIPE_INFO, 0,   INIT_ONLY
+stripe_items,   stripe_items_t, DB_STRIPE_ITEMS, 0,  INIT_ONLY
+
+# link content in annex info
+link,          char, DB_TEXT, RBH_PATH_MAX,     ANNEX_INFO | SLINK_ATTR
+
+#only for removed entries (read-only)
+rm_time, unsigned int, DB_UINT, 0, REMOVED

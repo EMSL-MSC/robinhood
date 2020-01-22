@@ -3,25 +3,25 @@
 # robinhood.init 1.0 2008/02/07 Ph. Gregoire philippe.gregoire@cea.fr
 ##
 # chkconfig:	- 95 5
-# description:	@PURPOSE_SVC@ (filesystem purge and audit) service
-# processname:	/usr/sbin/@PURPOSE_BIN@
-# config:	/etc/robinhood.d/@PURPOSE_EXT@/<filesystem>.conf
+# description:	robinhood (filesystem purge and audit) service
+# processname:	/usr/sbin/robinhood
+# config:	/etc/robinhood.d/<filesystem>.conf
 ##
 
 # Source function library.
 . /etc/rc.d/init.d/functions
 
 # variables - may be overwritten by /etc/sysconfig/robinhood
-RH_CONF_DIR=@CONFDIR@/robinhood.d/@PURPOSE_EXT@	# directory containing configuration files
+RH_CONF_DIR=@CONFDIR@/robinhood.d	# directory containing configuration files
 RH_RUN_DIR=/					# directory where daemon will run
-DAEMON=@SBINDIR@/@PURPOSE_BIN@
+DAEMON=@SBINDIR@/robinhood
 
 # options for starting the daemon
 # eg. --scan --purge (leave empty for default actions).
 RBH_OPT=""
 
 # Source robinhood configuration.
-[ -f @CONFDIR@/sysconfig/@PURPOSE_SVC@ ] && . @CONFDIR@/sysconfig/@PURPOSE_SVC@
+[ -f @CONFDIR@/sysconfig/robinhood ] && . @CONFDIR@/sysconfig/robinhood
 
 VARRUN=/var/run
 RETVAL=0
@@ -87,22 +87,17 @@ build_fslist()
 #
 # daemon_exist()
 # check if process corresponding to pidfile exist.
-# it must run with the same args.
 #
 daemon_exist()
 {
 	local pidfile=$1
-	local cmdline=$2
 	local pid
 
 	if [ -f $pidfile ] ; then
 		# check if there is still some process
 		pid=$(<$pidfile)
 		if [ -z "${pid//[0-9]/}" -a -d "/proc/$pid" ] ; then
-			local cmd=$(tr '\0' ' ' </proc/$pid/cmdline)
-			if [[ ${cmd% } = $cmdline ]] ; then
-				return 0
-			fi
+			return 0
 		fi
 	fi
 	return 1
@@ -111,7 +106,7 @@ daemon_exist()
 #
 # check_or_start_fs()
 # checks if another daemon is not already running for the same purpose,
-# then (optionaly) launchs a new daemon with a specific configuration file and a specific pid file.
+# then (optionally) launches a new daemon with a specific configuration file and a specific pid file.
 #
 check_or_start_fs()
 {
@@ -126,7 +121,7 @@ check_or_start_fs()
 	local label="Starting Robinhood for $conf "
 
 	# check if there is still some process
-	if daemon_exist $pidfile "$cmdline" ; then
+	if daemon_exist $pidfile ; then
 		if [[ $action = START ]] ; then
 			# According to LSB, running "start" on a service already running
 			# should be successful.
@@ -201,6 +196,7 @@ stop_fs()
 			done
 			#[ -d /proc/$pid ] && initlog $INITLOG_ARGS -c "/bin/kill -9 $pid" "$label"
 			[ -d /proc/$pid ] && action "Force shutdown of Robinhood for $conf ..." /bin/kill -9 $pid
+			sleep 1
 			echo -n "Checking process status ..."
 			if [ -d /proc/$pid ] ; then
 				echo_failure
@@ -240,7 +236,7 @@ reload_fs()
 	fi
 
 	# check if there is still some process
-	if daemon_exist $pidfile "$cmdline" ; then
+	if daemon_exist $pidfile ; then
 		local pid=$(<$pidfile)
 
 		echo "Robinhood for $conf is running: process pid $pid"

@@ -25,26 +25,26 @@
 #endif
 
     int yylex(void);
-    void yyerror(char*);
+    void yyerror(const char *);
     extern int yylineno;
     extern char * yytext;
 
     list_items * program_result=NULL;
-    
+
 	/* stock le message d'erreur donne par le lexer */
     char local_errormsg[1024]="";
-	
+
     /* stock le message d'erreur complet */
     char extern_errormsg[1024]="";
-    
+
 #ifdef _DEBUG_PARSING
 #define DEBUG_YACC   rh_config_print_list
 #else
 /* do nothing */
-static void DEBUG_YACC( FILE * output, list_items * list ) { return ;}
+static void DEBUG_YACC( FILE * output, list_items * list ) {return ;}
 #endif
 
-    
+
 %}
 
 %error-verbose
@@ -78,7 +78,7 @@ static void DEBUG_YACC( FILE * output, list_items * list ) { return ;}
 %token UNION
 %token INTER
 %token <str_val> IDENTIFIER
-%token <str_val> NON_IDENTIFIER_VALUE 
+%token <str_val> NON_IDENTIFIER_VALUE
 %token <str_val> ENV_VAR
 
 %type <str_val> value
@@ -86,10 +86,10 @@ static void DEBUG_YACC( FILE * output, list_items * list ) { return ;}
 %type <list> listitems
 %type <item> block
 %type <item> definition
-%type <item> expression 
+%type <item> expression
 %type <item> subblock
-%type <item> key_value 
-%type <item> extended_key_value 
+%type <item> key_value
+%type <item> extended_key_value
 %type <item> affect
 %type <item> extended_affect
 %type <item> set
@@ -107,7 +107,8 @@ listblock:
     ;
 
 block:
-    IDENTIFIER BEGIN_BLOCK listitems END_BLOCK {$$=rh_config_CreateBlock($1,NULL,$3);}
+    IDENTIFIER IDENTIFIER BEGIN_BLOCK listitems END_BLOCK {$$=rh_config_CreateBlock($1,$2,$4);}
+    | IDENTIFIER BEGIN_BLOCK listitems END_BLOCK {$$=rh_config_CreateBlock($1,NULL,$3);}
     ;
 
 listitems:
@@ -123,7 +124,7 @@ definition:
 value:
 	IDENTIFIER	{strcpy($$,$1);}
 	| NON_IDENTIFIER_VALUE {strcpy($$,$1);}
-    | ENV_VAR {rh_config_resov_var($$,$1);}
+    | ENV_VAR {rh_config_resolv_var($$,$1);}
 	;
 
 affect:
@@ -182,18 +183,31 @@ subblock:
 
 %%
 
-    void yyerror(char *s){
-    		if ( local_errormsg[0] && s[0] )
-			snprintf(extern_errormsg,1024,"%s (%s) at '%s' line %d in '%s'",local_errormsg,s, (yytext?yytext:"???"), yylineno, current_file);
-		else if (local_errormsg[0])
-			snprintf(extern_errormsg,1024,"%s at '%s' line %d in '%s'",local_errormsg, (yytext?yytext:"???"), yylineno, current_file);
-		else if (s[0])
-			snprintf(extern_errormsg,1024,"%s at '%s' line %d in '%s'",s, (yytext?yytext:"???"), yylineno, current_file);
-		else
-			snprintf(extern_errormsg,1024,"Syntax error at '%s' line %d in '%s'",(yytext?yytext:"???"), yylineno, current_file);
-    }
-    
+void yyerror(const char *s)
+{
+    int rc;
+    if (local_errormsg[0] && s[0])
+        rc = snprintf(extern_errormsg, 1024, "%s (%s) at '%s' line %d in '%s'",
+                      local_errormsg, s, (yytext?yytext:"???"), yylineno,
+                      current_file->str);
+    else if (local_errormsg[0])
+        rc = snprintf(extern_errormsg, 1024, "%s at '%s' line %d in '%s'",
+                      local_errormsg, (yytext?yytext:"???"), yylineno,
+                      current_file->str);
+    else if (s[0])
+        rc = snprintf(extern_errormsg, 1024, "%s at '%s' line %d in '%s'",
+                      s, (yytext?yytext:"???"), yylineno, current_file->str);
+    else
+        rc = snprintf(extern_errormsg, 1024,
+                      "Syntax error at '%s' line %d in '%s'",
+                      (yytext?yytext:"???"), yylineno, current_file->str);
 
-    void set_error(char * s){
-        rh_strncpy(local_errormsg, s, 1024);
+    if (rc >= sizeof(extern_errormsg)) {
+        snprintf(extern_errormsg + sizeof(extern_errormsg) - 4, 4, "...");
     }
+}
+
+void set_error(const char * s)
+{
+	rh_strncpy(local_errormsg, s, 1024);
+}

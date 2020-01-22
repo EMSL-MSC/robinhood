@@ -1,20 +1,27 @@
+SUBDIRS=test_suite
 
-EXTRA_DIST= lustre_fs/1-test_setup.sh	\
-	lustre_fs/2-run-tests.sh		\
-	lustre_fs/3-tests-lustre.sh	\
-	lustre_fs/4-test_report.sh		\
-	lustre_fs/cleanup.sh		\
-	lustre_fs/README			\
-	lustre_fs/bench_rpc.sh		\
-	lustre_fs/cfg		    \
-    posix_fs/1-test_setup.sh    \
-    posix_fs/2-run-tests.sh     \
-    posix_fs/3-test_report.sh   \
-    posix_fs/README             \
-    posix_fs/cfg		\
-    posix_fs/cleanup.sh             \
-    huge_posix/cfg		 \
-    huge_posix/1-test_setup.sh      \
-    huge_posix/2-run-tests.sh	    \
-	test_compil_switches.sh	    \
-	fill_fs.sh
+pkgdatadir=@datarootdir@/@PACKAGE_NAME@/tests
+
+if COMMON_RPMS
+nobase_dist_pkgdata_DATA =                      \
+    $(srcdir)/test_suite/README.rst             \
+    $(srcdir)/test_suite/cfg/*.conf             \
+    $(srcdir)/test_suite/cfg/*.sql              \
+    $(srcdir)/test_suite/valgrind.supp          \
+    $(srcdir)/huge_posix/cfg/*.conf
+
+nobase_dist_pkgdata_SCRIPTS =                   \
+    $(srcdir)/test_suite/1-test_setup_lustre.sh \
+    $(srcdir)/test_suite/1-test_setup_posix.sh  \
+    $(srcdir)/test_suite/2-run-tests.sh         \
+    $(srcdir)/test_suite/3-tests-lustre.sh      \
+    $(srcdir)/test_suite/cleanup.sh             \
+    $(srcdir)/test_suite/bench_rpc.sh           \
+    $(srcdir)/test_suite/rm_script              \
+    $(srcdir)/test_suite/lsetup.sh              \
+    $(srcdir)/huge_posix/1-test_setup.sh        \
+    $(srcdir)/huge_posix/2-run-tests.sh         \
+    $(srcdir)/test_rpmbuild.sh                  \
+    $(srcdir)/fill_fs.sh                        \
+    $(srcdir)/completion.sh
+endif

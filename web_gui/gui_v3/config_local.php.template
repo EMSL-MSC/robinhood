@@ -1,0 +1,95 @@
+<?php
+/*
+ * Copyright (C) 2016-2017 CEA/DAM
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the CeCILL License.
+ *
+ * The fact that you are presently reading this means that you have had
+ * knowledge of the CeCILL license (http://www.cecill.info) and that you
+ * accept its terms.
+ */
+
+/*
+Complete the following parameters with your local configuration and
+rename the file to config_local.php
+
+You can redefine any of the parameter from config.php.
+*/
+
+/*****************************
+*        Database            *
+*****************************/
+
+$DBA[$DEFAULT_DB] = [
+"DB_TYPE"     => "mysql",
+"DB_HOST"     => "localhost",
+"DB_NAME"     => "",
+"DB_USER"     => "",
+"DB_PASSWD"   => "",
+"DB_USAGE"    => array("data","config"),
+];
+
+/*****************************
+*        Access              *
+*****************************/
+
+/* Beware, by default everyone can access to everything */
+
+/* Uncomment the following lines to reset default access */
+//$ACCESS_LIST['webgui'] = array();
+//$ACCESS_LIST['api-ro'] = array();
+//$ACCESS_LIST['datatables'] = array();
+//$ACCESS_LIST['graphs'] = array();
+//$ACCESS_LIST['native_vars'] = array();
+//$ACCESS_LIST['native_acct'] = array();
+//$ACCESS_LIST['native_files'] = array();
+
+//Web GUI with graphs and lists
+//$ACCESS_LIST['webgui'][] = '*';
+//Read Only API, required for webgui
+//$ACCESS_LIST['api-ro'][] = '*';
+//Datatables
+//$ACCESS_LIST['datatables'][] = '*';
+//Graphs
+//$ACCESS_LIST['graphs'][] = '*';
+//Native (raw data)
+//$ACCESS_LIST['native_vars'][] = '*';
+//$ACCESS_LIST['native_acct'][] = '*';
+//$ACCESS_LIST['native_files'][] = '*';
+
+/*****************************
+*        General parameters  *
+*****************************/
+
+//Max row per result
+//$MAX_ROWS = 1000;
+
+/*****************************
+*           ChartJS          *
+*****************************/
+
+//$CHARTJS = array();
+//$CHARTJS['Chart.defaults.global.title.display'] = "true";
+//$CHARTJS['Chart.defaults.global.defaultFontSize'] = 13;
+//$CHARTJS['responsiveChart'] = "true";
+//$CHARTJS['animationChart'] = "false";
+//CHARTJS['showAllTooltipsChart'] = "true";
+
+/*****************************
+ *        Plugins            *
+ *****************************/
+
+/* Uncomment to reset the plugin list */
+//$PLUGINS_REG = array();
+
+/* Plugin names must match directories names plugins folder */
+//$PLUGINS_REG[] = "stackgraph";
+//$PLUGINS_REG[] = "colorgraph";
+//$PLUGINS_REG[] = "plugdisplay";
+//$PLUGINS_REG[] = "fsinfo";
+//$PLUGINS_REG[] = "browser";
+//$PLUGINS_REG[] = "ldapauth";
+//$PLUGINS_REG[] = "console";
+
+?>

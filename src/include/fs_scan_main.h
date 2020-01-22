@@ -12,7 +12,6 @@
  * accept its terms.
  */
 
-
 /**
  * \file    fs_scan_main.h
  * \author  Th. Leibovici
@@ -27,62 +26,57 @@
 #define _FS_SCAN_MAIN_H
 
 #include "config_parsing.h"
-#include "policies.h"
+#include "policy_rules.h"
+#include <stdbool.h>
 
-/** Configuration for FS scan Module */
-typedef struct fs_scan_config_t
-{
+/** start scanning module */
+int FSScan_Start(run_flags_t flags, const char *partial_root);
+
+/** terminate scanning module */
+void FSScan_Terminate(void);
+
+/** wait for scan termination */
+void FSScan_Wait(void);
+
+/** dump scan stats */
+void FSScan_DumpStats(void);
+
+/** store scan stats in db */
+void FSScan_StoreStats(lmgr_t *lmgr);
+
+/** Configuration of the FS scan Module */
+typedef struct fs_scan_config_t {
     /* scan options */
 
-    unsigned int   min_scan_interval;
-    unsigned int   max_scan_interval;
-    unsigned int   scan_retry_delay;
-    unsigned int   nb_threads_scan;
-    unsigned int   scan_op_timeout;
-    unsigned int   exit_on_timeout;
+    unsigned int    nb_threads_scan;
+    time_t          min_scan_interval;
+    time_t          max_scan_interval;
+    time_t          scan_retry_delay;
+    time_t          scan_op_timeout;
+    bool            exit_on_timeout;
 
     /**
      * interval of the spooler (checks for audits to be launched,
      * thread hangs, ...) */
-    unsigned int   spooler_check_interval;
+    time_t          spooler_check_interval;
 
     /** memory management */
-    unsigned       nb_prealloc_tasks;
+    unsigned        nb_prealloc_tasks;
 
     /** ignore list (bool expr) */
     whitelist_item_t *ignore_list;
-    unsigned int   ignore_count;
+    unsigned int    ignore_count;
 
-	char           completion_command[RBH_PATH_MAX];
+    /** list of directories to scan (if different from fs_root) */
+    char          **dir_list;
+    unsigned int    dir_count;
+
+    char          **completion_command;
 
 } fs_scan_config_t;
 
-
-/** start scanning module */
-int            FSScan_Start( fs_scan_config_t * module_config, int flags, const char * partial_root );
-
-/** terminate scanning module */
-void           FSScan_Terminate( void );
-
-/** wait for scan termination */
-void           FSScan_Wait( void );
-
-/** dump scan stats */
-void           FSScan_DumpStats( void );
-
-/** store scan stats in db */
-void           FSScan_StoreStats( lmgr_t * lmgr );
-
-/**
- * \addtogroup MODULE_CONFIG_FUNCTIONS
- * @{
- */
-int            FSScan_SetDefaultConfig( void *module_config, char *msg_out );
-int            FSScan_ReadConfig( config_file_t config, void *module_config,
-                                  char *msg_out, int for_reload );
-int            FSScan_ReloadConfig( void *module_config );
-int            FSScan_WriteConfigTemplate( FILE * output );
-int            FSScan_WriteDefaultConfig( FILE * output );
+/** config handlers */
+extern mod_cfg_funcs_t fs_scan_cfg_hdlr;
 
 #endif
 

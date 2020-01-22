@@ -22,39 +22,40 @@
 #include <pthread.h>
 #include <sys/param.h>
 #include <sys/stat.h>
-
-#ifndef TRUE
-#define TRUE (1)
-#endif
-
-#ifndef FALSE
-#define FALSE (0)
-#endif
-
+#include <stdbool.h>
 
 /* a scanning task */
 
-typedef struct robinhood_task__
-{
+typedef struct robinhood_task__ {
     /* absolute path of the directory to be read */
-    char           path[RBH_PATH_MAX];
+    char            path[RBH_PATH_MAX];
+
+    /* relative path of the directory from parent task */
+    char            relpath[RBH_NAME_MAX];
+
+    /* fd to directory, kept until the task is freed for child tasks */
+    int fd;
 
     /* the relative depth of the directory to be read */
-    unsigned int   depth;
+    unsigned int    depth;
 
     /* id of this directory */
-    entry_id_t     dir_id;
+    entry_id_t      dir_id;
 
     /* metadatas of this directory */
-    struct stat    dir_md;
+    struct stat     dir_md;
 
     /* parent task */
     struct robinhood_task__ *parent_task;
 
+    /* partial scan root, in case of partial scans
+     * or restricted scans */
+    const char *partial_scan_root;
+
     /* lock for protecting the child list
      * and the task_finished boolean.
      */
-    pthread_spinlock_t child_list_lock;
+    pthread_spinlock_t       child_list_lock;
 
     /* list of child tasks running */
 
@@ -63,8 +64,7 @@ typedef struct robinhood_task__
     /* this boolean indicates if the task is finished
      * (not including child tasks)
      */
-    int            task_finished;
-
+    bool task_finished;
 
     /* these pointers are used for chaining a (child) task
      * into its parent list of childs.
@@ -81,7 +81,6 @@ typedef struct robinhood_task__
 
 } robinhood_task_t;
 
-
 /* We define a maximum value for ordering tasks into the stack,
  * but we however handle cases when it's over.
  * (we will consider that all the tasks over this limit
@@ -92,18 +91,16 @@ typedef struct robinhood_task__
 /* A stack of tasks ordered by depth,
  * handled by 'task_stack_mngmt' routines.
  */
-typedef struct tasks_stack__
-{
-    pthread_mutex_t stack_lock;                  /* lock on the stack */
-    sem_t          sem_tasks;                    /* token for available tasks */
+typedef struct tasks_stack__ {
+    pthread_mutex_t     stack_lock; /* lock on the stack */
+    sem_t               sem_tasks;  /* token for available tasks */
 
     /* Indicates the depth for the first task available */
-    unsigned int   max_task_depth;
+    unsigned int        max_task_depth;
 
     /* list of tasks, ordered by depth */
-    robinhood_task_t *tasks_at_depth[MAX_TASK_DEPTH + 1];
+    robinhood_task_t   *tasks_at_depth[MAX_TASK_DEPTH + 1];
 
 } task_stack_t;
-
 
 #endif

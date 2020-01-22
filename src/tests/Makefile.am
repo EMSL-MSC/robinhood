@@ -1,50 +1,32 @@
 AM_CFLAGS= $(CC_OPT) $(DB_CFLAGS) $(PURPOSE_CFLAGS)
 AM_LDFLAGS= -lpthread
 
-check_PROGRAMS=create_nostripe test_forcestripe test_hash_func test_uidgidcache test_list_mgr test_entry_proc test_info_collector test_resource_monitor
+# See autotools/m4/ax_valgrind_check.m4 for documentation
+@VALGRIND_CHECK_RULES@
+#VALGRIND_SUPPRESSIONS_FILES = my-project.supp
+#EXTRA_DIST = my-project.supp
 
-all_libs=	../logs/liblogs.la \
-	        ../cfg_parsing/libconfigparsing.la \
-                ../fs_scan/libfsscan.la \
-                ../entry_processor/libentryproc.la \
-                ../policy_matching/libpolicies.la \
-                ../policy_modules/purge/libresmonitor.la \
-                ../list_mgr/liblistmgr.la
-
-
-if CHANGELOGS
-all_libs += ../chglog_reader/libchglog_rd.la
+check_PROGRAMS=test_uidgidcache test_params \
+    test_confparam test_parse
+if LUSTRE
+check_PROGRAMS+=create_nostripe test_forcestripe
 endif
-if TMP_FS_MGR
-all_libs += ../policy_modules/purge/libresmonitor.la
-all_libs += ../policy_modules/rmdir/librmdir.la
-endif
-if LUSTRE_HSM
-all_libs += ../policy_modules/purge/libresmonitor.la
-all_libs += ../policy_modules/migration/libmigration.la
-all_libs += ../policy_modules/hsm_remove/libhsmrm.la
-endif
-if HSM_LITE
-all_libs += ../policy_modules/migration/libmigration.la
-all_libs += ../policy_modules/hsm_remove/libhsmrm.la
-all_libs += ../backend_ext/libbackend_ext.la
-endif
+TESTS=test_parsing.sh test_uidgidcache test_params test_confparam
 
-all_libs += ../list_mgr/liblistmgr.la
-all_libs += ../common/libcommontools.la
+noinst_PROGRAMS=$(check_PROGRAMS)
 
+test_forcestripe_LDADD=$(DB_LDFLAGS) $(PURPOSE_LDFLAGS) $(FS_LDFLAGS)
 
-test_forcestripe_LDADD=$(all_libs)  $(DB_LDFLAGS) $(PURPOSE_LDFLAGS) $(FS_LDFLAGS)
+test_uidgidcache_SOURCES=test_uidgidcache.c
+test_uidgidcache_LDADD=../common/libcommontools.la
+test_params_SOURCES=test_params.c
+test_params_LDADD=../common/libcommontools.la
+test_confparam_SOURCES=test_confparam.c
+test_confparam_LDFLAGS=$(DB_LDFLAGS) $(PURPOSE_LDFLAGS) $(FS_LDFLAGS)
+test_confparam_LDADD=../policies/libpolicies.la ../common/libcommontools.la
+test_parse_SOURCES	    = test_parse.c
+test_parse_LDADD         =  ../cfg_parsing/libconfigparsing.la
 
-test_list_mgr_LDADD=$(all_libs)  $(DB_LDFLAGS) $(PURPOSE_LDFLAGS) $(FS_LDFLAGS)
-
-test_entry_proc_LDADD=$(all_libs)  $(DB_LDFLAGS) $(PURPOSE_LDFLAGS) $(FS_LDFLAGS)
-
-test_info_collector_LDADD=$(all_libs)  $(DB_LDFLAGS) $(PURPOSE_LDFLAGS) $(FS_LDFLAGS)
-
-test_resource_monitor_LDADD=$(all_libs)  $(DB_LDFLAGS) $(PURPOSE_LDFLAGS) $(FS_LDFLAGS)
-
-test_uidgidcache_LDADD=$(all_libs) $(DB_LDFLAGS) $(PURPOSE_LDFLAGS) $(FS_LDFLAGS)
 
 indent:
 	$(top_srcdir)/scripts/indent.sh

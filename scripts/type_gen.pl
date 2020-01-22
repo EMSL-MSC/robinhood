@@ -141,6 +141,10 @@ foreach $index (sort {0+$a <=> 0+$b}  keys %attrlist )
 		print  OUTPUT ";\n";
 	}
 }
+    # additional special field: list of status (size depends on policy definitions)
+    print OUTPUT "\tchar const **sm_status;\n";
+    # additional special fields: policy specific info
+    print OUTPUT "\tvoid **sm_info;\n";
 
 print OUTPUT "} entry_info_t;\n\n";
 
@@ -153,10 +157,14 @@ foreach $index (sort {0+$a <=> 0+$b}  keys %attrlist )
 print OUTPUT "\n";
 print OUTPUT "#define ATTR_COUNT ".$next_index."\n";
 print OUTPUT "\n";
+print OUTPUT "#if ATTR_COUNT > 32\n";
+print OUTPUT "#error \"Standard attribute index must fit in a 32bits mask\"\n";
+print OUTPUT "#endif\n";
+print OUTPUT "\n";
 foreach $index (sort {0+$a <=> 0+$b}  keys %attrlist )
 {
-        my $mask_val = 1<<$index;
-	printf OUTPUT "#define ATTR_MASK_".${$attrlist{$index}}{name}." \t%#08X\n", $mask_val;
+#        my $mask_val = 1<<$index;
+	printf OUTPUT "#define ATTR_MASK_".${$attrlist{$index}}{name}." \t(1LL << %u)\n", $index;
 }
 
 print OUTPUT "\nstatic const field_info_t field_infos[]=\n{\n";

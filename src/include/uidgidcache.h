@@ -32,11 +32,15 @@
 #include <grp.h>
 #include <pwd.h>
 
-int            InitUidGid_Cache( void );
+int InitUidGid_Cache(void);
 
-struct passwd *GetPwUid( uid_t owner );
+const struct passwd *GetPwUid(uid_t owner);
+const struct group *GetGrGid(gid_t gid);
 
-struct group  *GetGrGid( gid_t gid );
-
+/* Cache statistics */
+extern unsigned int pw_nb_set;
+extern unsigned int pw_nb_get;
+extern unsigned int gr_nb_set;
+extern unsigned int gr_nb_get;
 
 #endif

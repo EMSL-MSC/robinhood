@@ -1,7 +1,6 @@
 AM_YFLAGS		    = --defines
 AM_LFLAGS		    = -i
-# no -Werror because yacc's auto-generated code is not clean
-AM_CFLAGS= -Wall $(DB_CFLAGS) $(PURPOSE_CFLAGS) -DYY_NO_UNPUT
+AM_CFLAGS= -Wall -Werror $(DB_CFLAGS) $(PURPOSE_CFLAGS)
 
 if DEBUG_PARSING
 # not supported with automake 1.12
@@ -16,17 +15,12 @@ conf_yacc.h: conf_yacc.c
 # cleaning FLEX/BISON generated files
 #CLEANFILES = conf_yacc.h conf_yacc.c conf_lex.c
 
-noinst_LTLIBRARIES          = libconfigparsing.la
+noinst_LTLIBRARIES          = libconfigparsing.la librbhcfg.la
+
 libconfigparsing_la_SOURCES = conf_yacc.y conf_yacc.h conf_lex.l analyze.c config_parsing.c analyze.h \
-			      RobinhoodConfig.c conf_yacc.c conf_lex.c
+			                  rbh_cfg_helpers.c rbh_boolexpr.c conf_yacc.c conf_lex.c
 
-check_PROGRAMS		    = verif_syntax test_parsing
-
-verif_syntax_SOURCES	    = verif_syntax.c
-verif_syntax_LDADD         = libconfigparsing.la
-
-test_parsing_SOURCES	    = test_parse.c
-test_parsing_LDADD         =  libconfigparsing.la
+librbhcfg_la_SOURCES        = rbh_cfg.c
 
 indent:
 	$(top_srcdir)/scripts/indent.sh

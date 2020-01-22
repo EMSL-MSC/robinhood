@@ -7,32 +7,22 @@ TYPEGEN=$(top_srcdir)/scripts/type_gen.pl
 	$(TYPEGEN) $< $*.h
 
 noinst_HEADERS=db_types.h  list_mgr.h RW_Lock.h \
-		uidgidcache.h Memory.h rbh_const.h RobinhoodLogs.h \
-		RobinhoodConfig.h RobinhoodMisc.h config_parsing.h \
-		global_config.h entry_processor.h      \
-		fs_scan_main.h chglog_reader.h resource_monitor.h \
+		uidgidcache.h Memory.h rbh_const.h rbh_logs.h \
+		rbh_cfg.h rbh_misc.h config_parsing.h \
+		global_config.h entry_processor.h status_manager.h\
+		fs_scan_main.h chglog_reader.h policy_run.h\
 		xplatform_print.h lustre_extended_types.h \
-		policies.h rmdir.h queue.h StringAlloc.h hsm_rm.h migration.h \
-		entry_proc_hash.h list.h var_str.h \
-        lustre/lustre_errno.h
+		policy_rules.h queue.h  \
+		entry_proc_hash.h list.h \
+        lustre/lustre_errno.h update_params.h \
+        db_schema.h db_schema.def pipeline_types.h \
+        rbh_params.h rbh_types.h rbh_boolexpr.h rbh_cfg_helpers.h \
+        rbh_modules.h rbh_basename.h
 
-if LUSTRE_HSM
-noinst_HEADERS+=lustre_hsm_types.h lustre_hsm_types.def pipeline_types.h
-lustre_hsm_types.h: lustre_hsm_types.def $(TYPEGEN)
-all: lustre_hsm_types.h
-endif
-if TMP_FS_MGR
-noinst_HEADERS+=tmp_fs_mgr_types.def pipeline_types.h
-tmp_fs_mgr_types.h: tmp_fs_mgr_types.def $(TYPEGEN)
-all: tmp_fs_mgr_types.h
-endif
-if HSM_LITE
-noinst_HEADERS+=hsmlite_types.h hsmlite_types.def backend_ext.h backend_mgr.h  pipeline_types.h
-hsmlite_types.h: hsmlite_types.def $(TYPEGEN)
-all: hsmlite_types.h
-endif
+db_schema.h: db_schema.def $(TYPEGEN)
+all: db_schema.h
 
-CLEANFILES = lustre_hsm_types.h tmp_fs_mgr_types.h hsmlite_types.h
+CLEANFILES = db_schema.h
 
 indent:
 	$(top_srcdir)/scripts/indent.sh

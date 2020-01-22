@@ -16,16 +16,17 @@
  * \file  global_config.h
  * \brief Global configuration parameters
  */
-#ifndef _GENERAL_H
-#define _GENERAL_H
+#ifndef _GLB_CFG_H
+#define _GLB_CFG_H
 
+#include "rbh_cfg.h"
 #include "rbh_const.h"
-#include "config_parsing.h"
-#include <sys/param.h>          /* for RBH_PATH_MAX */
+#include <sys/param.h>  /* for RBH_PATH_MAX */
 #include <stdio.h>
+#include <stdbool.h>
 
 typedef enum {
-    FSKEY_ERROR=0,
+    FSKEY_ERROR = 0,
     FSKEY_FSNAME,
     FSKEY_FSID,
     FSKEY_DEVID
@@ -34,44 +35,33 @@ typedef enum {
 /**
  * General Robinhood configuration
  */
-typedef struct global_config_t
-{
+typedef struct global_config_t {
     /* filesystem description */
-
-    char           fs_path[RBH_PATH_MAX];
-    char           fs_type[FILENAME_MAX];
+    char    fs_path[RBH_PATH_MAX];
+    char    fs_type[FILENAME_MAX];
 
     /* lock file */
-    char           lock_file[RBH_PATH_MAX];
+    char    lock_file[RBH_PATH_MAX];
 
-    fs_key_t      fs_key;
+    fs_key_t fs_key;
 
     /* behavior flags */
-    int            stay_in_fs:1;
-    int            check_mounted:1;
+    bool    stay_in_fs;
+    bool    check_mounted;
+    bool    last_access_only_atime;
+    bool    uid_gid_as_numbers;
 
-#if defined( _LUSTRE ) && defined ( _MDS_STAT_SUPPORT )
+#if defined(_LUSTRE) && defined(_MDS_STAT_SUPPORT)
     /** Direct stat to MDS on Lustre filesystems */
-    int            direct_mds_stat;
+    bool    direct_mds_stat;
 #endif
 
 } global_config_t;
 
-/**
- * \addtogroup MODULE_CONFIG_FUNCTIONS
- * @{
- */
-int            SetDefaultGlobalConfig( void *module_config, char *msg_out );
-int            ReadGlobalConfig( config_file_t config, void *module_config,
-                                 char *msg_out, int for_reload );
-int            ReloadGlobalConfig( void *module_config );
-int            WriteGlobalConfigTemplate( FILE * output );
-int            WriteGlobalConfigDefault( FILE * output );
-/** @} */
-
 /** global config structure available to all modules */
 extern global_config_t global_config;
 
-
+/** handlers for global config */
+extern mod_cfg_funcs_t global_cfg_hdlr;
 
 #endif

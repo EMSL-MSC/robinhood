@@ -22,9 +22,10 @@
 #include "config.h"
 #endif
 
-#include "RobinhoodConfig.h"
-#include "RobinhoodLogs.h"
-#include "RobinhoodMisc.h"
+#include "rbh_cfg.h"
+#include "rbh_logs.h"
+#include "rbh_misc.h"
+#include "rbh_basename.h"
 #include <unistd.h>
 #include <getopt.h>
 #include <stdio.h>
@@ -41,7 +42,7 @@ static const char *help_string =
     "Generate a lov_objid file for MDT according to max stripe object indexes.\n"
     "Increment each index by the safety "_U"margin"U_".\n";
 
-static inline void display_help(char *bin_name)
+static inline void display_help(const char *bin_name)
 {
     printf(help_string, bin_name);
 }
@@ -54,16 +55,15 @@ static inline void display_help(char *bin_name)
 int main( int argc, char **argv )
 {
     int            c = 0;
-    char          *bin = basename( argv[0] );
+    const char    *bin;
     int            rc;
     char           err_msg[4096];
-    robinhood_config_t config;
-    int chgd = 0;
+    bool           chgd = false;
 
     /* options */
     char           config_file[MAX_OPT_LEN] = "";
     char           badcfg[RBH_PATH_MAX];
-    int            force_log_level = FALSE;
+    bool           force_log_level = false;
     int            log_level = 0;
     int            margin = 0;
     char           output_file[MAX_OPT_LEN] = "/tmp/lov_objid";
@@ -71,13 +71,15 @@ int main( int argc, char **argv )
     lmgr_t         lmgr;
     FILE         * out;
 
+    bin = rh_basename(argv[0]);
+
     /* parse command line options */
     while ((c = getopt(argc, argv, OPT_STRING)) != -1)
     {
         switch (c)
         {
             case 'l':
-                force_log_level = TRUE;
+                force_log_level = true;
                 log_level = str2debuglevel(optarg);
                 if (log_level == -1)
                 {
@@ -123,39 +125,40 @@ int main( int argc, char **argv )
         fprintf(stderr, "Using config file '%s'.\n", config_file );
     }
 
-    /* only read ListMgr config */
+    /* initialize internal resources (glib, llapi, internal resources...) */
+    rc = rbh_init_internals();
+    if (rc != 0)
+        exit(rc);
 
-    if ( ReadRobinhoodConfig( 0, config_file, err_msg, &config, FALSE ) )
+    /* load and set modules configuration */
+    if(rbh_cfg_load(0, config_file, err_msg))
     {
-        fprintf( stderr, "Error reading configuration file '%s': %s\n", config_file, err_msg );
-        exit( 1 );
+        fprintf(stderr, "Error reading configuration file '%s': %s\n",
+                config_file, err_msg);
+        exit(1);
     }
-    process_config_file = config_file;
 
-    /* set global configuration */
-    global_config = config.global_config;
-
-    if ( force_log_level )
-        config.log_config.debug_level = log_level;
+    if (force_log_level)
+        log_config.debug_level = log_level;
     else
-        config.log_config.debug_level = LVL_MAJOR; /* no event message */
+        log_config.debug_level = LVL_MAJOR; /* no event message */
 
     /* set logging to stderr for this tool */
-    strcpy( config.log_config.log_file, "stderr" );
-    strcpy( config.log_config.report_file, "stderr" );
-    strcpy( config.log_config.alert_file, "stderr" );
+    strcpy(log_config.log_file, "stderr");
+    strcpy(log_config.report_file, "stderr");
+    strcpy(log_config.alert_file, "stderr");
 
     /* Initialize logging */
-    rc = InitializeLogs( bin, &config.log_config );
-    if ( rc )
+    rc = InitializeLogs(bin);
+    if (rc)
     {
-        fprintf( stderr, "Error opening log files: rc=%d, errno=%d: %s\n",
-                 rc, errno, strerror( errno ) );
-        exit( rc );
+        fprintf(stderr, "Error opening log files: rc=%d, errno=%d: %s\n",
+                 rc, errno, strerror(errno));
+        exit(rc);
     }
 
     /* Initialize list manager */
-    rc = ListMgr_Init( &config.lmgr_config, TRUE );
+    rc = ListMgr_Init(true);
     if ( rc )
     {
         DisplayLog( LVL_CRIT, TAG, "Error %d initializing list manager", rc );
@@ -178,7 +181,7 @@ int main( int argc, char **argv )
     out = fopen(output_file, "w");
     if (!out)
     {
-        DisplayLog(LVL_CRIT, TAG, "Failed to open '%s' for writting: %s", output_file,
+        DisplayLog(LVL_CRIT, TAG, "Failed to open '%s' for writing: %s", output_file,
                    strerror(errno));
         return errno;
     }

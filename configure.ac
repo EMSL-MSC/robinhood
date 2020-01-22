@@ -4,10 +4,10 @@
 
 AC_PREREQ(2.59)
 
-AC_INIT( [robinhood], [2.5.3], [robinhood-support@lists.sourceforge.net])
+AC_INIT( [robinhood], [3.1.5], [robinhood-support@lists.sourceforge.net])
 RELEASE="1"
 
-AC_DEFINE_UNQUOTED(RELEASE, "$RELEASE", [release info] )
+AC_DEFINE_UNQUOTED(RELEASE, "$RELEASE", [release info])
 AC_SUBST(RELEASE)
 
 AC_CONFIG_AUX_DIR([autotools])
@@ -15,15 +15,63 @@ AC_CONFIG_MACRO_DIR([autotools/m4])
 AC_CONFIG_HEADER([src/include/config.h])
 AC_CONFIG_SRCDIR([src/list_mgr/listmgr_init.c])
 
-AM_INIT_AUTOMAKE([-Wall -Werror tar-pax foreign])
+AM_INIT_AUTOMAKE([-Wall -Werror tar-pax foreign subdir-objects])
 m4_ifdef([AM_SILENT_RULES], [AM_SILENT_RULES([yes])])
 
 AC_PREFIX_DEFAULT([/usr])
 
 AC_GNU_SOURCE
 
-# disable shared libraries generation
-AC_ENABLE_SHARED(no)
+AC_CONFIG_FILES([Makefile
+         src/Makefile
+         src/include/Makefile
+         src/common/Makefile
+         src/cfg_parsing/Makefile
+         src/list_mgr/Makefile
+         src/entry_processor/Makefile
+         src/fs_scan/Makefile
+         src/chglog_reader/Makefile
+         src/modules/Makefile
+         src/policies/Makefile
+         src/robinhood/Makefile
+         src/tools/Makefile
+         src/tests/Makefile
+         scripts/Makefile
+         scripts/robinhood.init
+         scripts/robinhood.init.sles
+         scripts/robinhood.service
+         scripts/robinhood@.service
+         scripts/sysconfig_robinhood
+         scripts/ld.so.robinhood.conf
+         scripts/rbh_cksum.sh
+         tests/Makefile
+         tests/test_suite/Makefile
+         web_gui/Makefile
+         man/Makefile
+         robinhood.spec
+         doc/doxygen/doxygen.cfg])
+
+AC_ARG_ENABLE([dist],
+              AC_HELP_STRING([--enable-dist], [Only configure enough for make dist]),
+              [],
+              [enable_dist="no"])
+
+AM_PROG_LEX
+AC_PATH_PROG(LEX_INST, $LEX)
+if test -z "$LEX_INST" -a "x$enable_dist" = xyes; then
+  AC_MSG_ERROR([lex/flex not found])
+fi
+
+AC_PROG_YACC
+AC_PATH_PROG(YACC_INST, $YACC)
+if test -z "$YACC_INST" -a "x$enable_dist" = xyes; then
+  AC_MSG_ERROR([yacc/bison not found])
+fi
+
+AS_IF([test "x$enable_dist" = xyes], [
+AC_OUTPUT
+exit
+])
 
 # required for automake 1.12 (since fedora 18)
 m4_ifdef([AM_PROG_AR], [AM_PROG_AR])
@@ -35,15 +83,12 @@ AC_PROG_CC
 m4_ifdef([AM_PROG_CC_C_O], [AM_PROG_CC_C_O])
 
 AC_C_INLINE
-AM_PROG_LEX
-AC_PROG_YACC
 
 # define everything necessary for accessing large files (64bits offset)
 AC_SYS_LARGEFILE
 
 # gcc options
-#CC_OPT="-Wall -Werror"
-CC_OPT="-Wall -Wstrict-prototypes -Wmissing-prototypes -Wmissing-declarations"
+CC_OPT="-Wall -Werror -Wstrict-prototypes -Wmissing-prototypes -Wmissing-declarations -std=gnu99 -Wno-variadic-macros"
 AC_SUBST(CC_OPT)
 
 AC_CHECK_SIZEOF([nlink_t])
@@ -55,6 +100,17 @@ AC_CHECK_SIZEOF([size_t])
 AC_CHECK_SIZEOF([pthread_t])
 
 AX_ENABLE_FLAG([strict], [Compile with -Wall -Werror], [-Wall -Werror])
+
+AC_CHECK_LIB(z, gzflush,
+  [LIBS="-lz $LIBS"
+   AC_DEFINE(HAVE_LIBZ, 1, [define if you have zlib])],
+  [AC_MSG_WARN([zlib is required])])
+
+PKG_CHECK_MODULES(GLIB2, [glib-2.0 >= 2.16])
+PKG_CHECK_MODULES(GTHREAD2, [gthread-2.0])
+
+CFLAGS="$CFLAGS $GLIB2_CFLAGS $GTHREAD2_CFLAGS"
+LDFLAGS="$LDFLAGS $GLIB2_LIBS $GTHREAD2_LIBS"
 
 # debug flags
 AX_ENABLE_FLAG([debug-db], [enables debug traces for database operations], [-D_DEBUG_DB])
@@ -70,18 +126,41 @@ AX_ENABLE_FLAG([bench-db], [test only: build special version for DB benchmarking
 AX_ENABLE_FLAG([bench-pipeline], [test only: build special version for pipeline benchmarking], [-D_BENCH_PIPELINE -D_BENCH_DB])
 AX_ENABLE_FLAG([gprof], [test only: add gprof info to the binaries], [-g -pg])
 AX_ENABLE_FLAG([gcov], [test only: add gcov info to the binaries], [--coverage])
+AX_VALGRIND_CHECK
 
 # behavior flags
 AX_DISABLE_FLAG([atfunc], [Don't use 'at' functions for scanning], [-D_NO_AT_FUNC])
 
 AX_ENABLE_FLAG( [fid2path-leading-slash], [must be enabled if fid2path() returns a leading slash], [-D_FID2PATH_LEADING_SLASH] )
 
-# program to be used for mailing
-AX_PROG_MAIL
+AC_ARG_ENABLE( [data-version], AS_HELP_STRING([--disable-data-version],
+               [Disable the use of llapi_get_data_version()]),
+               [support_dv="$enableval"],[support_dv="yes"] )
+DV_CMD="stat -c %Y-%s"
 
-AC_ARG_ENABLE( [lustre], AS_HELP_STRING([--disable-lustre],
-               [Disable all lustre specific features]),
-               [support_lustre="$enableval"],[support_lustre="yes"] )
+AC_ARG_ENABLE([common-rpms], AS_HELP_STRING([--disable-common-rpms],
+              [Disable build of common RPMs, only build FS specific packages]),
+              [common_rpms="$enableval"],[common_rpms="yes"])
+AM_CONDITIONAL(COMMON_RPMS,test  "x$common_rpms" = "xyes")
+
+build_lustre="OFF"
+build_backup="OFF"
+build_lhsm="OFF"
+build_shook="OFF"
+
+AC_ARG_ENABLE([lustre], AS_HELP_STRING([--disable-lustre],
+              [Disable all lustre specific features]),
+              [support_lustre="$enableval"],[support_lustre="yes"])
+AC_ARG_ENABLE([shook], AS_HELP_STRING([--disable-shook],
+              [Disable build of shook specific modules]),
+              [support_shook="$enableval"],[support_shook="yes"])
+
+# default input option is --scan
+INPUT_OPT="--scan"
+
+# shook requires Lustre + FID support + shook library
+# hsm_lite requires Lustre + FID support
+# lustre_hsm requires Lustre >= 2.5
 
 if test "x$support_lustre" = "xyes" ; then
     # Lustre location
@@ -101,6 +180,7 @@ if test "x$support_lustre" = "xyes" ; then
     if test "x$have_liblustre_api" = "xyes" ; then
 
         AC_DEFINE(_LUSTRE, 1, [liblustreapi is available])
+        build_lustre="ON"
 
         AC_CHECK_HEADER([lustre/lustreapi.h], have_new_lustre_header="true", have_new_lustre_header="false")
         if test "$have_new_lustre_header" = "true"; then
@@ -109,12 +189,17 @@ if test "x$support_lustre" = "xyes" ; then
             AC_DEFINE(_MDT_SPECIFIC_LOVEA, 1, [MDT LOV EA is no longer the same as lov_user_md])
         fi
 
-        AC_CHECK_HEADER([lustre/lustre_idl.h], have_lustre_idl="true", have_lustre_idl="false")
+        AC_CHECK_HEADER([lustre/lustre_idl.h], have_lustre_idl="true", have_lustre_idl="false", [
+            #define LPX64 "%#llx"
+            #include <sys/types.h>
+            #include <asm/types.h>
+            #include <lustre/lustre_user.h>
+        ])
         if test "$have_lustre_idl" = "true"; then
             AC_DEFINE(_LUSTRE_IDL_HEADER, 1, [lustre_idl header exists])
         fi
 
-        # this defines LVERSION and LPACKAGE variables
+        # this defines LVERSION variable
         if test -z "$LDIR" ; then
             AX_LUSTRE_VERSION
         else
@@ -139,6 +224,17 @@ if test "x$support_lustre" = "xyes" ; then
         AC_CHECK_LIB([lustreapi], [llapi_msg_set_level], [have_llapi_msg_level="yes"])
         test "x$have_llapi_msg_level" = "xyes" && AC_DEFINE(HAVE_LLAPI_MSG_LEVEL, 1, [llapi_msg_set_level is available])
 
+        AC_CHECK_LIB([lustreapi], [llapi_error_callback_set],
+                     [have_llapi_error_callback_set="yes"])
+        test "x$have_llapi_error_callback_set" = "xyes" &&
+            AC_DEFINE(HAVE_LLAPI_LOG_CALLBACKS, 1, [llapi log callbacks are available])
+
+        AC_CHECK_LIB([lustreapi], [llapi_get_mdt_index_by_fid],
+                     [have_llapi_get_mdt_index_by_fid="yes"])
+        test "x$have_llapi_get_mdt_index_by_fid" = "xyes" &&
+            AC_DEFINE(HAVE_LLAPI_GET_MDT_INDEX_BY_FID, 1,
+                      [llapi_get_mdt_index_by_fid available])
+
         # check if struct statfs is defined in lustre user
         AC_CHECK_TYPE(struct obd_statfs,[have_obd_statfs="yes"],[have_obd_statfs="no"],[
             #define LPX64 "%#llx"
@@ -155,7 +251,11 @@ if test "x$support_lustre" = "xyes" ; then
             # only check for fid if fid support is not disabled
         if test "x$fid_support" = "xyes" ; then
                 AC_CHECK_LIB([lustreapi], [llapi_fid2path], [have_fid="yes"])
-            test "x$have_fid" = "xyes" && AC_DEFINE(_HAVE_FID, 1, [lustre supports fids])
+                if test "x$have_fid" = "xyes"; then
+                    AC_DEFINE(_HAVE_FID, 1, [lustre supports fids])
+                    AC_DEFINE(_HSM_LITE, 1, [HSM lite support])
+                    build_backup="ON"
+                fi
         fi
 
         # check if fd2fid function exists
@@ -174,7 +274,7 @@ if test "x$support_lustre" = "xyes" ; then
     		# test changelog functions
 
 	    	AC_CHECK_LIB([lustreapi],[llapi_changelog_start],[have_llapi_changelog_start="yes"])
-		    if test "x$have_llapi_changelog_start" = "xyes"; then 
+		    if test "x$have_llapi_changelog_start" = "xyes"; then
 		        AC_DEFINE(HAVE_CHANGELOGS, 1, [Lustre changelogs records are structures])
                 AC_CHECK_DECL([CL_IOCTL],AC_DEFINE(_HAVE_CL_IOCTL,1,[CL_IOCTL is defined]),[],[
                     #define LPX64 "%#llx"
@@ -189,15 +289,33 @@ if test "x$support_lustre" = "xyes" ; then
                     #include <lustre/lustre_user.h>
                 ])
 
+                # changelog_ext_rec was removed by commit 0f22e4,
+                # which added the flexible changelog format. That
+                # commit added CLF_RENAME, so check for that symbol.
+                AC_CHECK_DECLS([CLF_RENAME],[],[],[
+                    #define LPX64 "%#llx"
+                    #include <sys/types.h>
+                    #include <asm/types.h>
+                    #include <lustre/lustre_user.h>
+                ])
+                # default option for sysconfig
+                INPUT_OPT="--readlog"
             fi
 
             if test "x$have_llapi_changelog_start" = "xyes" && \
                test "x$have_fid" != "xyes"; then
                 AC_MSG_ERROR([Conflicting options: fid must be enabled for enabling MDT changelogs management])
             fi
-
-
     	fi
+        if test "x$support_dv" = "xyes" ; then
+            AC_CHECK_LIB([lustreapi], [llapi_get_data_version], [have_data_version="yes"])
+        fi
+        test "x$have_data_version" = "xyes" && DV_CMD="lfs data_version"
+
+        # llapi_swap_layouts exists since Lustre2.4 release
+        # since then, entry striping can change so scanning must update file stripe information
+        AC_CHECK_LIB([lustreapi], [llapi_fswap_layouts], [have_llapi_fswap_layouts="yes"])
+        test "x$have_llapi_fswap_layouts" = "xyes" && AC_DEFINE(HAVE_LLAPI_FSWAP_LAYOUTS, 1, [llapi_fswap_layouts is available])
 
         AX_ENABLE_FLAG( [llapi-fork-support], [Must be enabled if liblustreapi uses fork()], [-D_LLAPI_FORKS] )
         AX_ENABLE_FLAG( [mds-stat], [ioctl() to MDC instead of POSIX stat()], [-D_MDS_STAT_SUPPORT] )
@@ -225,138 +343,78 @@ if test "x$support_lustre" = "xyes" ; then
         ])
         test "x$have_obj_id" = "xyes" && AC_DEFINE(HAVE_OBJ_ID, 1, [lov_user_ost_data_v1 has l_object_id field])
 
+        # Lustre/HSM feature needs Lustre 2.5.0. As some hsm calls were already landed as empty nutshells in 2.4
+        # we rely on this new call of 2.5.0: llapi_hsm_state_get_fd().
+        AC_CHECK_LIB([lustreapi], llapi_hsm_state_get_fd, [have_lustre_hsm="yes"])
+        if test "x$have_lustre_hsm" = "xyes"; then
+            AC_DEFINE([_LUSTRE_HSM], [1], [Lustre/HSM feature is present])
+            build_lhsm="ON"
+        fi
 
+        if test "x$support_shook" = "xyes" ; then
+            # test if library is available for shook mode
+            AC_CHECK_LIB([shooksvr], [shook_release], [have_shook="yes"])
+            # fix with dynamic module management
+            if test "x$have_shook" = "xyes"; then
+                build_shook="ON"
+            fi
+            # check shook to lhsm conversion functions
+            AC_CHECK_LIB([shooksvr], [shook_lhsmify], [have_shook_lhsmify="yes"])
+            test "x$have_shook_lhsmify" = "xyes" && \
+                AC_DEFINE([HAVE_SHOOK_LHSMIFY], [1], [shook_lhsmify function available])
+        fi
     fi
 
     AM_CONDITIONAL(CHANGELOGS,  test  "x$have_llapi_changelog_start" = "xyes" )
     AM_CONDITIONAL(USER_LOVEA, [test  "x$have_new_lustre_header" != "xtrue" && test "x$have_llapi_changelog_start" = "xyes"])
+    AM_CONDITIONAL(LUSTRE_HSM,  test "x$have_lustre_hsm" = "xyes")
+    AM_CONDITIONAL(SHOOK,       test  "x$have_shook" = "xyes")
+    # XXX HSM-LITE tagged sections of the code require Lustre 2.x
+    AM_CONDITIONAL(HSM_LITE,    test "x$have_fid" = "xyes")
 else
     AM_CONDITIONAL(LUSTRE, test 0 = 1 )
-    AM_CONDITIONAL(CHANGELOGS, test 0 = 1 ) 
-    AM_CONDITIONAL( USER_LOVEA, test  0 = 1 )
-
+    AM_CONDITIONAL(CHANGELOGS, test 0 = 1 )
+    AM_CONDITIONAL(USER_LOVEA, test  0 = 1 )
+    AM_CONDITIONAL(LUSTRE_HSM,     test 0 = 1)
+    AM_CONDITIONAL(SHOOK,       test  0 = 1)
+    AM_CONDITIONAL(HSM_LITE,    test 0 = 1)
 fi # end of Lustre support
 
-AC_CHECK_HEADERS([attr/xattr.h],[],[AC_MSG_WARN([libattr-devel is not installed: the program will be compiled without xattr support.])])
+AC_SUBST(DV_CMD)
+AC_SUBST(INPUT_OPT)
 
+AC_CHECK_HEADERS([sys/xattr.h],[],[AC_MSG_ERROR([glibc-devel is not installed.])])
 
 AC_CHECK_LIB([pthread], [pthread_getsequence_np], [have_pthread_getsequence_np="yes"],[have_pthread_getsequence_np="no"])
     test "x$have_pthread_getsequence_np" = "xyes" && AC_DEFINE(HAVE_PTHREAD_GETSEQUENCE_NP, 1, [pthread_getsequence_np function exists])
 
-# Purpose ?
+AC_ARG_ENABLE([jemalloc], AS_HELP_STRING([--disable-jemalloc],
+              [Use standard memory allocator instead of jemalloc]),
+              [use_jemalloc="$enableval"],[use_jemalloc="yes"])
+AM_CONDITIONAL(USE_JEMALLOC, test "x$use_jemalloc" == "xyes" )
 
-AC_ARG_WITH( [purpose], AS_HELP_STRING([--with-purpose=TMPFS|LUSTRE_HSM|HSM_LITE|BACKUP|SHOOK],[specify the purpose of the daemon] ),
-             PURPOSE="$withval", PURPOSE="TMP_FS_MGR")
-
-AM_CONDITIONAL(LUSTRE_HSM,     test "$PURPOSE" = "LUSTRE_HSM")
-AM_CONDITIONAL(TMP_FS_MGR,     test "$PURPOSE" = "TMP_FS_MGR" -o "$PURPOSE" = "TMPFS" )
-AM_CONDITIONAL(HSM_LITE, test "$PURPOSE" = "HSM_LITE" -o  "$PURPOSE" = "SHOOK" -o  "$PURPOSE" = "BACKUP" )
-
-# purpose dependent flags
-case $PURPOSE in
-        LUSTRE_HSM)
-        # check pre-requisites
-        if test "x$have_liblustre_api" != "xyes" ; then
-            AC_MSG_ERROR([liblustreapi of lustre 2.x must be installed for compiling Lustre-HSM policy engine])
-        fi
-        if test "x$have_fid" != "xyes" ; then
-            AC_MSG_ERROR([type lustre_fid is missing (needed for Lustre-HSM purpose)])
-        fi
-
-        PURPOSE_CFLAGS="-D_LUSTRE_HSM"
-        PURPOSE_BIN="rbh-lhsm"
-        PURPOSE_EXT="lhsm"
-        PURPOSE_SVC="robinhood-lhsm"
-        AC_DEFINE([HAVE_MIGR_POLICY], [1], [Migration policy for Lustre-HSM purpose])
-        AC_DEFINE([HAVE_RM_POLICY], [1], [HSM removal policy for Lustre-HSM purpose])
-        AC_DEFINE([HAVE_PURGE_POLICY], [1], [Purge policy for Lustre-HSM purpose])
-        ;;
-    TMP_FS_MGR | TMPFS)
-        PURPOSE_CFLAGS="-D_TMP_FS_MGR"
-        PURPOSE_BIN="robinhood"
-        PURPOSE_EXT="tmpfs"
-        PURPOSE_SVC="robinhood"
-        AC_DEFINE([HAVE_RMDIR_POLICY], [1], [Dir removal policy for TMP_FS_MGR purpose])
-        AC_DEFINE([HAVE_PURGE_POLICY], [1], [Purge policy for TMP_FS_MGR purpose])
-        ;;
-    
-    BACKUP | HSM_LITE | SHOOK)
-        # check pre-requisites
-        if test "x$have_liblustre_api" != "xyes" ; then
-            AC_MSG_ERROR([For now, HSM-lite purpose is only supported on Lustre v2 filesystem])
-        fi
-        if test "x$have_fid" != "xyes" ; then
-            AC_MSG_ERROR([For now, HSM-lite purpose is only supported on Lustre v2 filesystem])
-        fi
-
-        PURPOSE_CFLAGS="-D_HSM_LITE"
-
-        AC_DEFINE([HAVE_MIGR_POLICY], [1], [Migration policy for HSM-lite purpose])
-        AC_DEFINE([HAVE_RM_POLICY], [1], [Backend removal policy for HSM-lite purpose])
-
-        if test "$PURPOSE" = "SHOOK" -o "$PURPOSE" = "HSM_LITE"; then
-            # test if library is available for shook mode
-            AC_CHECK_LIB([shooksvr], [shook_release], [have_shook="yes"])
-
-            if test "x$have_shook" != "xyes" ; then
-                if test "$PURPOSE" != "HSM_LITE"; then
-                    AC_MSG_ERROR([libshooksvr not found, cannot build robinhood using shook])
-                fi
-                # HSM_LITE mode without shook: OK (just display a warning)
-                AC_MSG_WARN([libshooksvr not found, switching to backup mode only])
-
-                PURPOSE_BIN="rbh-backup"
-                PURPOSE_EXT="backup"
-                PURPOSE_SVC="robinhood-backup"
-            else
-                # Shook mode with Shook library: OK
-                AC_MSG_NOTICE([libshooksvr is installed, full HSM-lite support is enabled]) 
-                PURPOSE_LDFLAGS="-lshooksvr"
-                AC_DEFINE([HAVE_PURGE_POLICY], [1], [Purge policy for HSM-lite purpose])
-                AC_DEFINE([HAVE_SHOOK], [1], [libshook based HSM binding])
-
-                PURPOSE_BIN="rbh-shook"
-                PURPOSE_EXT="shook"
-                PURPOSE_SVC="robinhood-shook"
-            fi
-        else
-            # backup mode
-            AC_MSG_NOTICE([Compiling robinhood with backup mode])
-            PURPOSE_BIN="rbh-backup"
-            PURPOSE_EXT="backup"
-            PURPOSE_SVC="robinhood-backup"
-        fi
-        ;;
-
-    *)
-        AC_MSG_ERROR([This purpose is not supported yet])
-        ;;
-esac
-
-AM_CONDITIONAL(SHOOK, test  "$PURPOSE_EXT" = "shook")
-AM_CONDITIONAL(BACKUP, test  "$PURPOSE_EXT" = "backup")
+if test "x$use_jemalloc" = "xyes" ; then
+    AC_CHECK_LIB([jemalloc], [malloc_stats_print], LDFLAGS="$LDFLAGS -ljemalloc", \
+        AC_MSG_ERROR([jemalloc library not found (needs jemalloc and jemalloc-devel)]))
+fi
 
 AC_SUBST(PURPOSE_CFLAGS)
 AC_SUBST(PURPOSE_LDFLAGS)
-AC_SUBST(PURPOSE_BIN)
-AC_SUBST(PURPOSE_EXT)
-AC_SUBST(PURPOSE_SVC)
-AC_DEFINE_UNQUOTED([PURPOSE_EXT],"$PURPOSE_EXT", [Directory extension for the given usage])
-
 
 CFLAGS="$CFLAGS -I\$(top_srcdir)/src/include"
 
 # Db ?
-
-AC_ARG_WITH( [db], AS_HELP_STRING([--with-db=MYSQL|SQLITE (default=MYSQL)],[type of database engine] ),
-             DB="$withval", DB="MYSQL")
+#AC_ARG_WITH( [db], AS_HELP_STRING([--with-db=MYSQL|SQLITE (default=MYSQL)],[type of database engine] ),
+#             DB="$withval", DB="MYSQL")
+# SQLITE support is deprecated
+DB="MYSQL"
 
 AM_CONDITIONAL(USE_MYSQL_DB,    test "$DB" = "MYSQL")
 AM_CONDITIONAL(USE_SQLITE_DB,   test "$DB" = "SQLITE")
 
 # @TODO check database libraries and path
 
-# Db dependent checks and flags 
+# Db dependent checks and flags
 case $DB in
     MYSQL)
 
@@ -370,18 +428,18 @@ case $DB in
         DB_CFLAGS="-D_MYSQL `$MYSQL_CONFIG --include`"
         DB_LDFLAGS=`mysql_config --libs_r`
 
-        if test "$MYSQL_VERSION" = "5" ; then
-            DB_CFLAGS="$DB_CFLAGS -D_MYSQL5"
-        else
+        if test "$MYSQL_VERSION" -lt "5" ; then
             AC_MSG_WARN([MySQL version is too old (<5), optimized accounting won't be supported.])
+        else
+            DB_CFLAGS="$DB_CFLAGS -D_MYSQL5"
         fi
         ;;
 
     SQLITE)
         # check lib and headers
-        AC_CHECK_HEADER([sqlite3.h], HAVE_SQLITE_HEADER="true", 
+        AC_CHECK_HEADER([sqlite3.h], HAVE_SQLITE_HEADER="true",
                     AC_MSG_ERROR([sqlite-devel not installed]))
-        AC_CHECK_LIB([sqlite3], [sqlite3_exec], HAVE_SQLITE_LIB="true", 
+        AC_CHECK_LIB([sqlite3], [sqlite3_exec], HAVE_SQLITE_LIB="true",
                     AC_MSG_ERROR([sqlite3 library not found]))
         DB_CFLAGS="-D_SQLITE"
         DB_LDFLAGS="-lsqlite3"
@@ -423,37 +481,18 @@ AC_SUBST(CONFDIR)
 AS_AC_EXPAND(SBINDIR, $sbindir)
 AC_SUBST(SBINDIR)
 
-# for exporting to spec file
+AS_AC_EXPAND(LIBDIR, $libdir)
+AC_SUBST(LIBDIR)
+
+# for exporting to Makefile.in
 AC_SUBST(ac_configure_args)
 
-AC_CONFIG_FILES([Makefile
-         src/Makefile
-         src/include/Makefile
-         src/logs/Makefile
-         src/common/Makefile
-         src/cfg_parsing/Makefile
-         src/list_mgr/Makefile
-         src/entry_processor/Makefile
-         src/fs_scan/Makefile
-         src/chglog_reader/Makefile
-         src/policy_matching/Makefile
-         src/policy_modules/Makefile
-         src/policy_modules/purge/Makefile
-         src/policy_modules/migration/Makefile
-         src/policy_modules/hsm_remove/Makefile
-         src/policy_modules/rmdir/Makefile
-         src/backend_ext/Makefile
-         src/robinhood/Makefile
-         src/tools/Makefile
-         src/tests/Makefile
-         scripts/Makefile
-         scripts/robinhood.init
-         scripts/robinhood.init.sles
-         scripts/sysconfig_robinhood
-         tests/Makefile
-         web_gui/Makefile
-         man/Makefile
-         robinhood.spec
-         doc/doxygen/doxygen.cfg
-         scripts/make_mans.sh])
 AC_OUTPUT
+
+AC_MSG_NOTICE([Summary:])
+AC_MSG_NOTICE([Lustre     support is $build_lustre])
+AC_MSG_NOTICE([Backup     support is $build_backup])
+AC_MSG_NOTICE([Lustre/HSM support is $build_lhsm])
+test -d "/ccc" && AC_MSG_NOTICE([Shook      support is $build_shook])
+
+exit 0

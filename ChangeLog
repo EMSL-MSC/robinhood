@@ -1,3 +1,154 @@
+Summary on changes in minor versions 3.1.x:
+
+3.1.5:
+- Lustre: compatibility with FPL and DoM (no full-featured support)
+- Fix and improvement of ratelimit scheduler
+- Stop retrying SQL requests on SIGTERM
+- Faster remove policies (disable sorting)
+
+3.1.4:
+* Web gui:
+    - new access control criteria: IP address, hostname;
+    - tasks: scheduled requests, and possiblity to keep result history;
+    - custom graphs.
+* Performance improvements:
+    - Improved rules-to-SQL conversion engine. Enable faster policy runs.
+    - Auto-tune hash table sizes (changelog reader and entry processor).
+    - Pipeline tuning to reduce CPU usage and improve ingestion rate.
+    - Default linking to jemalloc memory allocator for better performance.
+      Note: it is advised to start MariaDB with this allocator too
+      to achieve maximal performance.
+    - Fix major performance bug in changelog reader (appeared in v3.1.3).
+* Configuration files: support %include directives in sub-blocks.
+* New parameter to 'common.copy': "mkdir=yes" creates target directories
+  prior to the copy operation.
+* New action 'common.move' (move an entry from one path/name to another).
+* Command copytool 'lhsmtool_cmd': add man page.
+
+3.1.3:
+* Policies: add matching modes "auto_update_attrs" and "auto_update_all"
+* Faster changelog reader shutdown when the process is terminated by a signal
+* Changelog optimization: drop CREATE/UNLINK and MKDIR/RMDIR changelog pairs
+* rbh-find:
+    ° add "-links" criterion
+    ° "-ost" accepts OST sets
+    ° add "-iname" option for case-insensitive name matching
+    ° support "-not" for links, size and dates
+* FS scan optimization (use openat() to walk through the filesystem instead
+  of full paths).
+* Fix rules-to-SQL conversion
+
+3.1.2:
+* Implement command rbh-rebind command to assign an archived entry to a newly
+  created fid (e.g. used for undelete operation).
+* Make lhsm undelete more resilient to error cases
+* lhsm: add tunable to allow custom/smaller UUID
+* REST API:
+    ° add nagios plugin
+    ° add graph preview in console plugin
+    ° add new filters
+
+Main changes in robinhood 3.1:
+* Ingest rate optimizations: up to x10
+* New plugin type: action schedulers
+  These plugins make it possible to reorder policy actions, or smooth policy execution.
+  In this release, two of such plugins are provided: 'common.max_per_run' and
+  'common.rate_limit'.
+* Policy optimizations:
+  - Improved pre-filtering: convert all policy rules to SQL for better
+    pre-filtering.
+  - Configurable attribute matching before/after scheduling
+    (pre/post_sched_match parameters).
+* FS scan: make it possible to restrict scan to several directories
+  ('scan_only' configuration parameter).
+  - Especially useful with Lustre's static DNE partitioning.
+* Pre/post policy run commands
+* Modeguard status manager
+  - Enforce or clear permission bits on entries of the filesystem
+* Fixes for Lustre 2.10
+  - Note: this robinhood version does not support Progressive File Layouts yet
+* REST API and web interface enhancements:
+	- Plugin mechanism to add custom charts/fields/requests...
+	- Finer access control (limit user views only to their stats)
+	- All robinhood DB available through the REST API
+
+Main changes in robinhood 3.0:
+* Policies at will:
+    - Define new custom policies at will, just by writting just a few lines of configuration.
+    - Schedule all imaginable actions on filesystem entries.
+    - Templates are provided to implement: old entries cleanup, directory cleanup, data corruption checks (by regularly checking file's checksum), Lustre/HSM policies.
+* Fully configurable policies:
+    - All policy aspects made configurable (scope, actions, action parameters, sort order...)
+    - Fine-grained specification of policy actions and parameters.
+* Plugin-based architecture:
+    - Missing a specific feature in Robinhood core? Implement you own plugin to manage new kind of policies, maintain specific info in robinhood DB, enable interactions with specific site ecosystem (job scheduler, system load...), ...
+* Enabling the Robinhood community:
+    - Share your custom policy definitions and plugins, so that other community members can benefit from them and enrich them!
+* All Robinhood features in a single instance:
+    - No more distinct and incompatible robinhood "flavors" (tmpfs, lhsm, backup...)
+    - All policies can be implemented in a single robinhood instance.
+* Get a better overlook of your filesystem contents than ever!
+    - New web interface
+    - REST interface to query filesystem stats
+    - Tag your filesystem entries based on arbitrary criteria using the new fileclass implementation
+    - Flexible reporting with "rbh-find -printf"
+* RedHat 7 integration:
+    - systemd support.
+    - Per filesystem service: robinhood@<fsname>
+* New features for Lustre/HSM:
+    - Undelete: recover accidentally deleted files.
+    - Implement Lustre/HSM with any backend, using the generic command copytool shipped with robinhood: 'lhsmtool_cmd'.
+    - UUID support for Lustre/HSM copytools.
+* Convenient:
+    - Automatic DB conversion after major upgrades.
+* Even more robust & Improved code quality.
+
+Changes between version 2.5.4 and 2.5.5:
+* [lustre] Support Lustre versions up to 2.7.
+* [DB performance] Allow both batching and parallelizing DB operations when
+  accounting is OFF. Benchmarks show a x3~x4 speedup of DB ingest rate in this
+  case.
+* [DB performance] Reduce lock contention on indexes of STRIPE_ITEMS table.
+* [acct] Avoid accounting stats inconsistency when this feature is enabled/
+  disabled/re-enabled.
+* [policy performance] Disable ignored class re-matching by default.
+* [policy performance] Disable sort by mtime by default.
+* [policy performance] Allow disabling sort by atime for purge policies.
+* [fix] Fix segfault when log rotation occurs under heavy logging.
+* [fix] When processing a RENAME changelog record, match the new path in
+  filesystem instead of building it from DB (which caused 'incomplete path'
+  errors).
+* [fix] Fix sendfile copy operation for backup mode.
+* [fix] Fix various requests about directories: --topdirs with --filter-path
+  option, --toprmdir, ...
+* [fix] Fix possible duplicate insert error when updated entry attributes are
+  only in ANNEX_INFO table (rare).
+* [fix] Some purge parameters may not be taken into account.
+* [packaging] clean permissions in distribution tarball.
+* [report performance] Improve performance of path matching when running
+  directory reports with --filter-path option.
+
+Changes between version 2.5.3 and 2.5.4:
+* [lustre] Lustre 2.4+: detect all stripe changes and update the DB accordingly.
+* [scan] Prevent from dropping entries from DB when opendir or stat fail.
+* [DB] Optimization to batch more DB requests.
+* [DB] Allow using any MySQL engine (new config parameter: listmanager::mysql::engine)
+* [rbh-config] Avoid backup_db to lock the whole tables with innodb.
+* [bugfix] Improve robustness to corrupted mtimes.
+* [bugfix] Fix possible crash in db_exec_sql.
+* [bugfix] Fix possible overflow when executing a custom archive command.
+* [backup mode] Clean all non-printable characters in backend path.
+* [pkg] libattr-devel is now mandatory to build robinhood.
+
+2.5.4 release notes:
+* "innodb = enabled/disabled": this parameter will be deprecated.
+  It has to be replaced by "engine = innodb".
+* (Lustre only) one of the field types changed in the DB.
+  It will be automatically converted the first time rbh 2.5.4 starts.
+  The conversion takes about 5s per million entries.
+* Admin guides are now available online (http://robinhood.sf.net > "Online documentation")
+  "odt" and "pdf" versions are no longer maintained.
+
 Changes between version 2.5.2 and 2.5.3:
 - custom purge_command (fix): fixed vulnerability to malicious file names.
 - changelog processing (fix): fixed errors 'Entry has incomplete path in DB'

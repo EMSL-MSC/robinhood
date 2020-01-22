@@ -1,20 +1,9 @@
-if TMP_FS_MGR
-dist_man_MANS=@PURPOSE_BIN@.1 rbh-report.1  rbh-find.1  rbh-du.1
+dist_man_MANS=robinhood.1 rbh-report.1 rbh-find.1 rbh-du.1 rbh-diff.1
 
-@PURPOSE_BIN@.1: mans
-rbh-report.1: mans
-rbh-find.1: mans
-rbh-du.1: mans
-
-else
-dist_man_MANS=@PURPOSE_BIN@.1 rbh-@PURPOSE_EXT@-report.1  rbh-@PURPOSE_EXT@-find.1  rbh-@PURPOSE_EXT@-du.1
-
-@PURPOSE_BIN@.1: mans
-rbh-@PURPOSE_EXT@-report.1: mans
-rbh-@PURPOSE_EXT@-find.1: mans
-rbh-@PURPOSE_EXT@-du.1: mans
-
+if LUSTRE_HSM
+dist_man_MANS+=lhsmtool_cmd.1
 endif
 
-mans:
-	chmod +x ../scripts/make_mans.sh && ../scripts/make_mans.sh
+# Manually generate man pages from each executable --help
+manpages:
+	export VERSION=${VERSION}; ../scripts/make_mans.sh
